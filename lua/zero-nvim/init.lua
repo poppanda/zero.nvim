@@ -1,206 +1,214 @@
 local M = {}
 
--- 保存 Daemon 的 Job ID / Channel ID
-local daemon_channel_id = nil
--- 记录已连接的主机: { ["user@host:port"] = true }
-local connected_hosts = {}
+-- 默认配置
+local defaults = {
+    daemon = {
+        path = nil,
+        build_type = "debug",
+    },
+    log = {
+        level = vim.log.levels.INFO,
+        prefix = "ZeroNvim: ",
+    },
+    explorer = "builtin",
+}
 
--- 解析 URI: remote://user@host[:port]:/path/to/file
--- 返回: user, host, port (number or 22), path
-local function parse_uri(uri)
-    -- 尝试匹配带端口的格式: remote://user@host:port:/path
+-- 插件内部状态
+local state = {
+    channel_id = nil,
+    connected_hosts = {},
+    scanned_projects = {},
+}
+
+local options = {}
+
+local function logger(msg, level)
+    level = level or vim.log.levels.INFO
+    if level >= options.log.level then
+        vim.notify(options.log.prefix .. msg, level)
+    end
+end
+
+function M.parse_uri(uri)
     local user, host, port_str, path = string.match(uri, "^remote://([^@]+)@([^:]+):(%d+):(.+)$")
-    
     if user and host and port_str and path then
         return user, host, tonumber(port_str), path
     end
-
-    -- 尝试匹配不带端口的格式: remote://user@host:/path
     user, host, path = string.match(uri, "^remote://([^@]+)@([^:]+):(.+)$")
     if user and host and path then
         return user, host, 22, path
     end
-
-    return nil, nil, nil, nil
+    return nil
 end
 
--- 启动 Daemon 进程
-local function start_daemon()
-    if daemon_channel_id then
-        return daemon_channel_id
+local function get_daemon_bin()
+    if options.daemon.path and vim.fn.executable(options.daemon.path) == 1 then
+        return options.daemon.path
     end
+    local script_path = debug.getinfo(1).source:sub(2)
+    local plugin_root = vim.fs.dirname(vim.fs.dirname(vim.fs.dirname(script_path)))
+    local relative_path = string.format("/daemon/target/%s/zero-nvim-daemon", options.daemon.build_type)
+    local detected_path = plugin_root .. relative_path
+    if vim.fn.executable(detected_path) == 1 then return detected_path end
+    local cwd_path = vim.fn.getcwd() .. relative_path
+    if vim.fn.executable(cwd_path) == 1 then return cwd_path end
+    return nil
+end
 
-    -- 查找 Daemon 二进制文件路径
-    local bin_path = vim.fn.getcwd() .. "/daemon/target/debug/zero-nvim-daemon"
-    if vim.fn.executable(bin_path) == 0 then
-        -- 尝试在插件目录下查找
-        local plugin_root = vim.fs.dirname(vim.fs.dirname(vim.fs.dirname(debug.getinfo(1).source:sub(2))))
-        bin_path = plugin_root .. "/daemon/target/debug/zero-nvim-daemon"
-    end
-
-    vim.notify("ZeroNvim: Looking for daemon at: " .. bin_path, vim.log.levels.INFO)
-
-    if vim.fn.executable(bin_path) == 0 then
-        vim.notify("ZeroNvim Daemon binary not found at: " .. bin_path, vim.log.levels.ERROR)
+local function get_daemon_chan()
+    if state.channel_id then return state.channel_id end
+    local bin_path = get_daemon_bin()
+    if not bin_path then
+        logger("Daemon binary not found.", vim.log.levels.ERROR)
         return nil
     end
-
-    vim.notify("Starting ZeroNvim Daemon...", vim.log.levels.INFO)
-    daemon_channel_id = vim.fn.jobstart({ bin_path }, {
-        rpc = true, -- 启用 Msgpack-RPC 通信
-        on_exit = function(id, code, event)
-            if code ~= 0 then
-                vim.notify("ZeroNvim Daemon exited with code " .. code, vim.log.levels.WARN)
-            else
-                vim.notify("ZeroNvim Daemon exited normally", vim.log.levels.INFO)
-            end
-            daemon_channel_id = nil
-            connected_hosts = {} -- 重置连接状态
+    state.channel_id = vim.fn.jobstart({ bin_path }, {
+        rpc = true,
+        on_exit = function(_, code)
+            state.channel_id = nil
+            state.connected_hosts = {}
+            state.scanned_projects = {}
         end,
-        on_stderr = function(id, data, event)
-            -- data 是一个字符串列表
+        on_stderr = function(_, data)
             for _, line in ipairs(data) do
-                if line ~= "" then
-                    vim.notify("Daemon Stderr: " .. line, vim.log.levels.WARN)
-                end
+                if line ~= "" then logger("Daemon: " .. line, vim.log.levels.WARN) end
             end
         end,
     })
-
-    if daemon_channel_id == 0 then
-        vim.notify("ZeroNvim Daemon failed to start (invalid arguments)", vim.log.levels.ERROR)
-        daemon_channel_id = nil
-    elseif daemon_channel_id == -1 then
-        vim.notify("ZeroNvim Daemon is not executable", vim.log.levels.ERROR)
-        daemon_channel_id = nil
-    else 
-        vim.notify("ZeroNvim Daemon started with Channel ID: " .. daemon_channel_id, vim.log.levels.INFO)
-    end
-
-    return daemon_channel_id
+    return state.channel_id
 end
 
--- 更新 Buffer 内容
-local function update_buffer(buf, lines, remote_path)
-    if not vim.api.nvim_buf_is_valid(buf) then return end
+function M.ensure_connection(user, host, port, password)
+    local chan = get_daemon_chan()
+    if not chan then return nil, "Daemon not running" end
+    local key = string.format("%s@%s:%s", user, host, port)
+
+    if not state.connected_hosts[key] then
+        local ok, res = pcall(vim.fn.rpcrequest, chan, "connect", user, host, port, password)
+        if not ok then
+            return nil, tostring(res)
+        end
+        state.connected_hosts[key] = true
+    end
+    return chan
+end
+
+function M.get_entries(user, host, port, path)
+    local chan, err = M.ensure_connection(user, host, port)
+    if not chan then return nil, err end
+    local project_key = string.format("%s@%s:%d:%s", user, host, port, path)
+    if not state.scanned_projects[project_key] then
+        vim.rpcnotify(chan, "scan_project", user, host, port, path)
+        state.scanned_projects[project_key] = true
+    end
+    local ok, entries = pcall(vim.fn.rpcrequest, chan, "read_dir", user, host, port, path)
+    if not ok then return nil, tostring(entries) end
+    return entries
+end
+
+function M.get_file_content(user, host, port, path)
+    local chan, err = M.ensure_connection(user, host, port)
+    if not chan then return nil, err end
+    local ok, content = pcall(vim.fn.rpcrequest, chan, "fetch_file", user, host, port, path)
+    if not ok then return nil, tostring(content) end
+    return content
+end
+
+local function setup_dir_buffer(buf, user, host, port, path, entries)
+    local lines = { '" Remote Directory: ' .. path, '" Press <CR> to open, R to refresh, .. to go up', "" }
+    local entry_map = {}
+    table.insert(lines, " ../")
+    entry_map[#lines] = { name = "..", type = "directory" }
+    table.sort(entries, function(a, b)
+        if a.type ~= b.type then return a.type == "directory" end
+        return a.name < b.name
+    end)
+    for _, entry in ipairs(entries) do
+        local display = (entry.type == "directory" and " " or " ") .. entry.name
+        if entry.type == "directory" then display = display .. "/" end
+        table.insert(lines, display)
+        entry_map[#lines] = entry
+    end
     vim.api.nvim_set_option_value('modifiable', true, { buf = buf })
     vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
     vim.api.nvim_set_option_value('modified', false, { buf = buf })
     vim.api.nvim_set_option_value('readonly', true, { buf = buf })
-    local ft = vim.filetype.match({ filename = remote_path })
-    if ft then
-        vim.api.nvim_set_option_value('filetype', ft, { buf = buf })
-    end
-    vim.notify("File loaded: " .. remote_path, vim.log.levels.INFO)
+    vim.api.nvim_set_option_value('filetype', 'netrw', { buf = buf })
+    vim.keymap.set('n', '<CR>', function()
+        local line = vim.fn.line('.')
+        local entry = entry_map[line]
+        if not entry then return end
+        local new_path = entry.name == ".." and vim.fs.dirname(path) or (path:gsub("/$", "") .. "/" .. entry.name)
+        local uri = string.format("remote://%s@%s:%d:%s", user, host, port, new_path)
+        if entry.type == "directory" then
+            local ok, _ = pcall(vim.api.nvim_buf_set_name, buf, uri)
+            if not ok then vim.cmd("edit " .. uri) else M.handle_fetch(buf, user, host, port, new_path) end
+        else
+            vim.cmd("edit " .. uri)
+        end
+    end, { buffer = buf, silent = true })
+    vim.keymap.set('n', 'R', function() M.handle_fetch(buf, user, host, port, path, nil, true) end,
+        { buffer = buf, silent = true })
 end
 
--- 确保与远程主机建立连接
--- user: 用户名, host: 主机名, port: 端口, password: 密码 (可选)
--- 返回: success (bool), error_message (string/nil)
-local function ensure_connection(user, host, port, password)
-    local key = user .. "@" .. host .. ":" .. port
-    
-    if connected_hosts[key] then
-        vim.notify("Already connected to " .. key, vim.log.levels.DEBUG)
-        return true, nil
-    end
+function M.handle_fetch(buf, user, host, port, path, password, refresh)
+    local chan, err = M.ensure_connection(user, host, port, password)
 
-    local chan = start_daemon()
     if not chan then
-        return false, "Daemon not running"
-    end
-
-    vim.notify("Connecting to " .. key .. "...", vim.log.levels.INFO)
-    -- 发送 RPC 请求: connect(user, host, port, password)
-    -- 注意: 之前协议只有 (user, host, password)，现在增加 port
-    -- 我们需要同步修改 daemon 端
-    local ok, res = pcall(vim.fn.rpcrequest, chan, "connect", user, host, port, password)
-
-    if not ok then
-        return false, "RPC Call failed: " .. tostring(res)
-    end
-    
-    connected_hosts[key] = true
-    vim.notify("Connected to " .. key, vim.log.levels.INFO)
-    return true, nil
-end
-
--- 通过 Daemon 获取文件
-local function fetch_remote_daemon(buf, user, host, port, remote_path)
-    local chan = daemon_channel_id
-    if not chan then return end
-
-    vim.notify("Fetching " .. remote_path .. " via Daemon...", vim.log.levels.INFO)
-    local ok, content = pcall(vim.fn.rpcrequest, chan, "fetch_file", user, host, port, remote_path)
-
-    if not ok then
-        vim.notify("Fetch failed: " .. tostring(content), vim.log.levels.ERROR)
+        -- 核心改进：只有明确包含 AUTH_FAILED 字样才弹窗
+        if not password and err:match("AUTH_FAILED") then
+            vim.ui.input({ prompt = "SSH Password: ", secret = true }, function(input)
+                if input then
+                    vim.schedule(function() M.handle_fetch(buf, user, host, port, path, input) end)
+                end
+            end)
+            return
+        end
+        -- 其他错误（如 Banner 失败，SFTP 不支持等）直接报错
+        logger("Connection failed: " .. err, vim.log.levels.ERROR)
         return
     end
 
-    local lines = vim.split(content, "\n")
-    if #lines > 0 and lines[#lines] == "" then
-        table.remove(lines)
+    local ok_stat, ftype = pcall(vim.fn.rpcrequest, chan, "stat", user, host, port, path)
+    if not ok_stat then
+        logger("Access failed: " .. tostring(ftype), vim.log.levels.ERROR)
+        return
     end
 
-    update_buffer(buf, lines, remote_path)
-end
-
--- 处理连接与重试逻辑 (包含密码输入)
--- forward declaration
-local handle_connect_and_fetch
-
-handle_connect_and_fetch = function(buf, user, host, port, remote_path, password)
-    local success, err = ensure_connection(user, host, port, password)
-    
-    if success then
-        fetch_remote_daemon(buf, user, host, port, remote_path)
+    if ftype == "directory" then
+        if options.explorer == "oil" then
+            local oil_uri = string.format("oil-zero://%s@%s:%d%s", user, host, port, path)
+            -- 在跳转 Oil 之前，显式将 remote:// buffer 标记为已成功完成（虽然我们要跳走）
+            -- 这样可以防止某些 autocommands 触发
+            vim.api.nvim_buf_delete(buf, { force = true })
+            vim.cmd("edit " .. oil_uri)
+            return
+        end
+        local entries = M.get_entries(user, host, port, path)
+        if entries then setup_dir_buffer(buf, user, host, port, path, entries) end
     else
-        vim.notify("Connection failed: " .. tostring(err), vim.log.levels.WARN)
-        -- 如果失败，判断是否是因为认证失败，如果是则提示输入密码
-        if password then
-             -- 已经试过密码了，彻底失败
-            vim.notify("Authentication failed definitively.", vim.log.levels.ERROR)
-        else
-            -- 第一次尝试失败，提示输入密码
-            vim.ui.input({ prompt = "SSH Password for " .. user .. "@" .. host .. ": ", secret = true }, function(input)
-                if input then
-                    vim.schedule(function()
-                        handle_connect_and_fetch(buf, user, host, port, remote_path, input)
-                    end)
-                else
-                    vim.notify("Connection aborted by user.", vim.log.levels.WARN)
-                end
-            end)
+        local content = M.get_file_content(user, host, port, path)
+        if content then
+            local lines = vim.split(content, "\n")
+            if #lines > 0 and lines[#lines] == "" then table.remove(lines) end
+            vim.api.nvim_set_option_value('modifiable', true, { buf = buf })
+            vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+            vim.api.nvim_set_option_value('modified', false, { buf = buf })
+            vim.api.nvim_set_option_value('readonly', true, { buf = buf })
+            local ft = vim.filetype.match({ filename = path })
+            if ft then vim.api.nvim_set_option_value('filetype', ft, { buf = buf }) end
         end
     end
 end
 
--- BufReadCmd 事件回调
-local function handle_buf_read_cmd(args)
-    vim.notify("ZeroNvim: BufReadCmd triggered for " .. args.file, vim.log.levels.INFO)
-    local buf = args.buf
-    local uri = args.file
-    local user, host, port, remote_path = parse_uri(uri)
-
-    if not user or not host or not remote_path then
-        vim.notify("Invalid URI: " .. uri, vim.log.levels.ERROR)
-        return
-    end
-
-    vim.api.nvim_set_option_value('buftype', 'acwrite', { buf = buf })
-    vim.api.nvim_set_option_value('modifiable', false, { buf = buf })
-
-    vim.schedule(function()
-        handle_connect_and_fetch(buf, user, host, port, remote_path, nil)
-    end)
-end
-
-function M.setup()
-    vim.notify("ZeroNvim: Plugin loaded", vim.log.levels.INFO)
+function M.setup(opts)
+    options = vim.tbl_deep_extend("force", defaults, opts or {})
     vim.api.nvim_create_autocmd("BufReadCmd", {
         pattern = "remote://*",
-        callback = handle_buf_read_cmd,
+        callback = function(args)
+            local user, host, port, path = M.parse_uri(args.file)
+            if user then vim.schedule(function() M.handle_fetch(args.buf, user, host, port, path) end) end
+        end,
         group = vim.api.nvim_create_augroup("ZeroNvim", { clear = true }),
     })
 end
