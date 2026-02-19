@@ -4,37 +4,45 @@
 
 ## Project Status
 
-**Current Milestone:** Milestone 1 (Pure Lua Read-Only VFS) - **COMPLETED**
+**Current Milestone:** Milestone 2 (High-Performance Daemon) - **COMPLETED**
 
 -   [x] Milestone 1: Basic `remote://` protocol support (Read-Only) via `ssh` and `vim.system`.
--   [ ] Milestone 2: High-performance Daemon (Rust/C++) for connection multiplexing.
+-   [x] Milestone 2: High-performance Daemon (Rust) for connection multiplexing via Msgpack-RPC.
 -   [ ] Milestone 3: Zero-latency editing and incremental synchronization.
 -   [ ] Milestone 4: LSP Transparent Proxy and Path Translation.
 
 ## Directory Overview
 
 -   **`lua/zero-nvim/`**: Contains the core Lua implementation of the plugin.
-    -   `init.lua`: The main entry point. Handles `BufReadCmd` events for `remote://` URIs, executes SSH commands, and manages buffer content.
+    -   `init.lua`: The main entry point. Handles `BufReadCmd` events, manages the Daemon process (`vim.fn.jobstart`), and communicates via `vim.rpcrequest`.
+-   **`daemon/`**: Rust source code for the backend daemon.
+    -   `src/main.rs`: Implements the Msgpack-RPC server and persistent SSH connection logic using `ssh2` and `tokio`.
 -   **`plugin/`**: Auto-load scripts.
     -   `zero-nvim.lua`: Automatically initializes the plugin when Neovim starts.
 -   **`tests/`**: Test scripts.
-    -   `test_zero_milestone1.lua`: A standalone Lua script to verify Milestone 1 functionality by mocking `vim.system`.
-    -   `test_zero_password_auth.lua`: A standalone Lua script to verify password authentication fallback logic.
+    -   `test_zero_milestone2.lua`: Verifies the Lua-Daemon interaction logic by mocking RPC calls.
 -   **`docs/`**: Documentation and design specs.
-    -   `milestones.md`: Detailed roadmap and task breakdown.
-    -   `functions.md`: Architecture design notes.
-    -   `milestone1_zero_test.md`: Testing guide for the current milestone.
 
 ## Development & Usage
 
 ### Prerequisites
 
--   **Neovim 0.10+** (Required for `vim.system`).
--   **SSH Client**: Configured for either key-based (preferred) or password-based authentication.
+-   **Neovim 0.10+** (Required for `vim.system` and modern Lua API).
+-   **Rust Toolchain**: Required to build the daemon (`cargo`).
+-   **SSH Client**: Configured for key-based or password-based authentication.
+
+### Building the Daemon
+
+Before using the plugin, you must build the daemon:
+
+```bash
+cd daemon
+cargo build
+```
 
 ### Running in Development Mode
 
-To avoid conflicts with installed plugins (especially if you have `remote-nvim` installed), **ALWAYS** use the `--clean` flag and manually append the runtime path:
+To avoid conflicts with installed plugins, **ALWAYS** use the `--clean` flag and manually append the runtime path:
 
 ```bash
 nvim --clean --cmd "set rtp+=."
@@ -43,26 +51,32 @@ nvim --clean --cmd "set rtp+=."
 Once inside Neovim:
 
 1.  Open a remote file: `:e remote://user@host:/path/to/file`
-2.  Check logs: `:messages` (Debug info is prefixed with `ZeroNvim:`)
+2.  The plugin will automatically start the daemon and establish an SSH connection.
+3.  If authentication fails, you will be prompted for a password.
 
 ### Running Tests
 
 Run the automated test suite from the project root:
 
 ```bash
-nvim -l tests/test_zero_milestone1.lua
-nvim -l tests/test_zero_password_auth.lua
+nvim -l tests/test_zero_milestone2.lua
 ```
 
-## Architecture Notes (Milestone 1)
+## Architecture Notes (Milestone 2)
 
 -   **Protocol:** `remote://user@host:/path/to/file`
--   **Mechanism:** Intercepts `BufReadCmd`.
-    -   **Authentication:** Attempts public key authentication first (`BatchMode=yes`). If it fails, falls back to interactive password prompt via `vim.ui.input` and retries using a temporary `SSH_ASKPASS` script.
--   **Buffer State:** Buffers are currently set to `buftype=acwrite`, `nomodified`, and `readonly`.
--   **Error Handling:** Catches SSH errors (connectivity, permissions) and reports them via `vim.notify` and `:messages`.
+-   **Backend:** Rust Daemon (`zero-nvim-daemon`) running as a child process of Neovim.
+-   **Communication:** Standard Msgpack-RPC over Stdio.
+    -   Requests: `connect(user, host, password)`, `fetch_file(user, host, path)`.
+-   **Connection Multiplexing:**
+    -   The daemon maintains persistent SSH sessions (`ssh2::Session`) in memory.
+    -   Subsequent file requests reuse the existing authenticated session, eliminating handshake latency.
+-   **Authentication:**
+    -   Supports SSH Agent and Password authentication.
+    -   If the daemon reports auth failure, the Lua frontend prompts the user and retries with the password.
 
-## Key Commands
+## Key Commands (Internal)
 
--   **Fetch File (Key):** `ssh -o BatchMode=yes -o ConnectTimeout=5 user@host cat /path/to/file`
--   **Fetch File (Password):** `ssh -o ConnectTimeout=5 user@host cat /path/to/file` (with `SSH_ASKPASS` environment set)
+-   **Daemon Start:** `vim.fn.jobstart({'path/to/daemon'}, { rpc = true })`
+-   **Connect:** `vim.rpcrequest(chan, 'connect', user, host, password)`
+-   **Fetch:** `vim.rpcrequest(chan, 'fetch_file', user, host, path)`
