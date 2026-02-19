@@ -146,8 +146,165 @@ end
 ---@param bufnr integer
 ---@return boolean
 M.is_modifiable = function(bufnr)
-  -- Read-only for now; file mutations not yet supported
-  return false
+  return true
+end
+
+---@param bufnr integer
+M.write_file = function(bufnr)
+  loading.set_loading(bufnr, true)
+  local bufname = vim.api.nvim_buf_get_name(bufnr)
+  local res = M.parse_url(bufname)
+  local zero = get_zero()
+
+  local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+  local content = table.concat(lines, "\n")
+  -- Ensure trailing newline if file is not empty
+  if #content > 0 and content:sub(-1) ~= "\n" then
+    content = content .. "\n"
+  end
+
+  vim.schedule(function()
+    local chan = zero._get_daemon_chan and zero._get_daemon_chan()
+    if not chan then
+      loading.set_loading(bufnr, false)
+      vim.notify("Daemon not connected", vim.log.levels.ERROR)
+      return
+    end
+
+    local ok, ret = pcall(vim.fn.rpcrequest, chan, "write_file", res.user, res.host, res.port, res.path, content)
+    loading.set_loading(bufnr, false)
+
+    if ok and ret == true then
+      vim.bo[bufnr].modified = false
+      vim.notify("Saved: " .. res.path, vim.log.levels.INFO)
+    else
+      vim.notify("Save failed: " .. tostring(ret), vim.log.levels.ERROR)
+    end
+  end)
+end
+
+---@param url string
+---@param type "file"|"directory"
+---@param callback fun(err?: string)
+M.create_entry = function(url, type, callback)
+  local res = M.parse_url(url)
+  local zero = get_zero()
+  local chan = zero._get_daemon_chan and zero._get_daemon_chan()
+  if not chan then return callback("Daemon not connected") end
+
+  -- Prevent creating files ending with / (Oil handles normalization but just in case)
+  if type == "file" and vim.endswith(res.path, "/") then
+    return callback("File path ends with /")
+  end
+
+  vim.schedule(function()
+    if type == "directory" then
+      local ok, ret = pcall(vim.fn.rpcrequest, chan, "mkdir", res.user, res.host, res.port, res.path)
+      if ok and ret == true then callback() else callback(ret or "RPC failed") end
+    else
+      -- Create empty file
+      local ok, ret = pcall(vim.fn.rpcrequest, chan, "write_file", res.user, res.host, res.port, res.path, "")
+      if ok and ret == true then callback() else callback(ret or "RPC failed") end
+    end
+  end)
+end
+
+---@param url string
+---@param callback fun(err?: string)
+M.delete_entry = function(url, callback)
+  local res = M.parse_url(url)
+  local zero = get_zero()
+  local chan = zero._get_daemon_chan and zero._get_daemon_chan()
+  if not chan then return callback("Daemon not connected") end
+
+  vim.schedule(function()
+    -- Try remove_file first, if it fails maybe it's a dir?
+    -- Actually we should probably know the type, but delete_entry signature doesn't pass it.
+    -- However, we can guess or try both. Or use `stat`?
+    -- Optimization: Just try remove_file, if fail try remove_dir?
+    -- Better: Check trailing slash? Oil urls for dirs usually end in /
+
+    local method = "remove_file"
+    if vim.endswith(url, "/") then
+      method = "remove_dir"
+    else
+      -- If no trailing slash, it COULD be a dir, but usually Oil adds slash for dirs in list.
+      -- Let's try remove_file first.
+    end
+
+    -- To be safe, let's stat it first? No, that's slow.
+    -- Let's assume Oil passes us the URL as it knows it.
+    -- If we look at `list`, we cache entries.
+
+    -- Let's try remove_file, if it fails with specific error?
+    -- The daemon `remove_file` uses `unlink`, `remove_dir` uses `rmdir`.
+
+    local ok, ret = pcall(vim.fn.rpcrequest, chan, "remove_file", res.user, res.host, res.port, res.path)
+    if ok and ret == true then
+      callback()
+      return
+    end
+
+    -- If remove_file failed, try remove_dir (maybe it was a dir)
+    local ok2, ret2 = pcall(vim.fn.rpcrequest, chan, "remove_dir", res.user, res.host, res.port, res.path)
+    if ok2 and ret2 == true then
+      callback()
+    else
+      callback(ret or ret2 or "Delete failed")
+    end
+  end)
+end
+
+---@param src_url string
+---@param dst_url string
+---@param callback fun(err?: string)
+M.rename_entry = function(src_url, dst_url, callback)
+  local res_src = M.parse_url(src_url)
+  local res_dst = M.parse_url(dst_url)
+  local zero = get_zero()
+  local chan = zero._get_daemon_chan and zero._get_daemon_chan()
+  if not chan then return callback("Daemon not connected") end
+
+  -- Basic check: user/host/port should match
+  if res_src.user ~= res_dst.user or res_src.host ~= res_dst.host then
+    return callback("Cannot rename across different hosts")
+  end
+
+  vim.schedule(function()
+    local ok, ret = pcall(vim.fn.rpcrequest, chan, "rename", res_src.user, res_src.host, res_src.port, res_src.path,
+      res_dst.path)
+    if ok and ret == true then callback() else callback(ret or "Rename failed") end
+  end)
+end
+
+
+
+---@param action table
+---@return string
+M.render_action = function(action)
+  if action.type == "create" then
+    return string.format("Create %s", action.url)
+  elseif action.type == "delete" then
+    return string.format("Delete %s", action.url)
+  elseif action.type == "move" then
+    return string.format("Move %s -> %s", action.src_url, action.dest_url)
+  else
+    return string.format("%s %s", action.type, action.url)
+  end
+end
+
+---@param action table
+---@param callback fun(err?: string)
+M.perform_action = function(action, callback)
+  if action.type == "create" then
+    M.create_entry(action.url, action.entry_type, callback)
+  elseif action.type == "delete" then
+    M.delete_entry(action.url, callback)
+  elseif action.type == "move" then
+    M.rename_entry(action.src_url, action.dest_url, callback)
+  else
+    callback(string.format("Action '%s' not supported", action.type))
+  end
 end
 
 ---@param name string

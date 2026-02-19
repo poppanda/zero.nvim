@@ -292,13 +292,49 @@ end
 
 function M.setup(opts)
     options = vim.tbl_deep_extend("force", defaults, opts or {})
+
+    local group = vim.api.nvim_create_augroup("ZeroNvim", { clear = true })
+
     vim.api.nvim_create_autocmd("BufReadCmd", {
         pattern = "remote://*",
         callback = function(args)
             local user, host, port, path = M.parse_uri(args.file)
             if user then vim.schedule(function() M.handle_fetch(args.buf, user, host, port, path) end) end
         end,
-        group = vim.api.nvim_create_augroup("ZeroNvim", { clear = true }),
+        group = group,
+    })
+
+    -- [NEW] Phase 2: Write support
+    vim.api.nvim_create_autocmd("BufWriteCmd", {
+        pattern = "remote://*",
+        callback = function(args)
+            local user, host, port, path = M.parse_uri(args.file)
+            if not user then return end
+
+            local lines = vim.api.nvim_buf_get_lines(args.buf, 0, -1, false)
+            local content = table.concat(lines, "\n")
+            -- Ensure trailing newline if file is not empty (standard Unix behavior)
+            if #content > 0 and content:sub(-1) ~= "\n" then
+                content = content .. "\n"
+            end
+
+            local chan = get_daemon_chan()
+            if not chan then
+                logger("Daemon not connected, cannot save.", vim.log.levels.ERROR)
+                return
+            end
+
+            vim.schedule(function()
+                local ok, res = pcall(vim.fn.rpcrequest, chan, "write_file", user, host, port, path, content)
+                if ok and res == true then
+                    vim.api.nvim_set_option_value('modified', false, { buf = args.buf })
+                    logger("Saved: " .. path, vim.log.levels.INFO)
+                else
+                    logger("Save failed: " .. tostring(res), vim.log.levels.ERROR)
+                end
+            end)
+        end,
+        group = group,
     })
 
     -- Register :ZeroLink user command

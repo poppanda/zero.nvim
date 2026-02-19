@@ -80,8 +80,31 @@ pub fn handle_write_file(
         .write_all(content.as_bytes())
         .map_err(|e| anyhow::anyhow!("写入失败 {}: {}", path, e))?;
 
+    // Drop sftp/lock before invalidation
+    drop(remote_file);
+    drop(sftp);
+    drop(state_lock);
+
     eprintln!("Daemon: 文件已写入 {} ({} bytes)", path, content.len());
+
+    eprintln!("Daemon: 文件已写入 {} ({} bytes)", path, content.len());
+
+    // Invalidate parent directory cache
+    invalidate_parent_cache(state, &key, Path::new(path));
+
     Ok(Value::Boolean(true))
+}
+
+fn invalidate_parent_cache(state: &Arc<Mutex<DaemonState>>, key: &str, path: &Path) {
+    if let Some(parent) = path.parent() {
+        let mut state_lock = state.lock().unwrap();
+        if let Some(cache) = state_lock.caches.get_mut(key) {
+            // Remove parent from cache to force refresh on next read_dir
+            // We use to_path_buf() because map keys are PathBuf
+            cache.directories.remove(&parent.to_path_buf());
+            eprintln!("Daemon: Invalidate cache for {:?}", parent);
+        }
+    }
 }
 
 // =============================================================================
@@ -251,6 +274,165 @@ pub fn handle_scan_project(
             cache.directories.insert(path, entries);
         }
         eprintln!("Daemon: scan_project 完成，缓存了 {} 个目录", count);
+    }
+
+    Ok(Value::Boolean(true))
+}
+
+// =============================================================================
+// mkdir — 创建远程目录
+// =============================================================================
+
+pub fn handle_mkdir(
+    user: &str,
+    host: &str,
+    port: u16,
+    path: &str,
+    state: &Arc<Mutex<DaemonState>>,
+) -> Result<Value, anyhow::Error> {
+    let key = DaemonState::connection_key(user, host, port);
+    let state_lock = state.lock().unwrap();
+    let sess = state_lock
+        .sessions
+        .get(&key)
+        .ok_or(anyhow::anyhow!("NOT_CONNECTED: {}", key))?;
+
+    let sftp = sess
+        .sftp()
+        .map_err(|e| anyhow::anyhow!("SFTP 初始化失败: {}", e))?;
+
+    // mode 0o755 = rwxr-xr-x
+    sftp.mkdir(Path::new(path), 0o755)
+        .map_err(|e| anyhow::anyhow!("创建目录失败 {}: {}", path, e))?;
+
+    // Drop sftp/session/lock explicitly or by scope if necessary.
+    // Here we can just call invalidate after letting them drop at end of function?
+    // No, sftp borrows from state_lock. We must drop state_lock before invalidate acquires it mutably.
+    // So we must scope the SFTP part.
+    // However, since we are rewriting the function body significantly, simpler to just wrap existing body in block?
+    // Actually, `state_lock` is defined at top of function.
+    // Let's rewrite the whole function body to be safe or use drop.
+    drop(sftp); // Drop sftp first
+    drop(state_lock); // Drop lock
+
+    // Invalidate parent cache
+    invalidate_parent_cache(state, &key, Path::new(path));
+
+    Ok(Value::Boolean(true))
+}
+
+// =============================================================================
+// remove_file — 删除远程文件
+// =============================================================================
+
+pub fn handle_remove_file(
+    user: &str,
+    host: &str,
+    port: u16,
+    path: &str,
+    state: &Arc<Mutex<DaemonState>>,
+) -> Result<Value, anyhow::Error> {
+    let key = DaemonState::connection_key(user, host, port);
+    let state_lock = state.lock().unwrap();
+    let sess = state_lock
+        .sessions
+        .get(&key)
+        .ok_or(anyhow::anyhow!("NOT_CONNECTED: {}", key))?;
+
+    let sftp = sess
+        .sftp()
+        .map_err(|e| anyhow::anyhow!("SFTP 初始化失败: {}", e))?;
+
+    sftp.unlink(Path::new(path))
+        .map_err(|e| anyhow::anyhow!("删除文件失败 {}: {}", path, e))?;
+
+    drop(sftp);
+    drop(state_lock);
+
+    invalidate_parent_cache(state, &key, Path::new(path));
+
+    Ok(Value::Boolean(true))
+}
+
+// =============================================================================
+// remove_dir — 删除远程目录
+// =============================================================================
+
+pub fn handle_remove_dir(
+    user: &str,
+    host: &str,
+    port: u16,
+    path: &str,
+    state: &Arc<Mutex<DaemonState>>,
+) -> Result<Value, anyhow::Error> {
+    let key = DaemonState::connection_key(user, host, port);
+    let state_lock = state.lock().unwrap();
+    let sess = state_lock
+        .sessions
+        .get(&key)
+        .ok_or(anyhow::anyhow!("NOT_CONNECTED: {}", key))?;
+
+    let sftp = sess
+        .sftp()
+        .map_err(|e| anyhow::anyhow!("SFTP 初始化失败: {}", e))?;
+
+    sftp.rmdir(Path::new(path))
+        .map_err(|e| anyhow::anyhow!("删除目录失败 {}: {}", path, e))?;
+
+    drop(sftp);
+    drop(state_lock);
+
+    invalidate_parent_cache(state, &key, Path::new(path));
+    // Also remove the dir itself from cache if present
+    {
+        let mut state_lock = state.lock().unwrap();
+        if let Some(cache) = state_lock.caches.get_mut(&key) {
+            cache.directories.remove(&PathBuf::from(path));
+        }
+    }
+
+    Ok(Value::Boolean(true))
+}
+
+// =============================================================================
+// rename — 重命名/移动远程路径
+// =============================================================================
+
+pub fn handle_rename(
+    user: &str,
+    host: &str,
+    port: u16,
+    src: &str,
+    dst: &str,
+    state: &Arc<Mutex<DaemonState>>,
+) -> Result<Value, anyhow::Error> {
+    let key = DaemonState::connection_key(user, host, port);
+    let state_lock = state.lock().unwrap();
+    let sess = state_lock
+        .sessions
+        .get(&key)
+        .ok_or(anyhow::anyhow!("NOT_CONNECTED: {}", key))?;
+
+    let sftp = sess
+        .sftp()
+        .map_err(|e| anyhow::anyhow!("SFTP 初始化失败: {}", e))?;
+
+    // SFTP rename flags (atomic logic differs by server version, standard rename is usually sufficient)
+    sftp.rename(Path::new(src), Path::new(dst), None)
+        .map_err(|e| anyhow::anyhow!("重命名失败 {} -> {}: {}", src, dst, e))?;
+
+    drop(sftp);
+    drop(state_lock);
+
+    invalidate_parent_cache(state, &key, Path::new(src));
+    invalidate_parent_cache(state, &key, Path::new(dst));
+    // Also if src was a cached dir, move it? Too complex. Just remove src from cache.
+    {
+        let mut state_lock = state.lock().unwrap();
+        if let Some(cache) = state_lock.caches.get_mut(&key) {
+            cache.directories.remove(&PathBuf::from(src));
+            // We don't populate dst because we don't know its contents and scanning is distinct.
+        }
     }
 
     Ok(Value::Boolean(true))

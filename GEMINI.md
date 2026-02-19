@@ -4,11 +4,13 @@
 
 ## Project Status
 
-**Current Milestone:** Milestone 3 (Project Tree & VFS Expansion) - **COMPLETED**
+**Current Milestone:** Milestone 4 (Global Search & Telescope Integration)
 
 -   [x] Milestone 1: Basic `remote://` protocol support (Read-Only) via `ssh` and `vim.system`.
 -   [x] Milestone 2: High-performance Daemon (Rust) for connection multiplexing via Msgpack-RPC.
 -   [x] Milestone 3: Project Topology Perception and Directory Tree Cache.
+-   [x] Feature: ZeroLink UI & `~/.ssh/config` Support (Parse local SSH configs for host selection).
+-   [x] Feature: Full Remote File Operations (Write, Mkdir, Delete, Rename) via SFTP & Oil.nvim Adapter.
 -   [ ] Milestone 4: Global Search & Telescope Integration.
 -   [ ] Milestone 5: Project level LSP Proxy.
 -   [ ] Milestone 6: 实现 0 延迟编辑与增量同步 (Incremental Sync).
@@ -41,9 +43,10 @@ Open a remote directory:
 - `R`: Refresh current directory cache.
 - `..`: Go to parent directory.
 
-## Architecture Notes (Milestone 3)
+## Architecture Notes
 
--   **Stat-based Dispatch**: When a `remote://` URI is accessed, the plugin first performs a `stat` call to determine if it should render a directory listing or fetch file content.
--   **Daemon Cache**: The Rust daemon maintains a `HashMap<PathBuf, Vec<DirEntry>>` to cache directory structures. This eliminates SSH round-trips for previously visited directories.
--   **Background Topology Scan**: Opening a directory triggers an asynchronous `scan_project` call that executes a remote `find` command to pre-populate the cache.
--   **SFTP Integration**: Switched from shell `ls` to SFTP for robust directory reading and metadata extraction.
+-   **ZeroLink & SSH Config**: Before connecting, the plugin delegates `~/.ssh/config` parsing to the Rust daemon. The UI presents a fast, floating telescope-like interface to pick predefined hosts.
+-   **Stat-based Dispatch**: When a `remote://` URI is accessed, the plugin performs a fast `stat` call via the daemon to determine if it should render a directory or fetch file content.
+-   **Daemon Cache & Invalidation**: The Rust daemon maintains a `HashMap<PathBuf, Vec<DirEntry>>` to cache directory structures, eliminating SSH round-trips. When files are created, renamed, or deleted through the plugin, the cache is automatically and targetedly invalidated to ensure the UI stays up-to-date.
+-   **Background Topology Scan**: Opening a directory triggers an asynchronous `scan_project` call that executes a remote BFS scan via SFTP to pre-populate the directory cache up to 3 levels deep.
+-   **Robust SFTP Core**: Switched all file system operations to use direct `libssh2` SFTP bindings instead of shell pipelines, offering secure, reliable reads/writes (even for large or binary files) with minimal latency.

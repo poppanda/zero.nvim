@@ -5,9 +5,10 @@
 ## Features
 
 -   **Persistent Connections**: SSH connections are reused across different files and directory listings.
--   **In-Memory Caching**: Directory structures are cached in the daemon for instant navigation.
--   **Custom Port Support**: Connect to non-standard SSH ports or through local tunnels.
--   **Oil.nvim Integration**: Native adapter for the modern `oil.nvim` file explorer with transparent protocol redirection.
+-   **In-Memory Caching**: Directory structures are cached in the daemon for instant navigation, with automatic cache invalidation on file changes.
+-   **ZeroLink UI**: Native floating window UI to parse `~/.ssh/config` and quickly pick remote hosts.
+-   **Full File Operations**: Support for reading, writing, creating, deleting, and renaming remote files via SFTP.
+-   **Oil.nvim Integration**: Native adapter for `oil.nvim` with full modification support and transparent protocol redirection.
 
 ## Installation
 
@@ -63,16 +64,30 @@ require("zero-nvim").setup({
 
 ## Basic Usage
 
+### ZeroLink (SSH Config Picker)
+
+Easily connect to hosts defined in your `~/.ssh/config` using a floating UI:
+
+```vim
+:ZeroLink
+```
+
+- **No args**: Opens a Telescope-like picker for SSH hosts. Select a host and browse directories.
+- **Specific target**: `:ZeroLink my_host /path/to/dir` opens it directly.
+
+### Manual Remote Protocol
+
 Open any remote file or directory using the `remote://` protocol:
 
 ```vim
 :e remote://user@host[:port]:/path/to/file_or_dir
 ```
 
-- **In Built-in Directory View:**
-    - `<CR>`: Open file or enter directory (reuses buffer for directories).
+- **Built-in Directory View**:
+    - `<CR>`: Open file or enter directory.
     - `..`: Go to parent directory.
     - `R`: Refresh cache.
+- **Editing Files**: Simply use `:w` to save changes directly to the remote server.
 
 ## Troubleshooting
 

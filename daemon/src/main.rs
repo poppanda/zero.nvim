@@ -129,6 +129,44 @@ fn dispatch(
             fs::handle_scan_project(user, host, port, path, &state)
         }
 
+        // ── 扩展文件操作 ──
+        "mkdir" => {
+            let (user, host, port, path) = extract_path_params(params)?;
+            fs::handle_mkdir(user, host, port, path, &state)
+        }
+
+        "remove_file" => {
+            let (user, host, port, path) = extract_path_params(params)?;
+            fs::handle_remove_file(user, host, port, path, &state)
+        }
+
+        "remove_dir" => {
+            let (user, host, port, path) = extract_path_params(params)?;
+            fs::handle_remove_dir(user, host, port, path, &state)
+        }
+
+        "rename" => {
+            let args = params.as_array().ok_or(anyhow::anyhow!("Invalid params"))?;
+            let user = args
+                .get(0)
+                .and_then(|v| v.as_str())
+                .ok_or(anyhow::anyhow!("Missing user"))?;
+            let host = args
+                .get(1)
+                .and_then(|v| v.as_str())
+                .ok_or(anyhow::anyhow!("Missing host"))?;
+            let port = args.get(2).and_then(|v| v.as_u64()).unwrap_or(22) as u16;
+            let src = args
+                .get(3)
+                .and_then(|v| v.as_str())
+                .ok_or(anyhow::anyhow!("Missing src"))?;
+            let dst = args
+                .get(4)
+                .and_then(|v| v.as_str())
+                .ok_or(anyhow::anyhow!("Missing dst"))?;
+            fs::handle_rename(user, host, port, src, dst, &state)
+        }
+
         _ => Err(anyhow::anyhow!("Unknown method: {}", method)),
     }
 }
