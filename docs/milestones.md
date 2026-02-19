@@ -1,4 +1,4 @@
-### Milestone 1：纯 Lua 跑通“只读”虚拟文件系统 (VFS)
+### Milestone 1：纯 Lua 跑通“只读”虚拟文件系统 (VFS) [COMPLETED]
 
 第一步，先不要碰任何后台守护进程，就用 Neovim 纯 Lua API 和系统的 `ssh` 命令，把远程文件拉到本地显示出来。
 
@@ -11,7 +11,7 @@
 
 **达标标志：** 你能在本地 Neovim 秒开一个远程文件，哪怕它是只读的。
 
-### Milestone 2：引入高性能后台守护进程 (Daemon)
+### Milestone 2：引入高性能后台守护进程 (Daemon) [COMPLETED]
 
 纯 Lua 的 `vim.system` 每次读写都要拉起一个新的 SSH 进程，连接开销极大，完全无法实现“0延迟同步”。这时候就需要开发常驻后台的 Daemon 了。
 
@@ -24,7 +24,7 @@
 
 **达标标志：** Lua 前端变得极度轻量，所有网络请求通过 Daemon 瞬间完成，文件读写不再有建立 SSH 连接的卡顿。
 
-### Milestone 3：项目拓扑感知与目录树缓存 (Project Tree & VFS Expansion)
+### Milestone 3：项目拓扑感知与目录树缓存 (Project Tree & VFS Expansion) [COMPLETED]
 
 要管理项目，第一步是让 Neovim 知道远程项目长什么样。如果每次展开目录都阻塞等待 SSH 返回，体验会非常糟糕。
 
@@ -37,62 +37,74 @@
 
 **达标标志：** 你可以在本地用 `nvim-tree` 丝滑地展开/折叠一个包含上万个文件的远程项目目录，且远端执行 `touch new_file` 时，本地文件树能瞬间自动出现该文件。
 
-### Milestone 4：将重度计算卸载到远端 (Global Search & Telescope Integration)
+### Milestone 4：项目管理与文件操作 (Project Management)
 
-项目管理中最高频的操作是**全局搜索（Grep）**和**文件查找（Find File）**。千万不要把所有文件拉到本地再搜索，这会撑爆网络带宽和内存。
-
-**核心任务：**
-
-1. **流式 RPC (Streaming RPC)：** 搜索结果可能成千上万，Daemon 和 Neovim 之间的通信必须支持流式传输，不能等所有结果集齐了再发，否则 UI 会卡死。
-2. **远端执行与管道转发：** * 当在本地发起全局搜索时，Daemon 将请求转换为远端的 `rg` (ripgrep) 命令：`ssh user@host "rg --json 'pattern' /project/root"`。
-* 远端的 `rg` 吐出每一行 JSON 结果，Daemon 实时解析、转换路径（将 `/project/root` 替换为 `remote://`），并通过 RPC 的 chunk 推送给本地 Neovim。
-
-
-3. **Telescope / Fzf-lua 适配：** 在本地编写一个 Telescope 自定义 Picker。它的数据源（Finder）不再是本地进程，而是监听 Daemon 推送过来的流式数据。
-
-**达标标志：** 按下快捷键，在本地 Telescope 的弹窗中输入关键字，远端大型项目的匹配结果能以极高的帧率如瀑布般刷出，选中结果敲击回车，瞬间打开该文件的 `remote://` 虚拟 Buffer。
-
-### Milestone 5：项目级 LSP 代理与工作区同步 (Workspace LSP & 0-Delay Sync)
-
-这是最终的 Boss 战。单文件的 LSP 比较容易骗，但项目级的 LSP（如 C++ 的 `clangd` 或 Rust 的 `rust-analyzer`）需要读取整个项目的依赖、配置文件（如 `compile_commands.json` 或 `Cargo.toml`）甚至进行全量索引。
+完善对远程项目的增删改查能力，并引入全项目搜索，真正实现“管理”远程项目。
 
 **核心任务：**
 
-1. **工作区根目录欺骗 (Workspace Root)：** 在拉起本地 LSP Client 时，通过 LSP 代理（你的 Daemon）将 `initialize` 请求中的 `rootUri` 动态转换为远端的工作区绝对路径。
-2. **读写分离的极致优化：**
-* **读（高亮/分析）：** 依然完全依赖远端的 LSP 进程。本地只负责渲染 `textDocument/publishDiagnostics` 发来的波浪线。
-* **写（增量同步）：** 这是难点。你不仅要把本地修改的 Diff 发给远端保存，**还要同时将这个 Diff 封装成 `textDocument/didChange` 消息发给远端的 LSP 进程**，否则 LSP 脑子里的代码状态和实际文件状态就脱节了。
+1. **全局搜索 (Global Search)：**
+   - **流式 RPC：** 实现 `grep` / `rg` 的流式结果返回，避免一次性传输大量数据卡死 UI。
+   - **Telescope/Fzf 集成：** 将远端搜索结果实时接入本地 Telescope Picker，点击跳转 `remote://` 文件。
 
+2. **文件/目录操作 (File Operations)：**
+   - 实现远程 `mkdir`, `touch`, `rm`, `mv`, `cp` 等操作。
+   - 对接文件管理器插件（如 `oil.nvim`, `neo-tree`）的写操作 API。
 
-3. **交叉跳转处理：** 当你执行 `Go To Definition` (跳转到定义) 时，LSP 可能会返回一个远端系统库的路径（例如 `/usr/include/stdio.h`）。Daemon 必须识别出这个路径不在你的项目根目录内，并动态为其创建一个新的只读 `remote://` 挂载点，拉取过来供本地查看。
+3. **Session 持久化：**
+   - 记住上次打开的远程项目状态，下次启动自动连接。
 
-**达标标志：** 能够在本地拥有项目级的代码补全、重构（Rename 跨文件修改）、查找所有引用（Find References），且所有这些操作都感觉像是在本地 SSD 上处理一样流畅。
+**达标标志：** 可以像操作本地项目一样，随意创建文件、重构目录，并能通过 Telescope 秒搜远程代码。
 
-### Milestone 6：实现 0 延迟编辑与增量同步
+### Milestone 5：LSP 代理基础 (LSP Proxy Foundation)
 
-现在文件能拉下来了，我们要处理“写”的问题。
-
-**核心任务：**
-
-1. **本地高亮：** 当 Buffer 加载完成后，根据文件后缀名，直接调用 `vim.treesitter.start()` 启用本地 Tree-sitter。这就完成了 0 延迟的语法高亮。
-2. **监听修改：** 使用 `vim.api.nvim_buf_attach` 监听 Buffer 的变化。它的 `on_lines` 回调会告诉你“哪几行被删除了，新增了什么内容”。
-3. **发送 Diff：** 不要全量保存！将这些行级的 Diff 变动通过 RPC 实时 Push 给 Daemon。
-4. **远程 Patch：** Daemon 通过 SSH 隧道，在远程服务器上执行类似 `sed` 或自定义的脚本，将 Diff 实时应用到远程文件中。
-
-**达标标志：** 本地敲击键盘丝滑无比（带有高亮），且远程文件的内容在你打字的同时被静默修改。
-
-### Milestone 7：攻克最终 Boss —— LSP 路径劫持与代理
-
-这是最难、也最有技术含量的一步。让本地的补全引擎（如 `nvim-cmp`）和 UI 完美渲染远程的诊断信息。
+搭建 Neovim 与远程 Language Server 之间的通信桥梁，实现单文件级别的智能功能。
 
 **核心任务：**
 
-1. **启动代理：** 在 Lua 中调用 `vim.lsp.start()`，但 `cmd` 指向你的 Daemon，比如 `cmd = { 'my-daemon', 'lsp-proxy', '--server', 'user@host', '--lsp', 'clangd' }`。
-2. **远程拉起：** Daemon 收到指令后，通过 SSH 在远程机器上拉起真正的 `clangd`。
-3. **报文重写（核心）：** Daemon 拦截 Neovim 发给 `clangd` 的所有 JSON-RPC 消息。
-* **拦截 Outbound：** 扫描 JSON，把 `uri: "remote://user@host/project/main.cpp"` 替换为 `uri: "file:///project/main.cpp"`，然后再通过 SSH 发给远程 `clangd`。
-* **拦截 Inbound：** 远程 `clangd` 返回诊断错误（比如第 10 行缺分号），Daemon 拦截响应，把 `file:///project/main.cpp` 还原为 `remote://...`，再丢给本地 Neovim。
+1. **Daemon 进程管理：**
+   - Daemon 能够在远程服务器上启动、监控、终止 LSP 进程（如 `clangd`, `pyright`）。
 
+2. **Stdio 转发 (Stdio Forwarding)：**
+   - 建立双向管道，将 Neovim 发出的 LSP 请求（JSON-RPC）透传给远程 LSP。
+   - 将远程 LSP 的响应透传回 Neovim。
 
+3. **基础路径转换：**
+   - 处理最简单的 `textDocument/didOpen` 和 `textDocument/didChange`。
+   - 将本地 `remote://...` 转换为远程 `file://...` 发送给 LSP。
 
-**达标标志：** 光标悬停时出现文档，输入 `->` 瞬间弹出补全列表，且代码写错时本地立即出现波浪线警告。
+**达标标志：** 打开一个远程 Python 文件，能够通过远程 `pyright` 获得基本的语法检查和 Hover 文档。
+
+### Milestone 6：LSP 进阶与工作区支持 (Advanced LSP & Workspace)
+
+解决复杂的路径映射和工作区级功能，让 LSP 真正可用。
+
+**核心任务：**
+
+1. **工作区根目录欺骗 (Workspace Root)：**
+   - 拦截 `initialize` 请求，修改 `rootUri` 为远程真实路径，让 LSP 正确识别项目根目录。
+
+2. **诊断信息映射 (Diagnostics)：**
+   - 拦截 `textDocument/publishDiagnostics`，将远程返回的 `file://` 路径还原为本地 `remote://` URI，确保波浪线画在正确的位置。
+
+3. **跨文件跳转 (Go-to-Definition)：**
+   - 当 LSP 返回定义位置时，如果目标文件未在本地缓存，自动触发 fetch 操作并在新 Buffer 打开。
+
+**达标标志：** 在 C++/Rust 项目中，能够准确进行跨文件跳转，查找引用，且项目级报错准确无误。
+
+### Milestone 7：零延迟编辑与增量同步 (Zero Latency & Sync)
+
+极致优化编辑体验，消除网络延迟带来的顿挫感。
+
+**核心任务：**
+
+1. **乐观 UI 更新 (Optimistic UI)：**
+   - 本地修改立即生效，后台异步发送 Diff。
+
+2. **增量同步 (Incremental Sync)：**
+   - 仅发送文件变动部分（Diff/Delta），而非全量覆盖，大幅降低带宽占用。
+
+3. **冲突处理：**
+   - 简单的版本控制或最后写入优先策略，防止并发修改丢失数据。
+
+**达标标志：** 即使在弱网环境下，打字编辑也如本地般丝滑，完全感觉不到并在远程编辑。

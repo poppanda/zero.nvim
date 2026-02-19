@@ -201,6 +201,77 @@ function M.handle_fetch(buf, user, host, port, path, password, refresh)
     end
 end
 
+--- Open a remote:// URI given resolved connection params and path.
+---@param user string
+---@param host string
+---@param port integer
+---@param path string
+local function open_remote(user, host, port, path)
+    -- Ensure path starts with /
+    if not path:match("^/") then
+        -- Expand ~ to /home/user
+        if path:match("^~") then
+            path = path:gsub("^~", "/home/" .. user)
+        else
+            path = "/home/" .. user .. "/" .. path
+        end
+    end
+    -- Ensure directory paths end with /
+    local uri = string.format("remote://%s@%s:%d:%s", user, host, port, path)
+    vim.cmd("edit " .. uri)
+end
+
+--- ZeroLink command handler.
+--- Usage: :ZeroLink [ssh_target] [path]
+---   - No args: show SSH host picker
+---   - ssh_target only: show path input
+---   - ssh_target + path: open directly
+---@param args string[] Command arguments (fargs)
+function M.zero_link(args)
+    local ssh_config = require("zero-nvim.ssh_config")
+    local ui = require("zero-nvim.ui")
+
+    local target = args[1]
+    local path = args[2]
+
+    -- Case 1: No arguments → show SSH host picker
+    if not target or target == "" then
+        local hosts = ssh_config.parse()
+        ui.pick_host(hosts, function(entry)
+            local user = entry.user or vim.env.USER or "root"
+            local hostname = entry.hostname or entry.host
+            local port = entry.port or 22
+            -- After picking host, browse remote directories
+            ui.browse_path(user, hostname, port, function(p)
+                open_remote(user, hostname, port, p)
+            end, { display_name = entry.host })
+        end)
+        return
+    end
+
+    -- Resolve the ssh target
+    local resolved = ssh_config.resolve(target)
+    if not resolved then
+        logger("Cannot resolve SSH target: " .. target, vim.log.levels.ERROR)
+        return
+    end
+
+    local user = resolved.user
+    local hostname = resolved.hostname
+    local port = resolved.port
+
+    -- Case 3: Both target and path provided → open directly
+    if path and path ~= "" then
+        open_remote(user, hostname, port, path)
+        return
+    end
+
+    -- Case 2: Only target, no path → browse remote directories
+    ui.browse_path(user, hostname, port, function(p)
+        open_remote(user, hostname, port, p)
+    end, { display_name = target })
+end
+
 function M.setup(opts)
     options = vim.tbl_deep_extend("force", defaults, opts or {})
     vim.api.nvim_create_autocmd("BufReadCmd", {
@@ -210,6 +281,31 @@ function M.setup(opts)
             if user then vim.schedule(function() M.handle_fetch(args.buf, user, host, port, path) end) end
         end,
         group = vim.api.nvim_create_augroup("ZeroNvim", { clear = true }),
+    })
+
+    -- Register :ZeroLink user command
+    vim.api.nvim_create_user_command("ZeroLink", function(cmd_opts)
+        M.zero_link(cmd_opts.fargs)
+    end, {
+        nargs = "*",
+        desc = "Connect to remote server via SSH config",
+        complete = function(arg_lead, cmd_line, cursor_pos)
+            -- Provide completion for SSH host aliases
+            local parts = vim.split(cmd_line, "%s+")
+            if #parts <= 2 then
+                -- Completing first arg: ssh target
+                local ssh_config = require("zero-nvim.ssh_config")
+                local hosts = ssh_config.parse()
+                local completions = {}
+                for _, entry in ipairs(hosts) do
+                    if entry.host:find(arg_lead, 1, true) == 1 then
+                        table.insert(completions, entry.host)
+                    end
+                end
+                return completions
+            end
+            return {}
+        end,
     })
 end
 
