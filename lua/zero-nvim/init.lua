@@ -78,6 +78,12 @@ local function get_daemon_chan()
     return state.channel_id
 end
 
+--- 暴露 daemon channel 给其他模块（如 ssh_config.lua）使用
+--- 仅在 daemon 已启动时返回 channel_id，不会自动启动 daemon
+function M._get_daemon_chan()
+    return state.channel_id
+end
+
 function M.ensure_connection(user, host, port, password)
     local chan = get_daemon_chan()
     if not chan then return nil, "Daemon not running" end

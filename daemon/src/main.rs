@@ -1,33 +1,26 @@
-use rmpv::{Value, decode, encode};
-use std::io::{Write, Read};
+// =============================================================================
+// zero-nvim daemon — 入口 & RPC 分发
+// =============================================================================
+// 通过 stdin/stdout Msgpack-RPC 与 Neovim 通信。
+// 实际处理逻辑分布在各子模块中：
+//   - state:      全局状态和数据结构
+//   - ssh_config: SSH 配置解析
+//   - connect:    SSH 连接管理
+//   - fs:         远程文件系统操作（读/写/目录/扫描）
+
+mod connect;
+mod fs;
+mod ssh_config;
+mod state;
+
+use rmpv::{decode, encode, Value};
+use state::DaemonState;
+use std::io::Write;
 use std::sync::{Arc, Mutex};
-use std::net::TcpStream;
-use ssh2::Session;
-use std::collections::HashMap;
 
-struct ProjectCache {
-    directories: HashMap<std::path::PathBuf, Vec<DirEntry>>,
-}
-
-#[derive(Clone, Debug)]
-struct DirEntry {
-    name: String,
-    file_type: String,
-}
-
-struct DaemonState {
-    sessions: HashMap<String, Session>,
-    caches: HashMap<String, ProjectCache>,
-}
-
-impl DaemonState {
-    fn new() -> Self {
-        Self { 
-            sessions: HashMap::new(),
-            caches: HashMap::new(),
-        }
-    }
-}
+// =============================================================================
+// 主循环
+// =============================================================================
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let state = Arc::new(Mutex::new(DaemonState::new()));
@@ -36,11 +29,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut stdout = std::io::stdout();
 
     loop {
+        // 从 stdin 读取一条 Msgpack 消息
         let msg = match decode::read_value(&mut reader) {
             Ok(v) => v,
-            Err(_) => break,
+            Err(_) => break, // stdin 关闭 = Neovim 退出
         };
 
+        // Msgpack-RPC request: [type=0, msgid, method, params]
         if let Value::Array(ref args) = msg {
             if args.len() == 4 {
                 let msg_type = args[0].as_u64();
@@ -50,11 +45,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 if let (Some(0), Some(id)) = (msg_type, msg_id) {
                     if let Some(method) = method_val.as_str() {
-                        let response_res = handle_request(method, params, state.clone());
-                        let (err, res) = match response_res {
+                        let result = dispatch(method, params, state.clone());
+                        let (err, res) = match result {
                             Ok(val) => (Value::Nil, val),
                             Err(e) => (Value::String(format!("{}", e).into()), Value::Nil),
                         };
+                        // Msgpack-RPC response: [type=1, msgid, error, result]
                         let response = Value::Array(vec![
                             Value::Integer(1.into()),
                             Value::Integer(id.into()),
@@ -64,7 +60,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         if encode::write_value(&mut stdout, &response).is_ok() {
                             let _ = stdout.flush();
                         }
-                        continue;
                     }
                 }
             }
@@ -73,182 +68,108 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn handle_request(method: &str, params: &Value, state: Arc<Mutex<DaemonState>>) -> Result<Value, anyhow::Error> {
+// =============================================================================
+// RPC 方法分发表
+// =============================================================================
+// 每个方法负责从 params 中提取参数，然后委托给对应模块的处理函数。
+
+fn dispatch(
+    method: &str,
+    params: &Value,
+    state: Arc<Mutex<DaemonState>>,
+) -> Result<Value, anyhow::Error> {
     match method {
+        // ── SSH 配置 ──
+        "list_ssh_hosts" => ssh_config::handle_list_ssh_hosts(&state),
+
+        "resolve_ssh_target" => {
+            let args = params.as_array().ok_or(anyhow::anyhow!("Invalid params"))?;
+            let target = args
+                .get(0)
+                .and_then(|v| v.as_str())
+                .ok_or(anyhow::anyhow!("Missing target"))?;
+            ssh_config::handle_resolve_ssh_target(target, &state)
+        }
+
+        // ── 连接管理 ──
         "connect" => {
-            let args = params.as_array().ok_or(anyhow::anyhow!("Invalid params"))?;
-            let user = args.get(0).and_then(|v| v.as_str()).ok_or(anyhow::anyhow!("Missing user"))?;
-            let host = args.get(1).and_then(|v| v.as_str()).ok_or(anyhow::anyhow!("Missing host"))?;
-            let port = args.get(2).and_then(|v| v.as_u64()).unwrap_or(22) as u16;
-            let password = args.get(3).and_then(|v| v.as_str());
-            let key = format!("{}@{}:{}", user, host, port);
+            let (user, host, port, password) = extract_connect_params(params)?;
+            connect::handle_connect(user, host, port, password, &state)
+        }
 
-            // 检查现有 Session 是否仍然有效
-            {
-                let state_lock = state.lock().unwrap();
-                if let Some(sess) = state_lock.sessions.get(&key) {
-                    if sess.authenticated() {
-                        return Ok(Value::Boolean(true));
-                    }
-                }
-            }
-
-            eprintln!("Daemon: Connecting to {}", key);
-            let tcp = TcpStream::connect(format!("{}:{}", host, port))?;
-            tcp.set_nodelay(true)?; 
-            let mut sess = Session::new()?;
-            sess.set_tcp_stream(tcp);
-            sess.set_timeout(10000); 
-            sess.handshake().map_err(|e| anyhow::anyhow!("Handshake failed: {}", e))?;
-
-            let mut authenticated = false;
-
-            // 1. Try Agent
-            if let Ok(mut agent) = sess.agent() {
-                if let Err(e) = agent.connect() {
-                    eprintln!("Daemon: SSH Agent connect failed: {}", e);
-                } else {
-                    if agent.list_identities().is_ok() {
-                         if let Ok(identities) = agent.identities() {
-                            for identity in identities {
-                                if agent.userauth(user, &identity).is_ok() {
-                                    eprintln!("Daemon: SSH Agent auth successful");
-                                    authenticated = true;
-                                    break;
-                                }
-                            }
-                         }
-                    }
-                }
-            }
-
-            // 2. Try Pubkey File
-            if !authenticated {
-                if let Some(home) = dirs::home_dir() {
-                    let ssh_dir = home.join(".ssh");
-                    // 按照 OpenSSH 默认顺序尝试
-                    let keys = vec!["id_ed25519", "id_rsa", "id_ecdsa", "id_dsa"]; 
-                    for key_name in keys {
-                        let priv_key_path = ssh_dir.join(key_name);
-                        if priv_key_path.exists() {
-                            eprintln!("Daemon: Trying pubkey file: {}", priv_key_path.display());
-                            if sess.userauth_pubkey_file(user, None, &priv_key_path, None).is_ok() {
-                                eprintln!("Daemon: Pubkey auth successful: {}", key_name);
-                                authenticated = true;
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-
-            // 3. Try Password
-            if !authenticated {
-                if let Some(pwd) = password {
-                    if sess.userauth_password(user, pwd).is_ok() {
-                        authenticated = true;
-                    }
-                }
-            }
-
-            if !authenticated {
-                 return Err(anyhow::anyhow!("AUTH_FAILED: Authentication failed for {}", key));
-            }
-
-            let mut state_lock = state.lock().unwrap();
-            state_lock.sessions.insert(key.clone(), sess);
-            state_lock.caches.insert(key.clone(), ProjectCache { directories: HashMap::new() });
-            eprintln!("Daemon: Session established for {}", key);
-            Ok(Value::Boolean(true))
-        },
+        // ── 文件操作 ──
         "fetch_file" => {
+            let (user, host, port, path) = extract_path_params(params)?;
+            fs::handle_fetch_file(user, host, port, path, &state)
+        }
+
+        "write_file" => {
             let args = params.as_array().ok_or(anyhow::anyhow!("Invalid params"))?;
-            let user = args.get(0).and_then(|v| v.as_str()).ok_or(anyhow::anyhow!("Missing user"))?;
-            let host = args.get(1).and_then(|v| v.as_str()).ok_or(anyhow::anyhow!("Missing host"))?;
-            let port = args.get(2).and_then(|v| v.as_u64()).unwrap_or(22) as u16;
-            let path = args.get(3).and_then(|v| v.as_str()).ok_or(anyhow::anyhow!("Missing path"))?;
-            let key = format!("{}@{}:{}", user, host, port);
-            let state_lock = state.lock().unwrap();
-            if let Some(sess) = state_lock.sessions.get(&key) {
-                let mut channel = sess.channel_session()?;
-                channel.exec(&format!("cat '{}'", path))?; // 加引号以支持带空格的路径
-                let mut s = String::new();
-                channel.read_to_string(&mut s)?;
-                channel.wait_close()?;
-                if channel.exit_status()? != 0 {
-                    return Err(anyhow::anyhow!("Remote command failed"));
-                }
-                Ok(Value::String(s.into()))
-            } else {
-                Err(anyhow::anyhow!("NOT_CONNECTED: {}", key))
-            }
-        },
+            let (user, host, port, path) = extract_path_params(params)?;
+            let content = args
+                .get(4)
+                .and_then(|v| v.as_str())
+                .ok_or(anyhow::anyhow!("Missing content"))?;
+            fs::handle_write_file(user, host, port, path, content, &state)
+        }
+
+        // ── 目录操作 ──
         "read_dir" => {
-            let args = params.as_array().ok_or(anyhow::anyhow!("Invalid params"))?;
-            let user = args.get(0).and_then(|v| v.as_str()).ok_or(anyhow::anyhow!("Missing user"))?;
-            let host = args.get(1).and_then(|v| v.as_str()).ok_or(anyhow::anyhow!("Missing host"))?;
-            let port = args.get(2).and_then(|v| v.as_u64()).unwrap_or(22) as u16;
-            let path_str = args.get(3).and_then(|v| v.as_str()).ok_or(anyhow::anyhow!("Missing path"))?;
-            let key = format!("{}@{}:{}", user, host, port);
+            let (user, host, port, path) = extract_path_params(params)?;
+            fs::handle_read_dir(user, host, port, path, &state)
+        }
 
-            // 检查缓存
-            {
-                let state_lock = state.lock().unwrap();
-                if let Some(cache) = state_lock.caches.get(&key) {
-                    if let Some(entries) = cache.directories.get(&std::path::PathBuf::from(path_str)) {
-                        let mut result = Vec::new();
-                        for entry in entries {
-                            let mut map = Vec::new();
-                            map.push((Value::String("name".into()), Value::String(entry.name.clone().into())));
-                            map.push((Value::String("type".into()), Value::String(entry.file_type.clone().into())));
-                            result.push(Value::Map(map));
-                        }
-                        return Ok(Value::Array(result));
-                    }
-                }
-            }
-
-            let mut state_lock = state.lock().unwrap();
-            if let Some(sess) = state_lock.sessions.get(&key) {
-                let sftp = sess.sftp().map_err(|e| anyhow::anyhow!("SFTP Init failed: {}. Check if sftp-server is enabled on remote.", e))?;
-                let entries = sftp.readdir(std::path::Path::new(path_str))?;
-                let mut result_entries = Vec::new();
-                let mut result_msgpack = Vec::new();
-                for (p, stat) in entries {
-                    let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("").to_string();
-                    if name == "." || name == ".." { continue; }
-                    let file_type = if stat.is_dir() { "directory" } else { "file" };
-                    result_entries.push(DirEntry { name: name.clone(), file_type: file_type.to_string() });
-                    let mut entry_map = Vec::new();
-                    entry_map.push((Value::String("name".into()), Value::String(name.into())));
-                    entry_map.push((Value::String("type".into()), Value::String(file_type.into())));
-                    result_msgpack.push(Value::Map(entry_map));
-                }
-                if let Some(cache) = state_lock.caches.get_mut(&key) {
-                    cache.directories.insert(std::path::PathBuf::from(path_str), result_entries);
-                }
-                Ok(Value::Array(result_msgpack))
-            } else {
-                Err(anyhow::anyhow!("NOT_CONNECTED: {}", key))
-            }
-        },
         "stat" => {
-            let args = params.as_array().ok_or(anyhow::anyhow!("Invalid params"))?;
-            let user = args.get(0).and_then(|v| v.as_str()).ok_or(anyhow::anyhow!("Missing user"))?;
-            let host = args.get(1).and_then(|v| v.as_str()).ok_or(anyhow::anyhow!("Missing host"))?;
-            let port = args.get(2).and_then(|v| v.as_u64()).unwrap_or(22) as u16;
-            let path = args.get(3).and_then(|v| v.as_str()).ok_or(anyhow::anyhow!("Missing path"))?;
-            let key = format!("{}@{}:{}", user, host, port);
-            let state_lock = state.lock().unwrap();
-            if let Some(sess) = state_lock.sessions.get(&key) {
-                let sftp = sess.sftp().map_err(|e| anyhow::anyhow!("SFTP Init failed: {}", e))?;
-                let stat = sftp.stat(std::path::Path::new(path))?;
-                let file_type = if stat.is_dir() { "directory" } else { "file" };
-                Ok(Value::String(file_type.into()))
-            } else {
-                Err(anyhow::anyhow!("NOT_CONNECTED: {}", key))
-            }
-        },
+            let (user, host, port, path) = extract_path_params(params)?;
+            fs::handle_stat(user, host, port, path, &state)
+        }
+
+        "scan_project" => {
+            let (user, host, port, path) = extract_path_params(params)?;
+            fs::handle_scan_project(user, host, port, path, &state)
+        }
+
         _ => Err(anyhow::anyhow!("Unknown method: {}", method)),
     }
+}
+
+// =============================================================================
+// 参数提取辅助函数
+// =============================================================================
+
+/// 从 [user, host, port, path] 提取通用路径参数
+fn extract_path_params(params: &Value) -> Result<(&str, &str, u16, &str), anyhow::Error> {
+    let args = params.as_array().ok_or(anyhow::anyhow!("Invalid params"))?;
+    let user = args
+        .get(0)
+        .and_then(|v| v.as_str())
+        .ok_or(anyhow::anyhow!("Missing user"))?;
+    let host = args
+        .get(1)
+        .and_then(|v| v.as_str())
+        .ok_or(anyhow::anyhow!("Missing host"))?;
+    let port = args.get(2).and_then(|v| v.as_u64()).unwrap_or(22) as u16;
+    let path = args
+        .get(3)
+        .and_then(|v| v.as_str())
+        .ok_or(anyhow::anyhow!("Missing path"))?;
+    Ok((user, host, port, path))
+}
+
+/// 从 [user, host, port, password?] 提取连接参数
+fn extract_connect_params(
+    params: &Value,
+) -> Result<(&str, &str, u16, Option<&str>), anyhow::Error> {
+    let args = params.as_array().ok_or(anyhow::anyhow!("Invalid params"))?;
+    let user = args
+        .get(0)
+        .and_then(|v| v.as_str())
+        .ok_or(anyhow::anyhow!("Missing user"))?;
+    let host = args
+        .get(1)
+        .and_then(|v| v.as_str())
+        .ok_or(anyhow::anyhow!("Missing host"))?;
+    let port = args.get(2).and_then(|v| v.as_u64()).unwrap_or(22) as u16;
+    let password = args.get(3).and_then(|v| v.as_str());
+    Ok((user, host, port, password))
 }
