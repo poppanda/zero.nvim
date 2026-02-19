@@ -216,9 +216,21 @@ local function open_remote(user, host, port, path)
             path = "/home/" .. user .. "/" .. path
         end
     end
-    -- Ensure directory paths end with /
-    local uri = string.format("remote://%s@%s:%d:%s", user, host, port, path)
-    vim.cmd("edit " .. uri)
+
+    -- Determine if this is a directory path (ends with / or has no extension)
+    local is_dir = path:match("/$") or not path:match("%.[^/]+$")
+
+    if is_dir then
+        -- Ensure trailing slash for oil
+        if not path:match("/$") then path = path .. "/" end
+        -- oil-zero://user@host:port/path
+        local uri = string.format("oil-zero://%s@%s:%d%s", user, host, port, path)
+        vim.cmd("edit " .. uri)
+    else
+        -- remote://user@host:port:path (for files)
+        local uri = string.format("remote://%s@%s:%d:%s", user, host, port, path)
+        vim.cmd("edit " .. uri)
+    end
 end
 
 --- ZeroLink command handler.
