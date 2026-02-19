@@ -19,6 +19,7 @@
     -   `zero-nvim.lua`: Automatically initializes the plugin when Neovim starts.
 -   **`tests/`**: Test scripts.
     -   `test_zero_milestone1.lua`: A standalone Lua script to verify Milestone 1 functionality by mocking `vim.system`.
+    -   `test_zero_password_auth.lua`: A standalone Lua script to verify password authentication fallback logic.
 -   **`docs/`**: Documentation and design specs.
     -   `milestones.md`: Detailed roadmap and task breakdown.
     -   `functions.md`: Architecture design notes.
@@ -29,7 +30,7 @@
 ### Prerequisites
 
 -   **Neovim 0.10+** (Required for `vim.system`).
--   **SSH Client**: Must be configured for non-interactive authentication (SSH keys/Agent) to the target host.
+-   **SSH Client**: Configured for either key-based (preferred) or password-based authentication.
 
 ### Running in Development Mode
 
@@ -50,15 +51,18 @@ Run the automated test suite from the project root:
 
 ```bash
 nvim -l tests/test_zero_milestone1.lua
+nvim -l tests/test_zero_password_auth.lua
 ```
 
 ## Architecture Notes (Milestone 1)
 
 -   **Protocol:** `remote://user@host:/path/to/file`
--   **Mechanism:** Intercepts `BufReadCmd`. Uses `ssh -o BatchMode=yes` to fetch file content via `cat`.
+-   **Mechanism:** Intercepts `BufReadCmd`.
+    -   **Authentication:** Attempts public key authentication first (`BatchMode=yes`). If it fails, falls back to interactive password prompt via `vim.ui.input` and retries using a temporary `SSH_ASKPASS` script.
 -   **Buffer State:** Buffers are currently set to `buftype=acwrite`, `nomodified`, and `readonly`.
 -   **Error Handling:** Catches SSH errors (connectivity, permissions) and reports them via `vim.notify` and `:messages`.
 
 ## Key Commands
 
--   **Fetch File:** `ssh -o BatchMode=yes -o ConnectTimeout=5 user@host cat /path/to/file`
+-   **Fetch File (Key):** `ssh -o BatchMode=yes -o ConnectTimeout=5 user@host cat /path/to/file`
+-   **Fetch File (Password):** `ssh -o ConnectTimeout=5 user@host cat /path/to/file` (with `SSH_ASKPASS` environment set)
