@@ -26,6 +26,7 @@
     "root": "/var/www/backend",     // 远程项目的根目录
     "lsp": {                        // [可选] 项目级 LSP 覆盖配置
       "basedpyright-langserver": {
+        "cmd": ["/var/www/backend/.venv/bin/basedpyright-langserver", "--stdio"], // [新增] 允许覆盖启动命令
         "settings": {
           "python": {
             "pythonPath": "/var/www/backend/.venv/bin/python"
@@ -53,12 +54,13 @@
 
 这是项目管理的主入口。
 
-*   **UI Style**: 使用 `Telescope` (如果可用) 或 `vim.ui.select` (Fallback) 提供的列表选择界面。
+*   **UI Style**: **优先使用 `zero-nvim` 原生浮动窗口风格** (参考 `ZeroLink` / `ZeroSearch` 的实现)，以保持视觉一致性。仅在极简模式下回退到 `vim.ui.select`。
 *   **Display Items**:
     *   `[dev-server] /var/www/api (Python)`
     *   `[prod-db] /etc/postgresql/14/main`
 *   **Actions (快捷键映射)**:
-    *   `<CR>` (Enter): **Open**. 连接并打开远程目录 (`:e remote://...`)。
+    *   `<CR>` (Enter): **Open**. 连接并打开远程目录。
+        *   *Compatibility Note*: 必须尊重用户的 `opts.explorer` 设置。如果用户启用了 `oil`，自动通过 `oil.nvim` 打开 (`oil-zero://...`)，否则使用 `remote://...`。
     *   `<C-e>` (Edit): **Edit Config**. 打开浮动窗口编辑该项目的 JSON 片段。
     *   `<C-d>` (Delete): **Delete**. 删除该项目记录。
     *   `<C-h>` (Check): **Health Check**. 运行环境检查 (见下文)。
@@ -67,7 +69,7 @@
 
 在当前缓冲区 (Buffer) 下快速保存为项目。
 
-*   **Trigger**: 用户当前正处于 `remote://user@host/path/file` 下。
+*   **Trigger**: 用户当前正处于 `remote://` 或 `oil-zero://` 路径下。
 *   **Behavior**:
     1.  自动解析当前的 Host 和 Root Dir。
     2.  弹出 Input 框询问 `Project Name` (默认为文件夹名)。
@@ -94,7 +96,9 @@
     *   **Fail**: "Directory not found" 或 "Permission denied"。
 
 3.  **Level 3: LSP Binary Check (Optional)**
-    *   **Action**: 如果配置中定义了 LSP，尝试在远程执行 `which <binary_name>` 或 `<binary> --version`。
+    *   **Action**: 如果配置中定义了 `lsp`：
+        *   检查 `cmd` (如果覆盖了) 或默认 binary 是否存在于远程 PATH 或指定路径。
+        *   执行 `which <binary_name>` 或 `<binary> --version`。
     *   **Success**: 返回版本号或路径。
     *   **Fail**: "Command not found"。
 
@@ -115,12 +119,15 @@
 当用户执行 `:ZeroLspStart <server>` 时，逻辑更新如下：
 
 1.  **Context Detection**: 获取当前 Buffer 的 `remote://` 路径。
-2.  **Project Match**: 检查该路径是否属于 `projects.json` 中的某个已知项目。
+2.  **Project Match**: 
+    *   遍历 `projects.json` 中所有项目的 `root` 路径。
+    *   采用 **Longest Prefix Match (最长前缀匹配)** 策略。
+    *   例如：文件 `/app/backend/main.py` 应该匹配项目 `/app/backend` 而不是 `/app`。
 3.  **Config Resolution**:
     *   Base: `require("zero-nvim").setup()` 中的全局配置。
-    *   Override: `projects.json` 中该项目的 `lsp` 配置。
+    *   Override: `projects.json` 中该项目的 `lsp` 配置 (包含 `cmd` 和 `settings`)。
     *   Result: `vim.tbl_deep_extend("force", Base, Override)`。
-4.  **Launch**: 使用合并后的配置启动 LSP。
+4.  **Launch**: 使用合并后的配置 (包括自定义 `cmd`) 启动 LSP。
 
 ---
 
