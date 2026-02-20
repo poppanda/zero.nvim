@@ -56,7 +56,7 @@
 
 **达标标志：** 可以像操作本地项目一样，随意创建文件、重构目录，并能通过 Telescope 秒搜远程代码。
 
-### Milestone 5：LSP 代理基础 (LSP Proxy Foundation)
+### Milestone 5：LSP 代理基础 (LSP Proxy Foundation) [COMPLETED]
 
 搭建 Neovim 与远程 Language Server 之间的通信桥梁，实现单文件级别的智能功能。
 

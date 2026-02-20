@@ -4,15 +4,16 @@
 
 ## Features
 
--   **Persistent Connections**: SSH connections are reused across different files and directory listings.
--   **In-Memory Caching**: Directory structures are cached in the daemon for instant navigation, with automatic cache invalidation on file changes.
--   **ZeroLink UI**: Native floating window UI to parse `~/.ssh/config` and quickly pick remote hosts.
--   **Full File Operations**: Support for reading, writing, creating, deleting, and renaming remote files via SFTP.
--   **Oil.nvim Integration**: Native adapter for `oil.nvim` with full modification support and transparent protocol redirection.
+- **Persistent Connections**: SSH connections are reused across different files and directory listings.
+- **In-Memory Caching**: Directory structures are cached in the daemon for instant navigation, with automatic cache invalidation on file changes.
+- **ZeroLink UI**: Native floating window UI to parse `~/.ssh/config` and quickly pick remote hosts.
+- **Full File Operations**: Support for reading, writing, creating, deleting, and renaming remote files via SFTP.
+- **Oil.nvim Integration**: Native adapter for `oil.nvim` with full modification support and transparent protocol redirection.
 
 ## Installation
 
 ### 1. Build the Daemon
+
 The plugin requires a Rust backend. Build it from the `daemon/` directory:
 
 ```bash
@@ -53,14 +54,14 @@ require("oil").setup({
 
 -- 2. (Optional) Enable transparent redirection in ZeroNvim
 require("zero-nvim").setup({
-  explorer = "oil", 
+  explorer = "oil",
 })
 ```
 
 **Usage:**
+
 - If `explorer = "oil"` is enabled: `:e remote://user@host/path/to/dir/` will automatically open in Oil.
 - Manual access: `:edit oil-zero://user@host[:port]/path/to/dir/`
-
 
 ## Basic Usage
 
@@ -84,13 +85,13 @@ Search your project instantly via ripgrep with an enhanced, native Tree-Like UI 
 ```
 
 - **Auto-Context Detection**: `:ZeroSearch` intelligently detects if you are in a local buffer or a remote buffer (`remote://` / `oil-zero://`). If remote, it securely offloads the search to the Rust daemon. If local, it seamlessly falls back to a fast local `rg` process.
-- **Tree-Like Grouping**: Results are grouped by file and visually indented with colored icons, line numbers, and search match extmarks. 
+- **Tree-Like Grouping**: Results are grouped by file and visually indented with colored icons, line numbers, and search match extmarks.
 - **Keyboard Navigation**:
   - `j` / `k`: Navigate through files and matched lines.
   - `h` / `l`: Expand or collapse file nodes to instantly hide/reveal matches.
   - `<C-c>`: Toggle Case-Sensitive exact matching.
   - `<C-w>`: Toggle Whole Word (Regex) exact matching.
-  - `<CR>`: Jump precisely to the matched file and line. 
+  - `<CR>`: Jump precisely to the matched file and line.
 - **Live Preview**: The right-hand window actively previews the file logic beneath your cursor.
 
 ### Local Buffer Search (ZeroSearchMini)
@@ -118,9 +119,9 @@ Open any remote file or directory using the `remote://` protocol:
 ```
 
 - **Built-in Directory View**:
-    - `<CR>`: Open file or enter directory.
-    - `..`: Go to parent directory.
-    - `R`: Refresh cache.
+  - `<CR>`: Open file or enter directory.
+  - `..`: Go to parent directory.
+  - `R`: Refresh cache.
 - **Editing Files**: Simply use `:w` to save changes directly to the remote server.
 
 ## Troubleshooting

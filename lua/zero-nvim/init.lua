@@ -11,6 +11,9 @@ local defaults = {
         prefix = "ZeroNvim: ",
     },
     explorer = "builtin",
+    lsp = {
+        servers = {}, -- key: server binary name, value: { settings = table }
+    },
 }
 
 -- 插件内部状态
@@ -18,6 +21,7 @@ local state = {
     channel_id = nil,
     connected_hosts = {},
     scanned_projects = {},
+    mason_bins = {}, -- key: "user@host:port" -> list of mason bin names
 }
 
 local options = {}
@@ -38,6 +42,18 @@ function M.parse_uri(uri)
     if user and host and path then
         return user, host, 22, path
     end
+
+    -- Support oil-zero://user@host:port/path  (no colon before path, host stops at : or /)
+    user, host, port_str, path = string.match(uri, "^oil%-zero://([^@]+)@([^:/]+):(%d+)(/.*)$")
+    if user and host and port_str and path then
+        return user, host, tonumber(port_str), path
+    end
+    -- oil-zero://user@host/path  (no port)
+    user, host, path = string.match(uri, "^oil%-zero://([^@]+)@([^:/]+)(/.*)$")
+    if user and host and path then
+        return user, host, 22, path
+    end
+
     return nil
 end
 
@@ -95,8 +111,42 @@ function M.ensure_connection(user, host, port, password)
             return nil, tostring(res)
         end
         state.connected_hosts[key] = true
+        -- Async: scan mason/bin on the remote server for LSP autocomplete
+        vim.schedule(function()
+            M.scan_mason_bins(user, host, port)
+        end)
     end
     return chan
+end
+
+--- Scan ~/.local/share/nvim/mason/bin/ on the remote server and cache the bin names.
+--- Results are used as autocomplete suggestions for :ZeroLspStart.
+function M.scan_mason_bins(user, host, port)
+    local chan = get_daemon_chan()
+    if not chan then return end
+    local key = string.format("%s@%s:%s", user, host, port)
+    local mason_bin_path = string.format("/home/%s/.local/share/nvim/mason/bin", user)
+    local ok, entries = pcall(vim.fn.rpcrequest, chan, "read_dir", user, host, port, mason_bin_path)
+    if not ok or type(entries) ~= "table" then
+        -- Try with ec2-user style home if user != ec2-user etc.
+        -- Or fallback silently — autocomplete just won't show Mason bins.
+        return
+    end
+    local bins = {}
+    for _, entry in ipairs(entries) do
+        if entry.type == "file" then
+            table.insert(bins, entry.name)
+        end
+    end
+    state.mason_bins[key] = bins
+end
+
+--- Get cached mason bin completions for the currently connected remote host.
+function M.get_mason_bins()
+    for key, bins in pairs(state.mason_bins) do
+        return bins -- Return bins for the first (usually only) connected host
+    end
+    return {}
 end
 
 function M.get_entries(user, host, port, path)
@@ -368,6 +418,41 @@ function M.setup(opts)
     end, {
         nargs = 0,
         desc = "Search remote server using Telescope",
+    })
+
+    -- [NEW] Register :ZeroLspStart user command
+    vim.api.nvim_create_user_command("ZeroLspStart", function(cmd_opts)
+        local args = cmd_opts.fargs
+        local server_bin = args[1]
+        local settings = nil
+
+        -- Lookup settings from setup config
+        if options.lsp and options.lsp.servers then
+            local s = options.lsp.servers[server_bin]
+            if s and s.settings then
+                settings = s.settings
+            end
+        end
+
+        require("zero-nvim.lsp").start_lsp(0, args, settings)
+    end, {
+        nargs = "+",
+        desc = "Start remote LSP via TCP proxy (e.g. :ZeroLspStart basedpyright --stdio)",
+        complete = function(arg_lead, cmd_line, _)
+            local parts = vim.split(cmd_line, "%s+")
+            -- Only complete the first arg (the LSP binary name)
+            if #parts <= 2 then
+                local bins = M.get_mason_bins()
+                local completions = {}
+                for _, name in ipairs(bins) do
+                    if name:find(arg_lead, 1, true) == 1 then
+                        table.insert(completions, name)
+                    end
+                end
+                return completions
+            end
+            return {}
+        end,
     })
 
     -- [NEW] Register :ZeroSearchMini user command
