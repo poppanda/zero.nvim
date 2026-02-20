@@ -10,6 +10,7 @@
 
 mod connect;
 mod fs;
+mod lsp;
 mod search;
 mod ssh_config;
 mod state;
@@ -217,6 +218,25 @@ fn dispatch(
                 &state,
                 tx,
             )
+        }
+
+        // ── LSP 代理 ──
+        "lsp_start" => {
+            let args = params.as_array().ok_or(anyhow::anyhow!("Invalid params"))?;
+            let user = args
+                .get(0)
+                .and_then(|v| v.as_str())
+                .ok_or(anyhow::anyhow!("Missing user"))?;
+            let host = args
+                .get(1)
+                .and_then(|v| v.as_str())
+                .ok_or(anyhow::anyhow!("Missing host"))?;
+            let port = args.get(2).and_then(|v| v.as_u64()).unwrap_or(22) as u16;
+            let cmd = args
+                .get(3)
+                .and_then(|v| v.as_str())
+                .ok_or(anyhow::anyhow!("Missing cmd"))?;
+            lsp::handle_start_lsp(user, host, port, cmd, &state)
         }
 
         _ => Err(anyhow::anyhow!("Unknown method: {}", method)),
