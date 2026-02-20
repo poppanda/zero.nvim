@@ -361,6 +361,14 @@ function M.setup(opts)
             return {}
         end,
     })
+
+    -- [NEW] Register :ZeroSearch user command
+    vim.api.nvim_create_user_command("ZeroSearch", function(cmd_opts)
+        require("zero-nvim.search").live_grep()
+    end, {
+        nargs = 0,
+        desc = "Search remote server using Telescope",
+    })
 end
 
 return M

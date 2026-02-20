@@ -75,6 +75,16 @@ Easily connect to hosts defined in your `~/.ssh/config` using a floating UI:
 - **No args**: Opens a Telescope-like picker for SSH hosts. Select a host and browse directories.
 - **Specific target**: `:ZeroLink my_host /path/to/dir` opens it directly.
 
+### Search Remote Project (Telescope Integration)
+
+Search your remote project code instantly using `rg` and `telescope.nvim`:
+
+```vim
+:ZeroSearch
+```
+
+Select a host and directory, and Telescope will stream the results live from the remote daemon.
+
 ### Manual Remote Protocol
 
 Open any remote file or directory using the `remote://` protocol:
