@@ -369,6 +369,14 @@ function M.setup(opts)
         nargs = 0,
         desc = "Search remote server using Telescope",
     })
+
+    -- [NEW] Register :ZeroSearchMini user command
+    vim.api.nvim_create_user_command("ZeroSearchMini", function(cmd_opts)
+        require("zero-nvim.search_mini").open()
+    end, {
+        nargs = 0,
+        desc = "Local buffer search and replace using floating windows",
+    })
 end
 
 return M

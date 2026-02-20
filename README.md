@@ -75,15 +75,39 @@ Easily connect to hosts defined in your `~/.ssh/config` using a floating UI:
 - **No args**: Opens a Telescope-like picker for SSH hosts. Select a host and browse directories.
 - **Specific target**: `:ZeroLink my_host /path/to/dir` opens it directly.
 
-### Search Remote Project (Telescope Integration)
+### Search Project (ZeroSearch)
 
-Search your remote project code instantly using `rg` and `telescope.nvim`:
+Search your project instantly via ripgrep with an enhanced, native Tree-Like UI format.
 
 ```vim
 :ZeroSearch
 ```
 
-Select a host and directory, and Telescope will stream the results live from the remote daemon.
+- **Auto-Context Detection**: `:ZeroSearch` intelligently detects if you are in a local buffer or a remote buffer (`remote://` / `oil-zero://`). If remote, it securely offloads the search to the Rust daemon. If local, it seamlessly falls back to a fast local `rg` process.
+- **Tree-Like Grouping**: Results are grouped by file and visually indented with colored icons, line numbers, and search match extmarks. 
+- **Keyboard Navigation**:
+  - `j` / `k`: Navigate through files and matched lines.
+  - `h` / `l`: Expand or collapse file nodes to instantly hide/reveal matches.
+  - `<C-c>`: Toggle Case-Sensitive exact matching.
+  - `<C-w>`: Toggle Whole Word (Regex) exact matching.
+  - `<CR>`: Jump precisely to the matched file and line. 
+- **Live Preview**: The right-hand window actively previews the file logic beneath your cursor.
+
+### Local Buffer Search (ZeroSearchMini)
+
+Search and replace within the current buffer using a minimal, stacked floating window UI.
+
+```vim
+:ZeroSearchMini
+```
+
+- **Compact UI**: Positioned at the bottom-right corner, conserving editing space while providing full search functionality.
+- **Fast Navigation**: Employs real-time `vim.regex` matching. Use `j` and `k` seamlessly jump between input prompts and matches.
+- **Persistent Memory**: Remembers your last query and cursor position between invocations.
+- **Integrated Replace**:
+  - `<C-r>`: Expand/collapse the replace line.
+  - `r` or `<CR>` on the replace line applies the substitution and immediately advances to the next match.
+- **Toggles**: Quickly switch Case-Sensitive (`<C-c>`) and Whole Word (`<C-w>`) matching directly from the input window.
 
 ### Manual Remote Protocol
 

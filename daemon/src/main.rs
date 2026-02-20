@@ -10,13 +10,14 @@
 
 mod connect;
 mod fs;
+mod search;
 mod ssh_config;
 mod state;
 
 use rmpv::{decode, encode, Value};
 use state::DaemonState;
 use std::io::Write;
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 
 // =============================================================================
 // 主循环
@@ -27,6 +28,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let stdin = std::io::stdin();
     let mut reader = stdin.lock();
     let mut stdout = std::io::stdout();
+
+    // 唯一的输出通道
+    let (tx, rx) = mpsc::channel::<Value>();
+
+    // 专门负责写 stdout 的后台线程，防止多线程写冲突
+    std::thread::spawn(move || {
+        while let Ok(msg) = rx.recv() {
+            if encode::write_value(&mut stdout, &msg).is_ok() {
+                let _ = stdout.flush();
+            }
+        }
+    });
 
     loop {
         // 从 stdin 读取一条 Msgpack 消息
@@ -45,7 +58,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 if let (Some(0), Some(id)) = (msg_type, msg_id) {
                     if let Some(method) = method_val.as_str() {
-                        let result = dispatch(method, params, state.clone());
+                        let result = dispatch(method, params, state.clone(), tx.clone());
                         let (err, res) = match result {
                             Ok(val) => (Value::Nil, val),
                             Err(e) => (Value::String(format!("{}", e).into()), Value::Nil),
@@ -57,9 +70,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             err,
                             res,
                         ]);
-                        if encode::write_value(&mut stdout, &response).is_ok() {
-                            let _ = stdout.flush();
-                        }
+                        let _ = tx.send(response);
                     }
                 }
             }
@@ -77,6 +88,7 @@ fn dispatch(
     method: &str,
     params: &Value,
     state: Arc<Mutex<DaemonState>>,
+    tx: mpsc::Sender<Value>,
 ) -> Result<Value, anyhow::Error> {
     match method {
         // ── SSH 配置 ──
@@ -165,6 +177,46 @@ fn dispatch(
                 .and_then(|v| v.as_str())
                 .ok_or(anyhow::anyhow!("Missing dst"))?;
             fs::handle_rename(user, host, port, src, dst, &state)
+        }
+
+        // ── 搜索 ──
+        "global_search" => {
+            let args = params.as_array().ok_or(anyhow::anyhow!("Invalid params"))?;
+            let user = args
+                .get(0)
+                .and_then(|v| v.as_str())
+                .ok_or(anyhow::anyhow!("Missing user"))?;
+            let host = args
+                .get(1)
+                .and_then(|v| v.as_str())
+                .ok_or(anyhow::anyhow!("Missing host"))?;
+            let port = args.get(2).and_then(|v| v.as_u64()).unwrap_or(22) as u16;
+            let path = args
+                .get(3)
+                .and_then(|v| v.as_str())
+                .ok_or(anyhow::anyhow!("Missing path"))?;
+            let query = args
+                .get(4)
+                .and_then(|v| v.as_str())
+                .ok_or(anyhow::anyhow!("Missing query"))?;
+            let session_id = args
+                .get(5)
+                .and_then(|v| v.as_str())
+                .ok_or(anyhow::anyhow!("Missing session_id"))?;
+            let case_sensitive = args.get(6).and_then(|v| v.as_bool()).unwrap_or(false);
+            let whole_word = args.get(7).and_then(|v| v.as_bool()).unwrap_or(false);
+            search::handle_global_search(
+                user,
+                host,
+                port,
+                path,
+                query,
+                session_id,
+                case_sensitive,
+                whole_word,
+                &state,
+                tx,
+            )
         }
 
         _ => Err(anyhow::anyhow!("Unknown method: {}", method)),
