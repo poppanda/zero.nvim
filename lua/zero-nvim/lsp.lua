@@ -1,5 +1,6 @@
 local M = {}
 local zero = require("zero-nvim")
+local manager = require("zero-nvim.project.manager")
 
 --- Attempt to start a remote LSP via the TCP proxy daemon.
 --- Works on both `remote://` file buffers and `oil-zero://` directory buffers.
@@ -15,6 +16,26 @@ function M.start_lsp(bufnr, cmd_args, settings)
         vim.notify("ZeroNvim: Current buffer is not a remote:// or oil-zero:// buffer (got: " .. name .. ")",
             vim.log.levels.ERROR)
         return
+    end
+
+    -- [NEW] Project Configuration Merging
+    local server_name = cmd_args[1]
+    local project_name, project_config = manager.match_project(host, path)
+
+    if project_config and project_config.lsp and project_config.lsp[server_name] then
+        local p_conf = project_config.lsp[server_name]
+
+        -- Override Command
+        if p_conf.cmd and #p_conf.cmd > 0 then
+            cmd_args = p_conf.cmd
+            vim.notify("ZeroNvim: Using project-specific LSP command for " .. server_name, vim.log.levels.INFO)
+        end
+
+        -- Merge Settings
+        if p_conf.settings then
+            settings = vim.tbl_deep_extend("force", settings or {}, p_conf.settings)
+            vim.notify("ZeroNvim: Merged project-specific LSP settings for " .. server_name, vim.log.levels.INFO)
+        end
     end
 
     local cmd_str = table.concat(cmd_args, " ")

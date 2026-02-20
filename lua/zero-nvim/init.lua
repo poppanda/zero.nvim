@@ -262,7 +262,7 @@ end
 ---@param host string
 ---@param port integer
 ---@param path string
-local function open_remote(user, host, port, path)
+function M.open_remote(user, host, port, path)
     -- Ensure path starts with /
     if not path:match("^/") then
         -- Expand ~ to /home/user
@@ -277,11 +277,18 @@ local function open_remote(user, host, port, path)
     local is_dir = path:match("/$") or not path:match("%.[^/]+$")
 
     if is_dir then
-        -- Ensure trailing slash for oil
+        -- Ensure trailing slash
         if not path:match("/$") then path = path .. "/" end
-        -- oil-zero://user@host:port/path
-        local uri = string.format("oil-zero://%s@%s:%d%s", user, host, port, path)
-        vim.cmd("edit " .. uri)
+        
+        if options.explorer == "oil" then
+            -- oil-zero://user@host:port/path
+            local uri = string.format("oil-zero://%s@%s:%d%s", user, host, port, path)
+            vim.cmd("edit " .. uri)
+        else
+             -- remote://user@host:port:path
+            local uri = string.format("remote://%s@%s:%d:%s", user, host, port, path)
+            vim.cmd("edit " .. uri)
+        end
     else
         -- remote://user@host:port:path (for files)
         local uri = string.format("remote://%s@%s:%d:%s", user, host, port, path)
@@ -311,7 +318,7 @@ function M.zero_link(args)
             local port = entry.port or 22
             -- After picking host, browse remote directories
             ui.browse_path(user, hostname, port, function(p)
-                open_remote(user, hostname, port, p)
+                M.open_remote(user, hostname, port, p)
             end, { display_name = entry.host })
         end)
         return
@@ -330,13 +337,13 @@ function M.zero_link(args)
 
     -- Case 3: Both target and path provided → open directly
     if path and path ~= "" then
-        open_remote(user, hostname, port, path)
+        M.open_remote(user, hostname, port, path)
         return
     end
 
     -- Case 2: Only target, no path → browse remote directories
     ui.browse_path(user, hostname, port, function(p)
-        open_remote(user, hostname, port, p)
+        M.open_remote(user, hostname, port, p)
     end, { display_name = target })
 end
 
@@ -407,6 +414,45 @@ function M.setup(opts)
                     end
                 end
                 return completions
+            end
+            return {}
+        end,
+    })
+
+    -- [NEW] Register :ZeroProject command with subcommands
+    vim.api.nvim_create_user_command("ZeroProject", function(opts)
+        local args = opts.fargs
+        local subcommand = args[1]
+        local project_ui = require("zero-nvim.project.ui")
+
+        if not subcommand or subcommand == "" then
+            project_ui.show_project_picker()
+        elseif subcommand == "add" then
+            project_ui.add_current_project()
+        elseif subcommand == "check" then
+            local target = args[2]
+            project_ui.check_health(target)
+        else
+            vim.notify("Unknown subcommand: " .. subcommand, vim.log.levels.ERROR)
+        end
+    end, {
+        nargs = "*",
+        desc = "Manage ZeroNvim projects (add, check, or list)",
+        complete = function(arg_lead, cmd_line, cursor_pos)
+            local parts = vim.split(cmd_line, "%s+")
+            if #parts == 2 then
+                -- Subcommand completion
+                local cmds = { "add", "check" }
+                return vim.tbl_filter(function(item)
+                    return vim.startswith(item, arg_lead)
+                end, cmds)
+            elseif #parts == 3 and parts[2] == "check" then
+                -- Project name completion for check
+                local manager = require("zero-nvim.project.manager")
+                local projects = manager.list()
+                return vim.tbl_filter(function(item)
+                    return vim.startswith(item, arg_lead)
+                end, vim.tbl_keys(projects))
             end
             return {}
         end,
