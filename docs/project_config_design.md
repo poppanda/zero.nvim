@@ -50,38 +50,44 @@
 
 ## 3. UI & Interaction Design (交互设计)
 
-### 3.1 Command: `:ZeroProject` (Main Dashboard)
+### 3.1 Command: `:ZeroProject [subcommand]` (Main Dashboard)
 
 这是项目管理的主入口。
 
-*   **UI Style**: **优先使用 `zero-nvim` 原生浮动窗口风格** (参考 `ZeroLink` / `ZeroSearch` 的实现)，以保持视觉一致性。仅在极简模式下回退到 `vim.ui.select`。
-*   **Display Items**:
-    *   `[dev-server] /var/www/api (Python)`
-    *   `[prod-db] /etc/postgresql/14/main`
+*   **Subcommands**:
+    *   `:ZeroProject` (无参数): 打开项目列表面板。
+    *   `:ZeroProject add`: 将当前远程缓冲区添加为新项目。
+    *   `:ZeroProject check <name>`: 对指定项目运行健康检查。
+
+*   **UI Style**: 使用 `zero-nvim` 原生浮动窗口风格，支持模态交互（Modal Interactions）。
+    *   **Project List**: 最小高度 10 行，最大 20 行，支持滚动。
+    *   **Add Prompt**: 自定义浮动输入框，覆盖在列表上方，提供无缝体验。
+    *   **Config Editor**: 使用 `buftype=acwrite` 的临时缓冲区，支持通过 `:w` 触发保存并自动刷新列表。
+
 *   **Actions (快捷键映射)**:
     *   `<CR>` (Enter): **Open**. 连接并打开远程目录。
-        *   *Compatibility Note*: 必须尊重用户的 `opts.explorer` 设置。如果用户启用了 `oil`，自动通过 `oil.nvim` 打开 (`oil-zero://...`)，否则使用 `remote://...`。
+        *   *Compatibility Note*: 自动适配 `oil.nvim` (使用 `oil-zero://`) 或 `netrw` (`remote://`)。
+    *   `<C-a>` (Add): **Add Project**. 在列表界面直接添加当前缓冲区为项目（无缝弹窗）。
     *   `<C-e>` (Edit): **Edit Config**. 打开浮动窗口编辑该项目的 JSON 片段。
     *   `<C-d>` (Delete): **Delete**. 删除该项目记录。
-    *   `<C-h>` (Check): **Health Check**. 运行环境检查 (见下文)。
-
-### 3.2 Command: `:ZeroProjectAdd`
-
-在当前缓冲区 (Buffer) 下快速保存为项目。
-
-*   **Trigger**: 用户当前正处于 `remote://` 或 `oil-zero://` 路径下。
-*   **Behavior**:
-    1.  自动解析当前的 Host 和 Root Dir。
-    2.  弹出 Input 框询问 `Project Name` (默认为文件夹名)。
-    3.  写入 `projects.json`。
+    *   `<C-h>` (Check): **Health Check**. 运行实时环境检查 (见下文)。
 
 ---
 
 ## 4. Health Check Mechanism (环境检查机制)
 
-为了解决 "配置了但连不上" 或 "LSP 起不来" 的痛点，设计多层级检查系统。
+为了解决 "配置了但连不上" 或 "LSP 起不来" 的痛点，设计了**实时非阻塞**的检查系统。
 
-**触发方式**: 在 `:ZeroProject` 列表中选中项目按 `<C-h>`，或执行 `:ZeroProjectCheck <name>`。
+**触发方式**: 在 `:ZeroProject` 列表中选中项目按 `<C-h>`，或执行 `:ZeroProject check <name>`。
+
+**UI Feedback**:
+检查开始时立即弹出结果窗口，并在后台异步更新每项状态，避免界面冻结。
+
+```text
+[✓] SSH Connection (prod-server)
+[✓] Root Directory (/var/www/api)
+[?] LSP (basedpyright): Configured (Binary check pending)
+```
 
 **检查流程 (Pipeline)**:
 
@@ -95,20 +101,9 @@
     *   **Success**: 目录存在且有读权限。
     *   **Fail**: "Directory not found" 或 "Permission denied"。
 
-3.  **Level 3: LSP Binary Check (Optional)**
-    *   **Action**: 如果配置中定义了 `lsp`：
-        *   检查 `cmd` (如果覆盖了) 或默认 binary 是否存在于远程 PATH 或指定路径。
-        *   执行 `which <binary_name>` 或 `<binary> --version`。
-    *   **Success**: 返回版本号或路径。
-    *   **Fail**: "Command not found"。
-
-**UI Feedback**:
-检查结果将以 Notification (如 `nvim-notify`) 或浮动窗口列表的形式展示：
-```text
-[✓] SSH Connection (prod-server)
-[✓] Root Directory (/var/www/api)
-[x] LSP (basedpyright): Command not found in PATH
-```
+3.  **Level 3: LSP Configuration Check**
+    *   **Action**: 验证配置文件中是否定义了 LSP 覆盖。
+    *   *Note*: 具体的二进制执行检查 (Binary Check) 依赖于 Daemon 的 `exec` 能力 (Milestone 4.7)。
 
 ---
 
@@ -122,7 +117,6 @@
 2.  **Project Match**: 
     *   遍历 `projects.json` 中所有项目的 `root` 路径。
     *   采用 **Longest Prefix Match (最长前缀匹配)** 策略。
-    *   例如：文件 `/app/backend/main.py` 应该匹配项目 `/app/backend` 而不是 `/app`。
 3.  **Config Resolution**:
     *   Base: `require("zero-nvim").setup()` 中的全局配置。
     *   Override: `projects.json` 中该项目的 `lsp` 配置 (包含 `cmd` 和 `settings`)。
@@ -131,20 +125,20 @@
 
 ---
 
-## 6. Implementation Roadmap (实施路线图)
+## 6. Implementation Status (实施状态)
 
-### Milestone 4.5: Project Core (Current Focus)
-*   [ ] 实现 `lua/zero-nvim/project/store.lua`: 负责 JSON 的读写。
-*   [ ] 实现 `lua/zero-nvim/project/manager.lua`: 负责 Add/Delete 逻辑。
+### Milestone 4.5: Project Core (Completed)
+*   [x] 实现 `lua/zero-nvim/project/store.lua`: 负责 JSON 的读写。
+*   [x] 实现 `lua/zero-nvim/project/manager.lua`: 负责 Add/Delete 及最长前缀匹配逻辑。
 
-### Milestone 4.6: UI & Commands
-*   [ ] 实现 `:ZeroProjectAdd` 命令。
-*   [ ] 实现 `:ZeroProject` 列表 UI (基于 `ui/browser.lua` 的经验)。
-*   [ ] 集成 Telescope (作为 Extension)。
+### Milestone 4.6: UI & Commands (Completed)
+*   [x] 实现 `:ZeroProject` 统一命令及子命令 (`add`, `check`)。
+*   [x] 实现 Project List UI，支持固定高度及 `<C-a>` 无缝添加。
+*   [x] 实现 Config Editor，支持 `:w` 保存及自动刷新。
+*   [x] 实现 Real-time Health Check UI。
 
-### Milestone 4.7: Health Check & LSP Hook
-*   [ ] 在 Daemon 中增加 `check_env` RPC 接口 (复用现有的 connect/exec)。
-*   [ ] 修改 `lsp.lua` 以支持配置合并。
+### Milestone 4.7: Advanced Features (Pending)
+*   [ ] 在 Daemon 中增加 `exec` RPC 接口，以支持 LSP 二进制的真实存在性检查。
 
 ---
 
@@ -153,13 +147,14 @@
 **Project List (Floating Window)**
 ```
  ┌────────────────────────────────────────────────────────┐
- │ ZeroProject Manager                                    │
+ │ Zero Projects                                          │
  ├────────────────────────────────────────────────────────┤
  │ > backend-api   (host: dev-box, root: /app/api)        │
  │   frontend-web  (host: dev-box, root: /app/web)        │
  │   k8s-configs   (host: bastion, root: /etc/k8s)        │
  │                                                        │
+ │                                                        │
  ├────────────────────────────────────────────────────────┤
- │ <CR>: Open | <C-e>: Edit | <C-d>: Del | <C-h>: Check   │
+ │ <CR>:Open | <C-a>:Add | <C-e>:Edit | <C-d>:Del | <C-h> │
  └────────────────────────────────────────────────────────┘
 ```
