@@ -76,6 +76,41 @@ Easily connect to hosts defined in your `~/.ssh/config` using a floating UI:
 - **No args**: Opens a Telescope-like picker for SSH hosts. Select a host and browse directories.
 - **Specific target**: `:ZeroLink my_host /path/to/dir` opens it directly.
 
+### Project Management (ZeroProject)
+
+Manage your remote projects with a dedicated dashboard, supporting saved configurations and context-aware LSP settings.
+
+```vim
+:ZeroProject [subcommand]
+```
+
+- **`:ZeroProject` (No args)**: Opens the project picker dashboard.
+  - `<CR>`: Open selected project.
+  - `<C-a>`: Add current remote buffer as a new project.
+  - `<C-e>`: Edit project configuration (JSON).
+  - `<C-d>`: Delete project.
+  - `<C-h>`: Run connectivity and environment Health Check.
+- **`:ZeroProject add`**: Directly add the current remote buffer as a project.
+- **`:ZeroProject check <name>`**: Run health check for a specific project.
+
+**Project Configuration Example:**
+When editing a project (`<C-e>`), you can override LSP settings for that specific remote environment:
+
+```json
+{
+  "host": "dev-server",
+  "root": "/var/www/backend",
+  "lsp": {
+    "basedpyright": {
+      "cmd": ["/var/www/backend/.venv/bin/basedpyright-langserver", "--stdio"],
+      "settings": {
+        "python": { "analysis": { "typeCheckingMode": "off" } }
+      }
+    }
+  }
+}
+```
+
 ### Search Project (ZeroSearch)
 
 Search your project instantly via ripgrep with an enhanced, native Tree-Like UI format.
