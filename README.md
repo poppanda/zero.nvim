@@ -48,7 +48,7 @@ To use `oil.nvim` with `zero-nvim` for high-performance remote file management:
 -- 1. Register the ZeroNvim adapter with Oil
 require("oil").setup({
   adapters = {
-    ["oil-zero://"] = "zero",
+    ["zero://"] = "zero",
   },
 })
 
@@ -60,8 +60,8 @@ require("zero-nvim").setup({
 
 **Usage:**
 
-- If `explorer = "oil"` is enabled: `:e remote://user@host/path/to/dir/` will automatically open in Oil.
-- Manual access: `:edit oil-zero://user@host[:port]/path/to/dir/`
+- If `explorer = "oil"` is enabled: `:e zero://user@host/path/to/dir/` will automatically open in Oil.
+- Manual access: `:edit zero://user@host[:port]/path/to/dir/`
 
 ## Basic Usage
 
@@ -119,7 +119,7 @@ Search your project instantly via ripgrep with an enhanced, native Tree-Like UI 
 :ZeroSearch
 ```
 
-- **Auto-Context Detection**: `:ZeroSearch` intelligently detects if you are in a local buffer or a remote buffer (`remote://` / `oil-zero://`). If remote, it securely offloads the search to the Rust daemon. If local, it seamlessly falls back to a fast local `rg` process.
+- **Auto-Context Detection**: `:ZeroSearch` intelligently detects if you are in a local buffer or a remote buffer (`zero://`). If remote, it securely offloads the search to the Rust daemon. If local, it seamlessly falls back to a fast local `rg` process.
 - **Tree-Like Grouping**: Results are grouped by file and visually indented with colored icons, line numbers, and search match extmarks.
 - **Keyboard Navigation**:
   - `j` / `k`: Navigate through files and matched lines.
@@ -147,10 +147,10 @@ Search and replace within the current buffer using a minimal, stacked floating w
 
 ### Manual Remote Protocol
 
-Open any remote file or directory using the `remote://` protocol:
+Open any remote file or directory using the `zero://` protocol:
 
 ```vim
-:e remote://user@host[:port]:/path/to/file_or_dir
+:e zero://user@host[:port]/path/to/file_or_dir
 ```
 
 - **Built-in Directory View**:
@@ -164,4 +164,4 @@ Open any remote file or directory using the `remote://` protocol:
 If you encounter `Handshake failed` or `Failed getting banner` (common behind proxies), use an SSH tunnel:
 
 1.  **Start Tunnel:** `ssh -L 2222:localhost:22 user@host -N`
-2.  **Connect Local:** `:e remote://user@127.0.0.1:2222:/path/to/file`
+2.  **Connect Local:** `:e zero://user@127.0.0.1:2222/path/to/file`

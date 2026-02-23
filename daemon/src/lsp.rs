@@ -11,8 +11,8 @@
 //   - ssh reuses ~/.ssh/config + SSH Agent，无需再次输入密码
 //
 // URI 转换（TCP→SSH and SSH→TCP）:
-//   remote://user@host:port:/path  ↔  file:///path
-//   具体: 替换 "remote://user@host:port:" ↔ "file://"
+//   zero://user@host:port/path  ↔  file:///path
+//   具体: 替换 "file://zero://user@host:port" ↔ "file://"
 
 use crate::state::DaemonState;
 use anyhow::Context;
@@ -28,6 +28,7 @@ pub fn handle_start_lsp(
     host: &str,
     port: u16,
     cmd: &str,
+    client_prefix: &str,
     state: &Arc<Mutex<DaemonState>>,
 ) -> Result<Value, anyhow::Error> {
     eprintln!("handle_start_lsp triggered for cmd: {}", cmd);
@@ -41,11 +42,8 @@ pub fn handle_start_lsp(
         }
     }
 
-    // URI translation prefix for remote://user@host:port: ↔ file://
-    // remote://ec2-user@52.197.224.3:22:/home/...  becomes  file:///home/...
-    // Replacing "remote://ec2-user@52.197.224.3:22:" with "file://" (path /home/... stays intact)
-    let remote_file_prefix = format!("remote://{}@{}:{}:", user, host, port);
     let file_prefix = "file://".to_string();
+    let client_prefix_s = client_prefix.to_string();
 
     let user_s = user.to_string();
     let host_s = host.to_string();
@@ -85,7 +83,7 @@ pub fn handle_start_lsp(
                 .arg(&login_cmd)
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
-                .stderr(Stdio::inherit()) // let ssh errors flow to daemon stderr (Neovim WARN)
+                .stderr(Stdio::piped()) // Pipe stderr to prevent blocking if parent doesn't read fast enough
                 .spawn();
 
             match ssh_result {
@@ -94,38 +92,43 @@ pub fn handle_start_lsp(
 
                     let child_stdin = child.stdin.take().expect("child stdin");
                     let child_stdout = child.stdout.take().expect("child stdout");
+                    let child_stderr = child.stderr.take().expect("child stderr");
+
+                    // Thread 0: Consume SSH stderr to prevent blocking
+                    // We also log it to daemon stderr so Neovim can see it (optionally filtered)
+                    thread::spawn(move || {
+                        use std::io::{BufRead, BufReader};
+                        let reader = BufReader::new(child_stderr);
+                        for line in reader.lines() {
+                            if let Ok(l) = line {
+                                eprintln!("[SSH-ERR] {}", l);
+                            }
+                        }
+                    });
 
                     let tcp_writer = tcp_stream.try_clone().expect("Failed to clone TCP stream");
 
-                    let u1 = user_s.clone();
-                    let h1 = host_s.clone();
-                    // Thread 1: TCP (Neovim) → SSH stdin
-                    // Translate: remote://user@host:port: → file://
                     let tcp_reader = tcp_stream;
-                    let from1 = remote_file_prefix.clone();
+                    let from1 = client_prefix_s.clone();
                     let to1 = file_prefix.clone();
                     thread::spawn(move || {
                         let mut r = tcp_reader;
                         let mut w = child_stdin;
-                        if let Err(e) = pump_and_translate(
-                            &mut r, &mut w, &from1, &to1, "TCP->SSH", &u1, &h1, port,
-                        ) {
+                        if let Err(e) = pump_and_translate(&mut r, &mut w, &from1, &to1, "TCP->SSH")
+                        {
                             eprintln!("TCP -> SSH pump ended: {:?}", e);
                         }
                     });
 
                     // Thread 2: SSH stdout → TCP (Neovim)
-                    // Translate: file:// → remote://user@host:port:
+                    // Translate: file:// → client_prefix
                     let from2 = file_prefix;
-                    let to2 = remote_file_prefix;
-                    let u2 = user_s;
-                    let h2 = host_s;
+                    let to2 = client_prefix_s;
                     thread::spawn(move || {
                         let mut r = child_stdout;
                         let mut w = tcp_writer;
-                        if let Err(e) = pump_and_translate(
-                            &mut r, &mut w, &from2, &to2, "SSH->TCP", &u2, &h2, port,
-                        ) {
+                        if let Err(e) = pump_and_translate(&mut r, &mut w, &from2, &to2, "SSH->TCP")
+                        {
                             eprintln!("SSH -> TCP pump ended: {:?}", e);
                         }
                         // Wait for child process to finish
@@ -149,9 +152,6 @@ fn pump_and_translate<R: Read, W: Write>(
     from: &str,
     to: &str,
     label: &str,
-    user: &str,
-    host: &str,
-    port: u16,
 ) -> Result<(), anyhow::Error> {
     loop {
         let mut headers = String::new();
@@ -164,7 +164,32 @@ fn pump_and_translate<R: Read, W: Write>(
             if n == 0 {
                 return Ok(()); // EOF — stream closed
             }
+
+            // [DEBUG] Raw Log for SSH->TCP only
+            if label == "SSH->TCP" {
+                use std::fs::OpenOptions;
+                if let Ok(mut f) = OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open("/tmp/debug_ssh_raw.log")
+                {
+                    let _ = f.write_all(&byte);
+                }
+            }
+
             headers.push(byte[0] as char);
+
+            // [Safety Check] If headers grow too large, it's likely non-LSP garbage (e.g. stdout logs)
+            if headers.len() > 8192 {
+                eprintln!(
+                    "[{}] HEADER OVERFLOW (>8KB). Dumping buffer:\n{}",
+                    label, headers
+                );
+                return Err(anyhow::anyhow!(
+                    "Header overflow - potential non-LSP output detected"
+                ));
+            }
+
             if headers.ends_with("\r\n\r\n") {
                 break;
             }
@@ -190,54 +215,41 @@ fn pump_and_translate<R: Read, W: Write>(
         let mut body = vec![0u8; content_length];
         reader.read_exact(&mut body)?;
 
+        // [DEBUG] Raw Log for SSH->TCP Body
+        if label == "SSH->TCP" {
+            use std::fs::OpenOptions;
+            if let Ok(mut f) = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("/tmp/debug_ssh_raw.log")
+            {
+                let _ = f.write_all(&body);
+            }
+        }
+
         // 4. Translate URI in JSON body
         let new_body = match String::from_utf8(body.clone()) {
             Ok(s) => {
-                let mut translated = s.clone();
+                // Symmetrical 1-to-1 Replace!
+                // tcp->ssh: replaces "file://zero://ubuntu@host:22" with "file://" -> yields "file:///home/..."
+                // ssh->tcp: replaces "file://" with "file://zero://ubuntu@host:22" -> yields "file://zero://ubuntu@host:22/home/..."
+                let translated = s.replace(from, to);
 
-                if label == "TCP->SSH" {
-                    // Collect all possible remote prefixes that we might see from Neovim.
-                    // Neovim's uri_from_fname or oil.nvim might produce different schemes.
-                    let mut prefixes = Vec::new();
-
-                    // Standard remote:// variants
-                    prefixes.push(format!("remote://{}@{}:{}:", user, host, port));
-                    // oil-zero:// variants (with and without port)
-                    prefixes.push(format!("oil-zero://{}@{}:{}/", user, host, port));
-                    prefixes.push(format!("oil-zero://{}@{}/", user, host));
-
-                    // Now handle the same with "file://" or "file///" prepended by Neovim
-                    let mut all_bad = Vec::new();
-                    for p in prefixes {
-                        let p_copy = p.clone();
-                        all_bad.push(p_copy.clone());
-                        all_bad.push(format!("file://{}", p_copy));
-                        all_bad.push(format!("file:///{}", p_copy));
-                    }
-
-                    all_bad.sort_by(|a, b| b.len().cmp(&a.len()));
-
-                    for bad in all_bad {
-                        translated = translated.replace(&bad, to);
-                    }
-                } else {
-                    // SSH->TCP (LSP Server -> Neovim): Standard replacement
-                    translated = translated.replace(from, to);
-                }
-
-                if translated != s {
-                    eprintln!(
-                        "[{}] URI translated: '{}...' -> '{}...'",
+                // [DEBUG] Log ALL traffic to a single file for timeline analysis
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open("/tmp/zero_lsp_traffic.log")
+                {
+                    let _ = writeln!(
+                        f,
+                        "[{}] Payload ({} bytes):\n{}\n----------------------------------------",
                         label,
-                        &from[..from.len().min(35)],
-                        &to[..to.len().min(35)]
-                    );
-                    eprintln!(
-                        "[{}] Translated Payload Preview: {}",
-                        label,
-                        &translated[..translated.len().min(500)]
+                        translated.len(),
+                        translated
                     );
                 }
+
                 if translated.contains("\"method\":\"initialize\"") {
                     std::fs::write("/tmp/zero_lsp_init_dump.json", &translated).unwrap();
                 }

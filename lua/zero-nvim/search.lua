@@ -384,7 +384,7 @@ function M.open_ui(opts)
             if session.is_local then
                 vim.cmd("edit " .. vim.fn.fnameescape(node.file))
             else
-                local uri = string.format("remote://%s@%s:%d:%s", session.user, session.host, session.port, node.file)
+                local uri = string.format("zero://%s@%s:%d%s", session.user, session.host, session.port, node.file)
                 vim.cmd("edit " .. uri)
             end
             vim.schedule(function()
@@ -426,7 +426,7 @@ end
 
 function M.live_grep(opts)
     local buf_name = vim.api.nvim_buf_get_name(0)
-    local is_remote = buf_name:match("^remote://") or buf_name:match("^oil%-zero://")
+    local is_remote = buf_name:match("^zero://")
 
     local default_path = "/"
     local default_user, default_host, default_port
@@ -434,12 +434,9 @@ function M.live_grep(opts)
     if is_remote then
         local user, host, port_str, path
 
-        user, host, port_str, path = buf_name:match("^remote://([^@]+)@([^:]+):(%d+):(.*)$")
+        user, host, port_str, path = buf_name:match("^zero://([^@]+)@([^:]+):(%d+)(/.*)$")
         if not user then
-            user, host, port_str, path = buf_name:match("^oil%-zero://([^@]+)@([^:]+):(%d+)(/.*)$")
-        end
-        if not user then
-            user, host, path = buf_name:match("^oil%-zero://([^@]+)@([^/:]+)(/.*)$")
+            user, host, path = buf_name:match("^zero://([^@]+)@([^/:]+)(/.*)$")
             port_str = "22"
         end
 

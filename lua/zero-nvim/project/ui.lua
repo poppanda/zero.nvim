@@ -15,7 +15,7 @@ local function prompt_float(opts, on_confirm)
         height = height,
         footer = "<Enter>: Confirm"
     })
-    
+
     if opts.default then
         vim.api.nvim_buf_set_lines(buf, 0, -1, false, { opts.default })
     end
@@ -44,7 +44,7 @@ local function prompt_float(opts, on_confirm)
     vim.cmd("startinsert")
     -- Ensure cursor is at end of line
     if opts.default then
-        vim.api.nvim_win_set_cursor(win, {1, #opts.default})
+        vim.api.nvim_win_set_cursor(win, { 1, #opts.default })
     end
 end
 
@@ -57,7 +57,7 @@ function M.add_current_project(bufnr, on_complete)
     local user, host, port, path = zero.parse_uri(buf_name)
 
     if not user then
-        vim.notify("Target buffer is not a remote:// or oil-zero:// buffer.", vim.log.levels.WARN)
+        vim.notify("Target buffer is not a zero:// buffer.", vim.log.levels.WARN)
         return
     end
 
@@ -86,21 +86,21 @@ end
 ---@param on_save fun(new_config: table)
 local function edit_project_config(name, current_config, on_save)
     local content = vim.split(vim.json.encode(current_config), "\n")
-    
+
     local buf, win = utils.create_float({ title = "Edit Config: " .. name, width = 80, height = 20 })
-    
+
     -- Set buffer name and type for correct write behavior
     -- Use a simple name to avoid special character issues
     local buf_name = string.format("zero-project-%s.json", name)
     pcall(vim.api.nvim_buf_set_name, buf, buf_name)
-    
+
     vim.api.nvim_set_option_value("buftype", "acwrite", { buf = buf })
     vim.api.nvim_set_option_value("swapfile", false, { buf = buf })
-    
+
     vim.api.nvim_buf_set_lines(buf, 0, -1, false, content)
     vim.api.nvim_set_option_value("filetype", "json", { buf = buf })
     vim.api.nvim_set_option_value("modifiable", true, { buf = buf })
-    
+
     vim.notify("Edit config and write (:w) to save. Close window to cancel.", vim.log.levels.INFO)
 
     -- Auto-save on write
@@ -114,7 +114,7 @@ local function edit_project_config(name, current_config, on_save)
                 vim.notify("Invalid JSON: " .. tostring(new_config), vim.log.levels.ERROR)
                 return
             end
-            
+
             on_save(new_config)
             vim.api.nvim_set_option_value("modified", false, { buf = buf })
             utils.close_float(win, buf)
@@ -133,7 +133,7 @@ function M.show_project_picker()
 
     local display_lines = {}
     local max_width = 40
-    
+
     if #names == 0 then
         table.insert(display_lines, "  <No projects found>")
         max_width = 30
@@ -217,7 +217,7 @@ function M.show_project_picker()
     vim.keymap.set("n", "<C-d>", function()
         local name = get_selected_name()
         if name then
-            vim.ui.select({"Yes", "No"}, { prompt = "Delete project '" .. name .. "'?" }, function(choice)
+            vim.ui.select({ "Yes", "No" }, { prompt = "Delete project '" .. name .. "'?" }, function(choice)
                 if choice == "Yes" then
                     manager.remove(name)
                     refresh()
@@ -251,7 +251,7 @@ local function open_health_window(name, lines)
     vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
     vim.api.nvim_set_option_value("modifiable", false, { buf = buf })
     vim.api.nvim_set_option_value("buftype", "nofile", { buf = buf })
-    
+
     local close = function() utils.close_float(win, buf) end
     vim.keymap.set("n", "q", close, { buffer = buf })
     vim.keymap.set("n", "<Esc>", close, { buffer = buf })
@@ -288,7 +288,7 @@ function M.check_health(project_name_or_args)
         { label = "SSH Connection (" .. config.host .. ")", key = "ssh" },
         { label = "Root Directory (" .. config.root .. ")", key = "root" },
     }
-    
+
     if config.lsp then
         for srv_name, _ in pairs(config.lsp) do
             table.insert(checklist, { label = "LSP (" .. srv_name .. ")", key = "lsp_" .. srv_name })
@@ -312,12 +312,12 @@ function M.check_health(project_name_or_args)
         -- 1. SSH Check
         local idx = 1
         update_line(idx, "[●] " .. checklist[idx].label .. " (Connecting...)")
-        
+
         -- Need to use defer or just rely on the blocking ensure_connection?
-        -- ensure_connection is unfortunately blocking on the RPC part in some implementations, 
+        -- ensure_connection is unfortunately blocking on the RPC part in some implementations,
         -- but here it sends 'connect' request.
         -- To make UI update visible, we might need to yield.
-        -- But Lua is single threaded. 
+        -- But Lua is single threaded.
         -- However, since ensure_connection might take time, we want to at least show the "Connecting..." state.
         -- We force a redraw?
         vim.cmd("redraw")
@@ -328,16 +328,16 @@ function M.check_health(project_name_or_args)
             return -- Stop if SSH fails
         end
         update_line(idx, "[✓] " .. checklist[idx].label)
-        
+
         -- 2. Root Dir Check
         idx = 2
         update_line(idx, "[●] " .. checklist[idx].label .. " (Checking...)")
         vim.cmd("redraw")
         local ok, ftype = pcall(vim.fn.rpcrequest, chan, "stat", config.user, config.host, config.port, config.root)
         if ok and ftype == "directory" then
-             update_line(idx, "[✓] " .. checklist[idx].label)
+            update_line(idx, "[✓] " .. checklist[idx].label)
         else
-             update_line(idx, "[x] " .. checklist[idx].label .. ": Not accessible")
+            update_line(idx, "[x] " .. checklist[idx].label .. ": Not accessible")
         end
 
         -- 3. LSP Checks

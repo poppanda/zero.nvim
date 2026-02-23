@@ -34,22 +34,13 @@ local function logger(msg, level)
 end
 
 function M.parse_uri(uri)
-    local user, host, port_str, path = string.match(uri, "^remote://([^@]+)@([^:]+):(%d+):(.+)$")
+    -- zero://user@host:port/path
+    local user, host, port_str, path = string.match(uri, "^zero://([^@]+)@([^:]+):(%d+)(/.*)$")
     if user and host and port_str and path then
         return user, host, tonumber(port_str), path
     end
-    user, host, path = string.match(uri, "^remote://([^@]+)@([^:]+):(.+)$")
-    if user and host and path then
-        return user, host, 22, path
-    end
-
-    -- Support oil-zero://user@host:port/path  (no colon before path, host stops at : or /)
-    user, host, port_str, path = string.match(uri, "^oil%-zero://([^@]+)@([^:/]+):(%d+)(/.*)$")
-    if user and host and port_str and path then
-        return user, host, tonumber(port_str), path
-    end
-    -- oil-zero://user@host/path  (no port)
-    user, host, path = string.match(uri, "^oil%-zero://([^@]+)@([^:/]+)(/.*)$")
+    -- zero://user@host/path  (no port, default 22)
+    user, host, path = string.match(uri, "^zero://([^@]+)@([^:/]+)(/.*)$")
     if user and host and path then
         return user, host, 22, path
     end
@@ -195,7 +186,7 @@ local function setup_dir_buffer(buf, user, host, port, path, entries)
         local entry = entry_map[line]
         if not entry then return end
         local new_path = entry.name == ".." and vim.fs.dirname(path) or (path:gsub("/$", "") .. "/" .. entry.name)
-        local uri = string.format("remote://%s@%s:%d:%s", user, host, port, new_path)
+        local uri = string.format("zero://%s@%s:%d%s", user, host, port, new_path)
         if entry.type == "directory" then
             local ok, _ = pcall(vim.api.nvim_buf_set_name, buf, uri)
             if not ok then vim.cmd("edit " .. uri) else M.handle_fetch(buf, user, host, port, new_path) end
@@ -233,8 +224,8 @@ function M.handle_fetch(buf, user, host, port, path, password, refresh)
 
     if ftype == "directory" then
         if options.explorer == "oil" then
-            local oil_uri = string.format("oil-zero://%s@%s:%d%s", user, host, port, path)
-            -- 在跳转 Oil 之前，显式将 remote:// buffer 标记为已成功完成（虽然我们要跳走）
+            local oil_uri = string.format("zero://%s@%s:%d%s", user, host, port, path)
+            -- 在跳转 Oil 之前，显式将 zero:// buffer 标记为已成功完成（虽然我们要跳走）
             -- 这样可以防止某些 autocommands 触发
             vim.api.nvim_buf_delete(buf, { force = true })
             vim.cmd("edit " .. oil_uri)
@@ -279,21 +270,10 @@ function M.open_remote(user, host, port, path)
     if is_dir then
         -- Ensure trailing slash
         if not path:match("/$") then path = path .. "/" end
-        
-        if options.explorer == "oil" then
-            -- oil-zero://user@host:port/path
-            local uri = string.format("oil-zero://%s@%s:%d%s", user, host, port, path)
-            vim.cmd("edit " .. uri)
-        else
-             -- remote://user@host:port:path
-            local uri = string.format("remote://%s@%s:%d:%s", user, host, port, path)
-            vim.cmd("edit " .. uri)
-        end
-    else
-        -- remote://user@host:port:path (for files)
-        local uri = string.format("remote://%s@%s:%d:%s", user, host, port, path)
-        vim.cmd("edit " .. uri)
     end
+
+    local uri = string.format("zero://%s@%s:%d%s", user, host, port, path)
+    vim.cmd("edit " .. uri)
 end
 
 --- ZeroLink command handler.
@@ -352,47 +332,50 @@ function M.setup(opts)
 
     local group = vim.api.nvim_create_augroup("ZeroNvim", { clear = true })
 
-    vim.api.nvim_create_autocmd("BufReadCmd", {
-        pattern = "remote://*",
-        callback = function(args)
-            local user, host, port, path = M.parse_uri(args.file)
-            if user then vim.schedule(function() M.handle_fetch(args.buf, user, host, port, path) end) end
-        end,
-        group = group,
-    })
+    -- When oil is the explorer, oil's adapter handles all zero:// buffer I/O
+    -- (read_file, write_file, list). Registering BufReadCmd/BufWriteCmd here
+    -- would conflict with oil's own handlers and cause infinite refresh loops.
+    if options.explorer ~= "oil" then
+        vim.api.nvim_create_autocmd("BufReadCmd", {
+            pattern = "zero://*",
+            callback = function(args)
+                local user, host, port, path = M.parse_uri(args.file)
+                if user then vim.schedule(function() M.handle_fetch(args.buf, user, host, port, path) end) end
+            end,
+            group = group,
+        })
 
-    -- [NEW] Phase 2: Write support
-    vim.api.nvim_create_autocmd("BufWriteCmd", {
-        pattern = "remote://*",
-        callback = function(args)
-            local user, host, port, path = M.parse_uri(args.file)
-            if not user then return end
+        vim.api.nvim_create_autocmd("BufWriteCmd", {
+            pattern = "zero://*",
+            callback = function(args)
+                local user, host, port, path = M.parse_uri(args.file)
+                if not user then return end
 
-            local lines = vim.api.nvim_buf_get_lines(args.buf, 0, -1, false)
-            local content = table.concat(lines, "\n")
-            -- Ensure trailing newline if file is not empty (standard Unix behavior)
-            if #content > 0 and content:sub(-1) ~= "\n" then
-                content = content .. "\n"
-            end
-
-            local chan = get_daemon_chan()
-            if not chan then
-                logger("Daemon not connected, cannot save.", vim.log.levels.ERROR)
-                return
-            end
-
-            vim.schedule(function()
-                local ok, res = pcall(vim.fn.rpcrequest, chan, "write_file", user, host, port, path, content)
-                if ok and res == true then
-                    vim.api.nvim_set_option_value('modified', false, { buf = args.buf })
-                    logger("Saved: " .. path, vim.log.levels.INFO)
-                else
-                    logger("Save failed: " .. tostring(res), vim.log.levels.ERROR)
+                local lines = vim.api.nvim_buf_get_lines(args.buf, 0, -1, false)
+                local content = table.concat(lines, "\n")
+                if #content > 0 and content:sub(-1) ~= "\n" then
+                    content = content .. "\n"
                 end
-            end)
-        end,
-        group = group,
-    })
+
+                local chan = get_daemon_chan()
+                if not chan then
+                    logger("Daemon not connected, cannot save.", vim.log.levels.ERROR)
+                    return
+                end
+
+                vim.schedule(function()
+                    local ok, res = pcall(vim.fn.rpcrequest, chan, "write_file", user, host, port, path, content)
+                    if ok and res == true then
+                        vim.api.nvim_set_option_value('modified', false, { buf = args.buf })
+                        logger("Saved: " .. path, vim.log.levels.INFO)
+                    else
+                        logger("Save failed: " .. tostring(res), vim.log.levels.ERROR)
+                    end
+                end)
+            end,
+            group = group,
+        })
+    end
 
     -- Register :ZeroLink user command
     vim.api.nvim_create_user_command("ZeroLink", function(cmd_opts)

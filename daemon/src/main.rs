@@ -236,7 +236,12 @@ fn dispatch(
                 .get(3)
                 .and_then(|v| v.as_str())
                 .ok_or(anyhow::anyhow!("Missing cmd"))?;
-            lsp::handle_start_lsp(user, host, port, cmd, &state)
+            let default_prefix = format!("file://zero://{}@{}:{}", user, host, port);
+            let client_prefix = args
+                .get(4)
+                .and_then(|v| v.as_str())
+                .unwrap_or(&default_prefix);
+            lsp::handle_start_lsp(user, host, port, cmd, client_prefix, &state)
         }
 
         _ => Err(anyhow::anyhow!("Unknown method: {}", method)),

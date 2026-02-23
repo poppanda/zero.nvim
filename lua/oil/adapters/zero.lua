@@ -2,7 +2,7 @@
 --- Placed at lua/oil/adapters/zero.lua so oil.nvim can discover it
 --- via require("oil.adapters.zero").
 ---
---- URL scheme: oil-zero://user@host:port/remote/path
+--- URL scheme: zero://user@host:port/remote/path
 --- (port defaults to 22 if omitted)
 
 local cache = require("oil.cache")
@@ -22,14 +22,14 @@ local M = {}
 ---@field port integer
 ---@field path string
 
----Parse an oil-zero:// URL into its components.
+---Parse a zero:// URL into its components.
 ---oil.nvim calls util.parse_url(oil_url) which splits scheme and path,
 ---then passes the full oil_url to this function.
 ---@param oil_url string
 ---@return oil.zeroUrl
 M.parse_url = function(oil_url)
   local scheme, url = util.parse_url(oil_url)
-  assert(scheme and url, string.format("Malformed oil-zero url: '%s'", oil_url))
+  assert(scheme and url, string.format("Malformed zero url: '%s'", oil_url))
 
   local ret = { scheme = scheme }
 
@@ -53,7 +53,7 @@ M.parse_url = function(oil_url)
   end
 
   if not ret.host or ret.host == "" then
-    error(string.format("Malformed oil-zero url: %s", oil_url))
+    error(string.format("Malformed zero url: %s", oil_url))
   end
 
   ---@cast ret oil.zeroUrl

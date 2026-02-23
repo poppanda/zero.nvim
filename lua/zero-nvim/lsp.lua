@@ -3,7 +3,7 @@ local zero = require("zero-nvim")
 local manager = require("zero-nvim.project.manager")
 
 --- Attempt to start a remote LSP via the TCP proxy daemon.
---- Works on both `remote://` file buffers and `oil-zero://` directory buffers.
+--- Works on `zero://` buffers (both file and directory).
 ---@param bufnr? integer Buffer number (defaults to current buffer)
 ---@param cmd_args string[] Language server command and args (e.g. {"basedpyright", "--stdio"})
 ---@param settings? table Optional settings for the language server (e.g. { python = { pythonPath = ... } })
@@ -13,7 +13,7 @@ function M.start_lsp(bufnr, cmd_args, settings)
 
     local user, host, port, path = zero.parse_uri(name)
     if not user then
-        vim.notify("ZeroNvim: Current buffer is not a remote:// or oil-zero:// buffer (got: " .. name .. ")",
+        vim.notify("ZeroNvim: Current buffer is not a zero:// buffer (got: " .. name .. ")",
             vim.log.levels.ERROR)
         return
     end
@@ -50,7 +50,9 @@ function M.start_lsp(bufnr, cmd_args, settings)
         return
     end
 
-    local ok, local_port = pcall(vim.fn.rpcrequest, chan, "lsp_start", user, host, port, cmd_str)
+    local client_prefix = string.format("file://zero://%s@%s:%d", user, host, port)
+
+    local ok, local_port = pcall(vim.fn.rpcrequest, chan, "lsp_start", user, host, port, cmd_str, client_prefix)
     if not ok or type(local_port) ~= "number" then
         vim.notify("ZeroNvim: Failed to start LSP proxy: " .. tostring(local_port), vim.log.levels.ERROR)
         return
@@ -77,7 +79,7 @@ function M.start_lsp(bufnr, cmd_args, settings)
     -- vim.lsp.start would deduplicate and return the old dead client's id without
     -- connecting to our new listener port.
     local capabilities = vim.lsp.protocol.make_client_capabilities()
-    -- Disable didChangeWatchedFiles since Neovim's fs.watch (libuv) doesn't work on remote:// URIs
+    -- Disable didChangeWatchedFiles since Neovim's fs.watch (libuv) doesn't work on zero:// URIs
     -- or if the LSP tries to watch on the remote end, it fails with ENOENT and crashes.
     if capabilities.workspace and capabilities.workspace.didChangeWatchedFiles then
         capabilities.workspace.didChangeWatchedFiles.dynamicRegistration = false

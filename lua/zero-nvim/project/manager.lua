@@ -62,7 +62,7 @@ function M.match_project(host, path)
             -- 2. Path must start with project root
             -- Ensure root has trailing slash for correct prefix matching if needed,
             -- but simple string.find is usually enough for "is subdirectory" check if we handle boundaries.
-            
+
             -- Simple normalization: remove trailing slashes for comparison
             local clean_root = config.root:gsub("/+$", "")
             local clean_path = path:gsub("/+$", "")
