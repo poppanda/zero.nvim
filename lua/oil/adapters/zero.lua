@@ -70,7 +70,10 @@ local function url_to_str(url)
     table.insert(pieces, "@")
   end
   table.insert(pieces, url.host)
-  if url.port and url.port ~= 22 then
+  -- Always include port for canonical URI format.
+  -- Omitting port=22 causes mismatches with daemon-produced URIs (which always
+  -- include the explicit port), leading to duplicate buffers on LSP jump.
+  if url.port then
     table.insert(pieces, string.format(":%d", url.port))
   end
   table.insert(pieces, "/")

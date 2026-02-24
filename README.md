@@ -111,6 +111,48 @@ When editing a project (`<C-e>`), you can override LSP settings for that specifi
 }
 ```
 
+### Remote LSP (ZeroLspStart)
+
+Start a language server on the remote host via a local TCP proxy:
+
+```vim
+:ZeroLspStart basedpyright --stdio
+```
+
+Tab-completion suggests binaries available in `~/.local/share/nvim/mason/bin/` on the remote server.
+
+#### Auto-start by filetype
+
+Add `filetypes` (and optionally `cmd`) to each server entry in `lsp.servers`. The LSP will start automatically whenever a matching remote file is opened — no manual `:ZeroLspStart` needed:
+
+```lua
+require("zero-nvim").setup({
+  lsp = {
+    servers = {
+      basedpyright = {
+        filetypes = { "python" },
+        cmd = { "basedpyright", "--stdio" },
+        settings = {
+          python = { analysis = { typeCheckingMode = "off" } },
+        },
+      },
+      ["typescript-language-server"] = {
+        filetypes = { "typescript", "javascript" },
+        cmd = { "typescript-language-server", "--stdio" },
+      },
+    },
+  },
+})
+```
+
+- **`filetypes`**: Triggers auto-start when the buffer filetype matches.
+- **`cmd`**: Override the default `{ server_name, "--stdio" }` command.
+- **`settings`**: Passed as LSP initialization settings.
+
+If a project is registered via `:ZeroProject`, the LSP uses the **project root** as `rootUri` so cross-directory definitions and references work correctly. Per-project overrides (e.g. a virtualenv-specific binary) are configured in the project JSON (see `:ZeroProject` below).
+
+After an LSP definition jump, the target file is automatically attached to the running LSP client — no manual re-start required.
+
 ### Search Project (ZeroSearch)
 
 Search your project instantly via ripgrep with an enhanced, native Tree-Like UI format.

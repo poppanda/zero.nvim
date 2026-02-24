@@ -73,13 +73,19 @@ function M.start_lsp(bufnr, cmd_args, settings)
 
     vim.notify("ZeroNvim: LSP Proxy started on port " .. local_port .. " for " .. cmd_args[1], vim.log.levels.INFO)
 
-    local is_dir = (path:sub(-1) == "/")
-    local root_path = is_dir and path or vim.fs.dirname(path)
-    root_path = root_path:gsub("/$", "")
-    -- the LSP expects a normal local path for root_dir (which gets translated to rootUri and rootPath).
-    -- If we use remote:// here, vim.uri_from_fname will produce file://remote://... which the daemon translates to file://file://...
-    -- which causes language servers like basedpyright to crash on watch.fs(rootPath).
-    local root_dir = root_path
+    -- Prefer the registered project root so the language server has full
+    -- visibility of the project. Falling back to the file's parent directory
+    -- means cross-directory jumps may produce results outside root_dir.
+    -- root_dir MUST be a plain path (not a zero:// URI): vim.uri_from_fname
+    -- would produce file://zero://... which crashes LSP servers on rootPath.
+    local root_dir
+    if project_config and project_config.root then
+        root_dir = project_config.root:gsub("/+$", "")
+    else
+        local is_dir = (path:sub(-1) == "/")
+        root_dir = is_dir and path or vim.fs.dirname(path)
+        root_dir = root_dir:gsub("/$", "")
+    end
 
     local lsp_name = "zero-" .. cmd_args[1]
 

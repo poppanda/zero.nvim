@@ -248,8 +248,13 @@ function M.handle_fetch(buf, user, host, port, path, password, refresh)
             -- List the buffer so buffer-manager plugins (barbar, bufferline, etc.)
             -- detect it via BufAdd. bufadd() creates unlisted buffers by default.
             vim.api.nvim_set_option_value('buflisted', true, { buf = buf })
-            local ft = vim.filetype.match({ filename = path })
-            if ft then vim.api.nvim_set_option_value('filetype', ft, { buf = buf }) end
+            -- NOTE: filetype is NOT set here.
+            -- Setting it inside handle_fetch is too early for the BufNew path:
+            -- BufNew fires before the buffer enters any window, so TreeSitter's
+            -- on_win decoration provider never fires and highlights don't appear.
+            -- Filetype is set instead by:
+            --   • BufReadCmd callback  — direct open / file browser (:edit)
+            --   • BufWinEnter autocmd  — LSP-jump path (vim.fn.bufadd, no BufReadCmd)
         end
     end
 end
@@ -338,6 +343,53 @@ function M.setup(opts)
 
     local group = vim.api.nvim_create_augroup("ZeroNvim", { clear = true })
 
+    -- =========================================================
+    -- DIAGNOSTIC AUTOCMDS — remove after root cause is found
+    -- Logs every relevant event for zero:// buffers so we can
+    -- trace the exact event order for oil vs builtin open and
+    -- for LSP-jump, and check when/whether filetype is set.
+    -- =========================================================
+    local function _dbg(tag, buf, extra)
+        local bname = buf and vim.api.nvim_buf_get_name(buf) or "?"
+        local ft    = buf and vim.bo[buf].filetype or "?"
+        local lc    = buf and vim.api.nvim_buf_line_count(buf) or 0
+        local wins  = buf and #vim.fn.win_findbuf(buf) or 0
+        vim.notify(string.format(
+            "[zero-dbg] %-14s buf=%-3d ft=%-12s lines=%-4d wins=%d  %s",
+            tag, buf or -1, ft == "" and "(empty)" or ft, lc, wins,
+            extra or bname), vim.log.levels.WARN)
+    end
+
+    vim.api.nvim_create_autocmd("BufNew", {
+        pattern = "zero://*",
+        group = group,
+        callback = function(a) _dbg("BufNew", a.buf) end,
+    })
+    vim.api.nvim_create_autocmd("BufReadCmd", {
+        pattern = "zero://*",
+        group = group,
+        callback = function(a) _dbg("BufReadCmd", a.buf) end,
+    })
+    vim.api.nvim_create_autocmd("BufWinEnter", {
+        pattern = "zero://*",
+        group = group,
+        callback = function(a) _dbg("BufWinEnter", a.buf) end,
+    })
+    vim.api.nvim_create_autocmd("BufEnter", {
+        pattern = "zero://*",
+        group = group,
+        callback = function(a) _dbg("BufEnter", a.buf) end,
+    })
+    -- FileType fires for ANY buffer — filter to zero:// only
+    vim.api.nvim_create_autocmd("FileType", {
+        group = group,
+        callback = function(a)
+            if not vim.api.nvim_buf_get_name(a.buf):match("^zero://") then return end
+            _dbg("FileType", a.buf, "ft=" .. a.match)
+        end,
+    })
+    -- =========================================================
+
     -- When oil is the explorer, oil's adapter handles all zero:// buffer I/O
     -- (read_file, write_file, list). Registering BufReadCmd/BufWriteCmd here
     -- would conflict with oil's own handlers and cause infinite refresh loops.
@@ -370,8 +422,20 @@ function M.setup(opts)
             pattern = "zero://*",
             callback = function(args)
                 local user, host, port, path = M.parse_uri(args.file)
-                -- No vim.schedule: BufReadCmd must populate the buffer synchronously.
-                if user then M.handle_fetch(args.buf, user, host, port, path) end
+                if not user then return end
+                -- Populate buffer synchronously (BufReadCmd requirement).
+                M.handle_fetch(args.buf, user, host, port, path)
+                -- Set filetype HERE, not inside handle_fetch.
+                -- BufReadCmd fires after the window has already switched to this
+                -- buffer, so the current buffer IS args.buf. This means TreeSitter
+                -- and syntax plugins see the buffer as the active window buffer
+                -- and attach their on_win decoration providers correctly.
+                -- Content-based detection covers shebangs / extension-less files.
+                local lines = vim.api.nvim_buf_get_lines(args.buf, 0, 5, false)
+                local ft = vim.filetype.match({ filename = path, contents = lines })
+                if ft and ft ~= "" then
+                    vim.bo[args.buf].filetype = ft
+                end
             end,
             group = group,
         })
@@ -408,6 +472,95 @@ function M.setup(opts)
         })
     end
 
+    -- Set filetype when a zero:// buffer first enters a window without one.
+    -- Placed OUTSIDE the oil guard deliberately: BufReadCmd only runs when
+    -- explorer ~= "oil", but BufWinEnter must run for oil users too.
+    -- It only reads content and sets filetype — no file I/O, no conflict.
+    -- Covers:
+    --   • LSP-jump path (bufadd → BufNew loads content, no BufReadCmd)
+    --   • oil.nvim path (oil reads content, never fires our BufReadCmd)
+    --   • Any path where filetype wasn't set yet when the window opens
+    vim.api.nvim_create_autocmd("BufWinEnter", {
+        pattern = "zero://*",
+        callback = function(args)
+            if vim.bo[args.buf].filetype ~= "" then return end  -- already set
+            local name = args.file
+            if name:match("/$") then return end  -- skip directories
+            local _, _, _, path = M.parse_uri(name)
+            if not path then return end
+            local lc = vim.api.nvim_buf_line_count(args.buf)
+            if lc == 0 then return end  -- content not loaded yet
+            local lines = vim.api.nvim_buf_get_lines(args.buf, 0, math.min(5, lc), false)
+            local ft = vim.filetype.match({ filename = path, contents = lines })
+            if ft and ft ~= "" then
+                vim.bo[args.buf].filetype = ft
+            end
+        end,
+        group = group,
+    })
+
+    -- Fix: oil.nvim sets filetype=oil on zero:// FILE buffers it manages,
+    -- overriding our correctly-detected filetype (e.g. "python").
+    -- Oil does this for ALL zero:// buffers, not just directory listings.
+    -- Intercept FileType=oil on non-directory zero:// buffers and restore
+    -- the correct filetype. vim.schedule ensures we run after oil finishes.
+    vim.api.nvim_create_autocmd("FileType", {
+        pattern = "oil",
+        group = group,
+        callback = function(args)
+            local bname = vim.api.nvim_buf_get_name(args.buf)
+            if not bname:match("^zero://") then return end
+            if bname:match("/$") then return end  -- actual oil directory buffer, skip
+            local _, _, _, path = M.parse_uri(bname)
+            if not path then return end
+            local lc = vim.api.nvim_buf_line_count(args.buf)
+            if lc == 0 then return end
+            local lines = vim.api.nvim_buf_get_lines(args.buf, 0, math.min(5, lc), false)
+            local ft = vim.filetype.match({ filename = path, contents = lines })
+            if ft and ft ~= "" then
+                local _buf = args.buf
+                vim.schedule(function()
+                    if vim.api.nvim_buf_is_valid(_buf) and vim.bo[_buf].filetype == "oil" then
+                        vim.bo[_buf].filetype = ft
+                    end
+                end)
+            end
+        end,
+    })
+
+    -- Auto-start configured LSP servers when a zero:// buffer's filetype is set.
+    -- Users opt in by adding `filetypes = { "python", ... }` (and optionally
+    -- `cmd = { "basedpyright", "--stdio" }`) to each entry in lsp.servers.
+    vim.api.nvim_create_autocmd("FileType", {
+        group = group,
+        callback = function(args)
+            local bname = vim.api.nvim_buf_get_name(args.buf)
+            if not bname:match("^zero://") then return end
+            if not state.channel_id then return end
+            local ft = args.match
+            for server_name, server_cfg in pairs(options.lsp.servers or {}) do
+                if server_cfg.filetypes and vim.tbl_contains(server_cfg.filetypes, ft) then
+                    local lsp_name = "zero-" .. server_name
+                    local existing = vim.lsp.get_clients({ bufnr = args.buf, name = lsp_name })
+                    if #existing == 0 then
+                        local cmd_args = server_cfg.cmd or { server_name, "--stdio" }
+                        -- Schedule so we don't block FileType processing
+                        local _buf = args.buf
+                        vim.schedule(function()
+                            if vim.api.nvim_buf_is_valid(_buf) then
+                                require("zero-nvim.lsp").start_lsp(
+                                    _buf,
+                                    vim.deepcopy(cmd_args),
+                                    server_cfg.settings
+                                )
+                            end
+                        end)
+                    end
+                end
+            end
+        end,
+    })
+
     -- Patch vim.lsp.util.locations_to_items to pre-load zero:// buffers before
     -- the LSP jump. This is the call site in buf.lua's on_response callback
     -- (vim.schedule context = no textlock). Accessed via table field lookup
@@ -428,6 +581,23 @@ function M.setup(opts)
                             (lc == 1 and vim.api.nvim_buf_get_lines(bnum, 0, 1, false)[1] == "")
                         if is_empty then
                             M.handle_fetch(bnum, u, h, p, fpath)
+                        end
+                        -- Auto-attach any running zero-* LSP client whose root_dir
+                        -- covers this file. Clients started via start_lsp store the
+                        -- project root in config.root_dir as a plain path.
+                        for _, client in ipairs(vim.lsp.get_clients()) do
+                            if client.name:match("^zero%-") then
+                                local croot = client.config and client.config.root_dir
+                                if croot then
+                                    croot = croot:gsub("/+$", "")
+                                    if fpath == croot or fpath:find(croot .. "/", 1, true) == 1 then
+                                        local already = vim.lsp.get_clients({ bufnr = bnum, id = client.id })
+                                        if #already == 0 then
+                                            vim.lsp.buf_attach_client(bnum, client.id)
+                                        end
+                                    end
+                                end
+                            end
                         end
                     end
                 end
