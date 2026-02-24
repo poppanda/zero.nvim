@@ -12,7 +12,11 @@
 //
 // URI 转换（TCP→SSH and SSH→TCP）:
 //   zero://user@host:port/path  ↔  file:///path
-//   具体: 替换 "file://zero://user@host:port" ↔ "file://"
+//   TCP→SSH: 替换 "zero://user@host:port" → "file://"
+//   SSH→TCP: 替换 "file://"               → "zero://user@host:port"
+//
+// 注意：vim.uri_from_bufnr 对已带 scheme 的 buffer name（如 zero://...）原样返回，
+// 不会加 file:// 前缀，因此 client_prefix 不含 "file://" 前缀。
 
 use crate::state::DaemonState;
 use anyhow::Context;
@@ -121,7 +125,7 @@ pub fn handle_start_lsp(
                     });
 
                     // Thread 2: SSH stdout → TCP (Neovim)
-                    // Translate: file:// → client_prefix
+                    // Translate: file:// → zero://user@host:port
                     let from2 = file_prefix;
                     let to2 = client_prefix_s;
                     thread::spawn(move || {
@@ -165,18 +169,6 @@ fn pump_and_translate<R: Read, W: Write>(
                 return Ok(()); // EOF — stream closed
             }
 
-            // [DEBUG] Raw Log for SSH->TCP only
-            if label == "SSH->TCP" {
-                use std::fs::OpenOptions;
-                if let Ok(mut f) = OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open("/tmp/debug_ssh_raw.log")
-                {
-                    let _ = f.write_all(&byte);
-                }
-            }
-
             headers.push(byte[0] as char);
 
             // [Safety Check] If headers grow too large, it's likely non-LSP garbage (e.g. stdout logs)
@@ -215,74 +207,28 @@ fn pump_and_translate<R: Read, W: Write>(
         let mut body = vec![0u8; content_length];
         reader.read_exact(&mut body)?;
 
-        // [DEBUG] Raw Log for SSH->TCP Body
-        if label == "SSH->TCP" {
-            use std::fs::OpenOptions;
-            if let Ok(mut f) = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open("/tmp/debug_ssh_raw.log")
-            {
-                let _ = f.write_all(&body);
-            }
-        }
-
         // 4. Translate URI in JSON body
-        let new_body = match String::from_utf8(body.clone()) {
+        // tcp->ssh: "zero://user@host:port" → "file://"   (zero://user@host:22/path → file:///path)
+        // ssh->tcp: "file://"               → "zero://user@host:port" (file:///path → zero://user@host:22/path)
+        let new_body = match String::from_utf8(body) {
             Ok(s) => {
-                // Symmetrical 1-to-1 Replace!
-                // tcp->ssh: replaces "file://zero://ubuntu@host:22" with "file://" -> yields "file:///home/..."
-                // ssh->tcp: replaces "file://" with "file://zero://ubuntu@host:22" -> yields "file://zero://ubuntu@host:22/home/..."
-                let translated = s.replace(from, to);
-
-                // [DEBUG] Log ALL traffic to a single file for timeline analysis
-                if let Ok(mut f) = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open("/tmp/zero_lsp_traffic.log")
-                {
-                    let _ = writeln!(
-                        f,
-                        "[{}] Payload ({} bytes):\n{}\n----------------------------------------",
-                        label,
-                        translated.len(),
-                        translated
-                    );
-                }
-
-                if translated.contains("\"method\":\"initialize\"") {
-                    std::fs::write("/tmp/zero_lsp_init_dump.json", &translated).unwrap();
-                }
-                translated.into_bytes()
+                // Log just the JSON-RPC method/id for diagnostics (no payload content)
+                let method = s.find("\"method\":\"")
+                    .map(|i| {
+                        let rest = &s[i + 10..];
+                        rest.find('"').map(|j| &rest[..j]).unwrap_or("?")
+                    })
+                    .unwrap_or(if s.contains("\"result\"") { "<response>" } else { "<notification>" });
+                eprintln!("[{}] {} ({}b)", label, method, s.len());
+                s.replace(from, to).into_bytes()
             }
-            Err(_) => body,
+            Err(e) => e.into_bytes(),
         };
 
         // 5. Reconstruct headers EXACTLY as LSP expects
         // (Just Content-Length + \r\n\r\n. We drop other headers like Content-Type to avoid
         // complexity, which is generally safe for Language Servers).
         let new_headers = format!("Content-Length: {}\r\n\r\n", new_body.len());
-        if label == "TCP->SSH" {
-            if let Ok(mut f) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open("/tmp/daemon_ssh_in.bin")
-            {
-                let _ = f.write_all(new_headers.as_bytes());
-                let _ = f.write_all(&new_body);
-                let _ = f.write_all(b"\n");
-            }
-        } else {
-            if let Ok(mut f) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open("/tmp/daemon_ssh_out.bin")
-            {
-                let _ = f.write_all(new_headers.as_bytes());
-                let _ = f.write_all(&new_body);
-                let _ = f.write_all(b"\n");
-            }
-        }
         // 6. Write out
         writer.write_all(new_headers.as_bytes())?;
         writer.write_all(&new_body)?;

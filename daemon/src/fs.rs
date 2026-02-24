@@ -442,6 +442,42 @@ pub fn handle_rename(
 // 辅助函数
 // =============================================================================
 
+// =============================================================================
+// exec_remote — 在远端执行命令并返回 stdout
+// =============================================================================
+// 用于轻量级探测，如 `which python3`。
+// 注意：复用同一个 libssh2 Session，与 SFTP 操作通过 Mutex 互斥。
+
+pub fn handle_exec_remote(
+    user: &str,
+    host: &str,
+    port: u16,
+    cmd: &str,
+    state: &Arc<Mutex<DaemonState>>,
+) -> Result<Value, anyhow::Error> {
+    let key = DaemonState::connection_key(user, host, port);
+    let state_lock = state.lock().unwrap();
+    let sess = state_lock
+        .sessions
+        .get(&key)
+        .ok_or(anyhow::anyhow!("NOT_CONNECTED: {}", key))?;
+
+    let mut channel = sess
+        .channel_session()
+        .map_err(|e| anyhow::anyhow!("channel_session 失败: {}", e))?;
+    channel
+        .exec(cmd)
+        .map_err(|e| anyhow::anyhow!("exec 失败: {}", e))?;
+
+    let mut stdout = String::new();
+    channel
+        .read_to_string(&mut stdout)
+        .map_err(|e| anyhow::anyhow!("读取 stdout 失败: {}", e))?;
+    channel.wait_close().ok();
+
+    Ok(Value::String(stdout.trim().to_string().into()))
+}
+
 /// 将 DirEntry 列表转换为 Msgpack 数组格式
 pub fn entries_to_msgpack(entries: &[DirEntry]) -> Value {
     let mut result = Vec::new();

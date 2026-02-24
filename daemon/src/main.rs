@@ -180,6 +180,16 @@ fn dispatch(
             fs::handle_rename(user, host, port, src, dst, &state)
         }
 
+        // ── 远端命令执行 ──
+        "exec_remote" => {
+            let args = params.as_array().ok_or(anyhow::anyhow!("Invalid params"))?;
+            let user = args.get(0).and_then(|v| v.as_str()).ok_or(anyhow::anyhow!("Missing user"))?;
+            let host = args.get(1).and_then(|v| v.as_str()).ok_or(anyhow::anyhow!("Missing host"))?;
+            let port = args.get(2).and_then(|v| v.as_u64()).unwrap_or(22) as u16;
+            let cmd  = args.get(3).and_then(|v| v.as_str()).ok_or(anyhow::anyhow!("Missing cmd"))?;
+            fs::handle_exec_remote(user, host, port, cmd, &state)
+        }
+
         // ── 搜索 ──
         "global_search" => {
             let args = params.as_array().ok_or(anyhow::anyhow!("Invalid params"))?;
@@ -236,7 +246,7 @@ fn dispatch(
                 .get(3)
                 .and_then(|v| v.as_str())
                 .ok_or(anyhow::anyhow!("Missing cmd"))?;
-            let default_prefix = format!("file://zero://{}@{}:{}", user, host, port);
+            let default_prefix = format!("zero://{}@{}:{}", user, host, port);
             let client_prefix = args
                 .get(4)
                 .and_then(|v| v.as_str())

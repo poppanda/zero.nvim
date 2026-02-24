@@ -241,7 +241,13 @@ function M.handle_fetch(buf, user, host, port, path, password, refresh)
             vim.api.nvim_set_option_value('modifiable', true, { buf = buf })
             vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
             vim.api.nvim_set_option_value('modified', false, { buf = buf })
-            vim.api.nvim_set_option_value('readonly', true, { buf = buf })
+            -- Do NOT set readonly=true: it causes W10 warnings whenever Neovim's
+            -- internal buffer-loading machinery (bufload, BufRead events, fold
+            -- operations) touches the buffer after our pre-fetch. Writes are
+            -- handled exclusively via BufWriteCmd, so readonly is not needed.
+            -- List the buffer so buffer-manager plugins (barbar, bufferline, etc.)
+            -- detect it via BufAdd. bufadd() creates unlisted buffers by default.
+            vim.api.nvim_set_option_value('buflisted', true, { buf = buf })
             local ft = vim.filetype.match({ filename = path })
             if ft then vim.api.nvim_set_option_value('filetype', ft, { buf = buf }) end
         end
@@ -336,11 +342,36 @@ function M.setup(opts)
     -- (read_file, write_file, list). Registering BufReadCmd/BufWriteCmd here
     -- would conflict with oil's own handlers and cause infinite refresh loops.
     if options.explorer ~= "oil" then
+        -- Pre-load zero:// file buffers the moment they are created.
+        -- vim.fn.bufadd() (used by vim.uri_to_bufnr in locations_to_items)
+        -- creates an *unlisted* buffer, so BufAdd does NOT fire for it.
+        -- BufNew fires for any new buffer regardless of listed status.
+        vim.api.nvim_create_autocmd("BufNew", {
+            pattern = "zero://*",
+            callback = function(args)
+                local name = args.file
+                -- Skip directory buffers (LSP jumps target files, not dirs)
+                if name:match("/$") then return end
+                local user, host, port, path = M.parse_uri(name)
+                if not user then return end
+                -- Skip if buffer already has content
+                local lc = vim.api.nvim_buf_line_count(args.buf)
+                local already_loaded = lc > 1 or
+                    (lc == 1 and vim.api.nvim_buf_get_lines(args.buf, 0, 1, false)[1] ~= "")
+                if already_loaded then return end
+                -- Only fetch if daemon is connected (avoid errors on startup)
+                if not state.channel_id then return end
+                M.handle_fetch(args.buf, user, host, port, path)
+            end,
+            group = group,
+        })
+
         vim.api.nvim_create_autocmd("BufReadCmd", {
             pattern = "zero://*",
             callback = function(args)
                 local user, host, port, path = M.parse_uri(args.file)
-                if user then vim.schedule(function() M.handle_fetch(args.buf, user, host, port, path) end) end
+                -- No vim.schedule: BufReadCmd must populate the buffer synchronously.
+                if user then M.handle_fetch(args.buf, user, host, port, path) end
             end,
             group = group,
         })
@@ -375,6 +406,34 @@ function M.setup(opts)
             end,
             group = group,
         })
+    end
+
+    -- Patch vim.lsp.util.locations_to_items to pre-load zero:// buffers before
+    -- the LSP jump. This is the call site in buf.lua's on_response callback
+    -- (vim.schedule context = no textlock). Accessed via table field lookup
+    -- (util.locations_to_items), so our patch IS visible even when keybindings
+    -- captured vim.lsp.buf.definition by reference before this patch ran.
+    do
+        local _orig_lti = vim.lsp.util.locations_to_items
+        vim.lsp.util.locations_to_items = function(locations, offset_encoding)
+            for _, loc in ipairs(locations or {}) do
+                local uri = loc.uri or loc.targetUri
+                if uri and uri:match("^zero://") then
+                    local u, h, p, fpath = M.parse_uri(uri)
+                    if u and state.channel_id and not fpath:match("/$") then
+                        local bnum = vim.fn.bufnr(uri)
+                        if bnum == -1 then bnum = vim.fn.bufadd(uri) end
+                        local lc = vim.api.nvim_buf_line_count(bnum)
+                        local is_empty = (lc == 0) or
+                            (lc == 1 and vim.api.nvim_buf_get_lines(bnum, 0, 1, false)[1] == "")
+                        if is_empty then
+                            M.handle_fetch(bnum, u, h, p, fpath)
+                        end
+                    end
+                end
+            end
+            return _orig_lti(locations, offset_encoding)
+        end
     end
 
     -- Register :ZeroLink user command

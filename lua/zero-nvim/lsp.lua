@@ -2,6 +2,7 @@ local M = {}
 local zero = require("zero-nvim")
 local manager = require("zero-nvim.project.manager")
 
+
 --- Attempt to start a remote LSP via the TCP proxy daemon.
 --- Works on `zero://` buffers (both file and directory).
 ---@param bufnr? integer Buffer number (defaults to current buffer)
@@ -50,7 +51,19 @@ function M.start_lsp(bufnr, cmd_args, settings)
         return
     end
 
-    local client_prefix = string.format("file://zero://%s@%s:%d", user, host, port)
+    local client_prefix = string.format("zero://%s@%s:%d", user, host, port)
+
+    -- Auto-detect pythonPath for pyright/basedpyright if not explicitly configured.
+    -- Without a valid pythonPath, basedpyright's analysis thread can deadlock and stop
+    -- responding to hover/definition requests even after a successful initialize.
+    if server_name:match("pyright") and not (settings and settings.python and settings.python.pythonPath) then
+        local ok_exec, python_path = pcall(vim.fn.rpcrequest, chan, "exec_remote", user, host, port,
+            "which python3 2>/dev/null || which python 2>/dev/null || echo ''")
+        if ok_exec and type(python_path) == "string" and #vim.trim(python_path) > 0 then
+            settings = vim.tbl_deep_extend("force", settings or {}, { python = { pythonPath = vim.trim(python_path) } })
+            vim.notify("ZeroNvim: Auto-detected pythonPath: " .. vim.trim(python_path), vim.log.levels.DEBUG)
+        end
+    end
 
     local ok, local_port = pcall(vim.fn.rpcrequest, chan, "lsp_start", user, host, port, cmd_str, client_prefix)
     if not ok or type(local_port) ~= "number" then
