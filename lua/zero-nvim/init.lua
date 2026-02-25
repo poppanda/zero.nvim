@@ -11,9 +11,6 @@ local defaults = {
         prefix = "ZeroNvim: ",
     },
     explorer = "builtin",
-    lsp = {
-        servers = {}, -- key: server binary name, value: { settings = table }
-    },
 }
 
 -- 插件内部状态
@@ -528,9 +525,7 @@ function M.setup(opts)
         end,
     })
 
-    -- Auto-start configured LSP servers when a zero:// buffer's filetype is set.
-    -- Users opt in by adding `filetypes = { "python", ... }` (and optionally
-    -- `cmd = { "basedpyright", "--stdio" }`) to each entry in lsp.servers.
+    -- Auto-start configured LSP servers based on project configuration.
     vim.api.nvim_create_autocmd("FileType", {
         group = group,
         callback = function(args)
@@ -538,7 +533,14 @@ function M.setup(opts)
             if not bname:match("^zero://") then return end
             if not state.channel_id then return end
             local ft = args.match
-            for server_name, server_cfg in pairs(options.lsp.servers or {}) do
+            
+            local user, host, port, path = M.parse_uri(bname)
+            if not host or not path then return end
+            
+            local project_name, project_config = require("zero-nvim.project.manager").match_project(host, path)
+            if not project_config or type(project_config.lsp) ~= "table" then return end
+
+            for server_name, server_cfg in pairs(project_config.lsp) do
                 if server_cfg.filetypes and vim.tbl_contains(server_cfg.filetypes, ft) then
                     local lsp_name = "zero-" .. server_name
                     local existing = vim.lsp.get_clients({ bufnr = args.buf, name = lsp_name })
@@ -684,11 +686,16 @@ function M.setup(opts)
         local server_bin = args[1]
         local settings = nil
 
-        -- Lookup settings from setup config
-        if options.lsp and options.lsp.servers then
-            local s = options.lsp.servers[server_bin]
-            if s and s.settings then
-                settings = s.settings
+        -- Lookup settings from project config
+        local buf_name = vim.api.nvim_buf_get_name(0)
+        local user, host, port, path = M.parse_uri(buf_name)
+        if host and path then
+            local project_name, project_config = require("zero-nvim.project.manager").match_project(host, path)
+            if project_config and project_config.lsp then
+                local s = project_config.lsp[server_bin]
+                if s and s.settings then
+                    settings = s.settings
+                end
             end
         end
 

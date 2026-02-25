@@ -5,7 +5,7 @@ local M = {}
 ---@field user string?
 ---@field port number?
 ---@field root string
----@field lsp table<string, {cmd: string[]?, settings: table?}>?
+---@field lsp table<string, {cmd: string[]?, settings: table?, filetypes: string[]?}>?
 ---@field created_at number
 
 ---@type table<string, ZeroProjectConfig>?
