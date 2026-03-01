@@ -111,6 +111,23 @@ fn dispatch(
         }
 
         // ── 文件操作 ──
+        "fetch_path" => {
+            let (user, host, port, path) = extract_path_params(params)?;
+            fs::handle_fetch_path(user, host, port, path, &state)
+        }
+
+        "fetch_paths" => {
+            let args = params.as_array().ok_or(anyhow::anyhow!("Invalid params"))?;
+            let user = args.get(0).and_then(|v| v.as_str()).ok_or(anyhow::anyhow!("Missing user"))?;
+            let host = args.get(1).and_then(|v| v.as_str()).ok_or(anyhow::anyhow!("Missing host"))?;
+            let port = args.get(2).and_then(|v| v.as_u64()).unwrap_or(22) as u16;
+            
+            let paths_array = args.get(3).and_then(|v| v.as_array()).ok_or(anyhow::anyhow!("Missing paths array"))?;
+            let paths = paths_array.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect();
+            
+            fs::handle_fetch_paths(user, host, port, paths, &state)
+        }
+
         "fetch_file" => {
             let (user, host, port, path) = extract_path_params(params)?;
             fs::handle_fetch_file(user, host, port, path, &state)

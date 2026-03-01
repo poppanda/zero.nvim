@@ -23,6 +23,36 @@ function M.start_lsp(bufnr, cmd_args, settings)
     local server_name = cmd_args[1]
     local project_name, project_config = manager.match_project(host, path)
 
+    -- Prefer the registered project root so the language server has full
+    -- visibility of the project. Falling back to the file's parent directory
+    -- means cross-directory jumps may produce results outside root_dir.
+    -- root_dir MUST be a plain path (not a zero:// URI): vim.uri_from_fname
+    -- would produce file://zero://... which crashes LSP servers on rootPath.
+    local root_dir
+    if project_config and project_config.root then
+        root_dir = project_config.root:gsub("/+$", "")
+    else
+        local is_dir = (path:sub(-1) == "/")
+        root_dir = is_dir and path or vim.fs.dirname(path)
+        root_dir = root_dir:gsub("/$", "")
+    end
+
+    local lsp_name = "zero-" .. server_name
+
+    -- Check if there's already an active client for this project root
+    -- DO THIS EARLY to avoid starting duplicate SSH proxy processes!
+    for _, client in ipairs(vim.lsp.get_clients({ name = lsp_name })) do
+        if client.config and client.config.root_dir == root_dir then
+            -- Found existing client for this root, just attach and return
+            local already = vim.lsp.get_clients({ bufnr = bufnr, id = client.id })
+            if #already == 0 then
+                vim.notify(string.format("ZeroNvim: LSP %s already active for root %s, attaching to buffer %d.", lsp_name, root_dir, bufnr), vim.log.levels.INFO)
+                vim.lsp.buf_attach_client(bufnr, client.id)
+            end
+            return
+        end
+    end
+
     if project_config and project_config.lsp and project_config.lsp[server_name] then
         local p_conf = project_config.lsp[server_name]
 
@@ -71,28 +101,7 @@ function M.start_lsp(bufnr, cmd_args, settings)
         return
     end
 
-    vim.notify("ZeroNvim: LSP Proxy started on port " .. local_port .. " for " .. cmd_args[1], vim.log.levels.INFO)
-
-    -- Prefer the registered project root so the language server has full
-    -- visibility of the project. Falling back to the file's parent directory
-    -- means cross-directory jumps may produce results outside root_dir.
-    -- root_dir MUST be a plain path (not a zero:// URI): vim.uri_from_fname
-    -- would produce file://zero://... which crashes LSP servers on rootPath.
-    local root_dir
-    if project_config and project_config.root then
-        root_dir = project_config.root:gsub("/+$", "")
-    else
-        local is_dir = (path:sub(-1) == "/")
-        root_dir = is_dir and path or vim.fs.dirname(path)
-        root_dir = root_dir:gsub("/$", "")
-    end
-
-    local lsp_name = "zero-" .. cmd_args[1]
-
-    -- Stop any existing dead client with the same name to avoid vim.lsp.start reuse of corpses
-    for _, client in ipairs(vim.lsp.get_clients({ name = lsp_name })) do
-        client.stop(true) -- force-stop
-    end
+    vim.notify("ZeroNvim: LSP Proxy started on port " .. local_port .. " for " .. server_name, vim.log.levels.INFO)
 
     -- Use start_client (not start) to ALWAYS create a fresh TCP connection.
     -- vim.lsp.start would deduplicate and return the old dead client's id without
@@ -112,6 +121,24 @@ function M.start_lsp(bufnr, cmd_args, settings)
         settings = settings,
         before_init = function(params)
             params.processId = vim.NIL
+            -- M6 Task 1: Workspace Root — explicitly force rootUri/rootPath to the
+            -- remote file:// path so the LSP always sees the correct project root.
+            -- root_dir is already a plain remote path (e.g. /home/user/project),
+            -- but setting it here guards against any edge case where Neovim's
+            -- machinery might derive a zero:// URI (which language servers do not
+            -- understand) from an open buffer name.
+            params.rootPath = root_dir
+            params.rootUri = vim.uri_from_fname(root_dir)
+            -- workspaceFolders: fix any zero:// URIs that Neovim may have added
+            -- before our before_init ran.
+            if params.workspaceFolders then
+                for _, wf in ipairs(params.workspaceFolders) do
+                    if wf.uri and wf.uri:match("^zero://") then
+                        wf.uri = vim.uri_from_fname(root_dir)
+                        wf.name = vim.fn.fnamemodify(root_dir, ":t")
+                    end
+                end
+            end
         end,
         on_exit = function(code, signal)
             vim.schedule(function()

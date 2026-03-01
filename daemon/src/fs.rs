@@ -16,7 +16,152 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 // =============================================================================
-// fetch_file — SFTP 读取远程文件
+// fetch_path — 合并 stat 和 fetch，通过 Exec 通道直接获取，显著降低延迟
+// =============================================================================
+
+pub fn handle_fetch_path(
+    user: &str,
+    host: &str,
+    port: u16,
+    path: &str,
+    state: &Arc<Mutex<DaemonState>>,
+) -> Result<Value, anyhow::Error> {
+    let key = DaemonState::connection_key(user, host, port);
+    let state_lock = state.lock().unwrap();
+    let sess = state_lock
+        .sessions
+        .get(&key)
+        .ok_or(anyhow::anyhow!("NOT_CONNECTED: {}", key))?;
+
+    let mut channel = sess
+        .channel_session()
+        .map_err(|e| anyhow::anyhow!("无法开启 SSH 通道: {}", e))?;
+
+    let escaped_path = format!("'{}'", path.replace('\'', "'\\''"));
+    let script = format!(
+        "if [ -d {0} ]; then echo -n 'DIR'; elif [ -f {0} ]; then echo -n 'FILE'; cat {0}; else echo -n 'MISSING'; fi",
+        escaped_path
+    );
+
+    channel
+        .exec(&script)
+        .map_err(|e| anyhow::anyhow!("远程执行失败: {}", e))?;
+
+    let mut out = Vec::new();
+    channel
+        .read_to_end(&mut out)
+        .map_err(|e| anyhow::anyhow!("读取数据失败: {}", e))?;
+
+    let mut err = String::new();
+    channel.stderr().read_to_string(&mut err).ok();
+    channel.wait_close().ok();
+
+    if out.starts_with(b"DIR") {
+        Ok(Value::Array(vec![
+            Value::String("directory".into()),
+            Value::Nil,
+        ]))
+    } else if out.starts_with(b"FILE") {
+        let content_bytes = &out[4..];
+        let content_str = String::from_utf8_lossy(content_bytes).into_owned();
+        Ok(Value::Array(vec![
+            Value::String("file".into()),
+            Value::String(content_str.into()),
+        ]))
+    } else if out.starts_with(b"MISSING") {
+        Err(anyhow::anyhow!("路径不存在: {}", path))
+    } else {
+        let out_str = String::from_utf8_lossy(&out);
+        Err(anyhow::anyhow!("未知结果: {} | stderr: {}", out_str, err))
+    }
+}
+
+// =============================================================================
+// fetch_paths — 批量获取多个文件内容，极大地降低 LSP 跳转等场景的网络 RTT 延迟
+// =============================================================================
+
+pub fn handle_fetch_paths(
+    user: &str,
+    host: &str,
+    port: u16,
+    paths: Vec<String>,
+    state: &Arc<Mutex<DaemonState>>,
+) -> Result<Value, anyhow::Error> {
+    if paths.is_empty() {
+        return Ok(Value::Map(vec![]));
+    }
+
+    let key = DaemonState::connection_key(user, host, port);
+    let state_lock = state.lock().unwrap();
+    let sess = state_lock
+        .sessions
+        .get(&key)
+        .ok_or(anyhow::anyhow!("NOT_CONNECTED: {}", key))?;
+
+    let mut channel = sess
+        .channel_session()
+        .map_err(|e| anyhow::anyhow!("无法开启 SSH 通道: {}", e))?;
+
+    // Build a single shell script that echoes boundaries and cats the files
+    let mut script = String::new();
+    for p in &paths {
+        let escaped = p.replace('\'', "'\\''");
+        script.push_str(&format!(
+            "echo -n '<<<Z_FILE:{p}>>>'; if [ -f '{escaped}' ]; then cat '{escaped}'; fi; echo -n '<<<Z_END>>>'; ",
+            p = p,
+            escaped = escaped
+        ));
+    }
+
+    channel
+        .exec(&script)
+        .map_err(|e| anyhow::anyhow!("批量远程执行失败: {}", e))?;
+
+    let mut out = Vec::new();
+    channel
+        .read_to_end(&mut out)
+        .map_err(|e| anyhow::anyhow!("读取数据失败: {}", e))?;
+    channel.wait_close().ok();
+
+    let out_str = String::from_utf8_lossy(&out);
+    
+    let mut result_map = Vec::new();
+    
+    // Parse the output based on our boundaries
+    // Format: <<<Z_FILE:/path>>>[content]<<<Z_END>>>
+    let mut current_pos = 0;
+    while let Some(start_idx) = out_str[current_pos..].find("<<<Z_FILE:") {
+        let absolute_start = current_pos + start_idx;
+        let path_start = absolute_start + "<<<Z_FILE:".len();
+        
+        if let Some(path_end_relative) = out_str[path_start..].find(">>>") {
+            let path_end = path_start + path_end_relative;
+            let path = &out_str[path_start..path_end];
+            
+            let content_start = path_end + ">>>".len();
+            if let Some(content_end_relative) = out_str[content_start..].find("<<<Z_END>>>") {
+                let content_end = content_start + content_end_relative;
+                let content = &out_str[content_start..content_end];
+                
+                result_map.push((
+                    Value::String(path.into()),
+                    Value::String(content.into())
+                ));
+                
+                current_pos = content_end + "<<<Z_END>>>".len();
+            } else {
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+
+    Ok(Value::Map(result_map))
+}
+
+// =============================================================================
+// fetch_file — SFTP 读取远程文件 (保留做备用或特定场景)
 // =============================================================================
 
 pub fn handle_fetch_file(

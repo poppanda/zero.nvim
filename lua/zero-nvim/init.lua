@@ -213,12 +213,14 @@ function M.handle_fetch(buf, user, host, port, path, password, refresh)
         return
     end
 
-    local ok_stat, ftype = pcall(vim.fn.rpcrequest, chan, "stat", user, host, port, path)
-    if not ok_stat then
-        logger("Access failed: " .. tostring(ftype), vim.log.levels.ERROR)
+    local ok_fetch, fetch_res = pcall(vim.fn.rpcrequest, chan, "fetch_path", user, host, port, path)
+    if not ok_fetch then
+        logger("Access failed: " .. tostring(fetch_res), vim.log.levels.ERROR)
         return
     end
 
+    local ftype = fetch_res[1]
+    
     if ftype == "directory" then
         if options.explorer == "oil" then
             local oil_uri = string.format("zero://%s@%s:%d%s", user, host, port, path)
@@ -230,8 +232,8 @@ function M.handle_fetch(buf, user, host, port, path, password, refresh)
         end
         local entries = M.get_entries(user, host, port, path)
         if entries then setup_dir_buffer(buf, user, host, port, path, entries) end
-    else
-        local content = M.get_file_content(user, host, port, path)
+    elseif ftype == "file" then
+        local content = fetch_res[2]
         if content then
             local lines = vim.split(content, "\n")
             if #lines > 0 and lines[#lines] == "" then table.remove(lines) end
@@ -541,22 +543,42 @@ function M.setup(opts)
             if not project_config or type(project_config.lsp) ~= "table" then return end
 
             for server_name, server_cfg in pairs(project_config.lsp) do
-                if server_cfg.filetypes and vim.tbl_contains(server_cfg.filetypes, ft) then
+                if not server_cfg.filetypes then
+                    logger(string.format("ZeroNvim: LSP %s is configured but missing 'filetypes' array, skipping auto-start", server_name), vim.log.levels.WARN)
+                elseif vim.tbl_contains(server_cfg.filetypes, ft) then
                     local lsp_name = "zero-" .. server_name
+                    logger(string.format("ZeroNvim: Checking auto-start for LSP %s (buffer %d, ft=%s)", lsp_name, args.buf, ft), vim.log.levels.DEBUG)
+                    
                     local existing = vim.lsp.get_clients({ bufnr = args.buf, name = lsp_name })
                     if #existing == 0 then
-                        local cmd_args = server_cfg.cmd or { server_name, "--stdio" }
-                        -- Schedule so we don't block FileType processing
-                        local _buf = args.buf
-                        vim.schedule(function()
-                            if vim.api.nvim_buf_is_valid(_buf) then
-                                require("zero-nvim.lsp").start_lsp(
-                                    _buf,
-                                    vim.deepcopy(cmd_args),
-                                    server_cfg.settings
-                                )
-                            end
-                        end)
+                        state.lsp_starting = state.lsp_starting or {}
+                        local root_dir = project_config.root and project_config.root:gsub("/+$", "") or vim.fs.dirname(path):gsub("/+$", "")
+                        local start_key = lsp_name .. ":" .. root_dir
+                        
+                        if state.lsp_starting[start_key] then
+                            logger(string.format("ZeroNvim: LSP %s for root %s is already starting, skipping duplicate trigger for buffer %d", lsp_name, root_dir, args.buf), vim.log.levels.DEBUG)
+                        else
+                            state.lsp_starting[start_key] = true
+                            local cmd_args = server_cfg.cmd or { server_name, "--stdio" }
+                            -- Schedule so we don't block FileType processing
+                            local _buf = args.buf
+                            logger(string.format("ZeroNvim: Auto-starting LSP %s for buffer %d", lsp_name, _buf), vim.log.levels.INFO)
+                            vim.schedule(function()
+                                if vim.api.nvim_buf_is_valid(_buf) then
+                                    require("zero-nvim.lsp").start_lsp(
+                                        _buf,
+                                        vim.deepcopy(cmd_args),
+                                        server_cfg.settings
+                                    )
+                                end
+                                -- Clear the lock shortly after so future legitimate retries aren't blocked
+                                vim.defer_fn(function()
+                                    state.lsp_starting[start_key] = nil
+                                end, 3000)
+                            end)
+                        end
+                    else
+                        logger(string.format("ZeroNvim: LSP %s already active for buffer %d", lsp_name, args.buf), vim.log.levels.DEBUG)
                     end
                 end
             end
@@ -571,6 +593,9 @@ function M.setup(opts)
     do
         local _orig_lti = vim.lsp.util.locations_to_items
         vim.lsp.util.locations_to_items = function(locations, offset_encoding)
+            -- Batch processing of missing remote files
+            local missing_files_by_host = {} -- structure: { ["user@host:port"] = { chan = id, paths = {}, buffers = {} } }
+            
             for _, loc in ipairs(locations or {}) do
                 local uri = loc.uri or loc.targetUri
                 if uri and uri:match("^zero://") then
@@ -581,12 +606,23 @@ function M.setup(opts)
                         local lc = vim.api.nvim_buf_line_count(bnum)
                         local is_empty = (lc == 0) or
                             (lc == 1 and vim.api.nvim_buf_get_lines(bnum, 0, 1, false)[1] == "")
+                            
                         if is_empty then
-                            M.handle_fetch(bnum, u, h, p, fpath)
+                            local host_key = string.format("%s@%s:%d", u, h, p)
+                            if not missing_files_by_host[host_key] then
+                                missing_files_by_host[host_key] = {
+                                    user = u, host = h, port = p,
+                                    paths = {}, bnums = {}
+                                }
+                            end
+                            table.insert(missing_files_by_host[host_key].paths, fpath)
+                            table.insert(missing_files_by_host[host_key].bnums, bnum)
                         end
+                        
                         -- Auto-attach any running zero-* LSP client whose root_dir
                         -- covers this file. Clients started via start_lsp store the
                         -- project root in config.root_dir as a plain path.
+                        logger("ZeroNvim: Checking auto-attach for buffer " .. bnum .. " (" .. fpath .. ")", vim.log.levels.DEBUG)
                         for _, client in ipairs(vim.lsp.get_clients()) do
                             if client.name:match("^zero%-") then
                                 local croot = client.config and client.config.root_dir
@@ -595,7 +631,10 @@ function M.setup(opts)
                                     if fpath == croot or fpath:find(croot .. "/", 1, true) == 1 then
                                         local already = vim.lsp.get_clients({ bufnr = bnum, id = client.id })
                                         if #already == 0 then
+                                            logger(string.format("ZeroNvim: Auto-attaching LSP %s to buffer %d", client.name, bnum), vim.log.levels.INFO)
                                             vim.lsp.buf_attach_client(bnum, client.id)
+                                        else
+                                            logger(string.format("ZeroNvim: LSP %s already attached to buffer %d", client.name, bnum), vim.log.levels.DEBUG)
                                         end
                                     end
                                 end
@@ -604,6 +643,33 @@ function M.setup(opts)
                     end
                 end
             end
+            
+            -- Fetch missing files in batch per host
+            for _, host_data in pairs(missing_files_by_host) do
+                local chan, err = M.ensure_connection(host_data.user, host_data.host, host_data.port)
+                if chan and #host_data.paths > 0 then
+                    logger(string.format("ZeroNvim: Batch fetching %d files from %s:%d", #host_data.paths, host_data.host, host_data.port), vim.log.levels.DEBUG)
+                    -- Sync call to fetch all in one roundtrip
+                    local ok, content_map = pcall(vim.fn.rpcrequest, chan, "fetch_paths", host_data.user, host_data.host, host_data.port, host_data.paths)
+                    if ok and type(content_map) == "table" then
+                        for i, bnum in ipairs(host_data.bnums) do
+                            local fpath = host_data.paths[i]
+                            local content = content_map[fpath]
+                            if content then
+                                local lines = vim.split(content, "\n")
+                                if #lines > 0 and lines[#lines] == "" then table.remove(lines) end
+                                vim.api.nvim_set_option_value('modifiable', true, { buf = bnum })
+                                vim.api.nvim_buf_set_lines(bnum, 0, -1, false, lines)
+                                vim.api.nvim_set_option_value('modified', false, { buf = bnum })
+                                vim.api.nvim_set_option_value('buflisted', true, { buf = bnum })
+                            end
+                        end
+                    else
+                        logger("ZeroNvim: Batch fetch failed: " .. tostring(content_map), vim.log.levels.ERROR)
+                    end
+                end
+            end
+
             return _orig_lti(locations, offset_encoding)
         end
     end
@@ -717,6 +783,51 @@ function M.setup(opts)
                 return completions
             end
             return {}
+        end,
+    })
+
+    -- Register :ZeroLspStop [server_name] — stop a remote LSP client.
+    -- Stopping the Neovim client closes the TCP socket, which terminates
+    -- the daemon's SSH subprocess for that LSP session.
+    vim.api.nvim_create_user_command("ZeroLspStop", function(cmd_opts)
+        local arg = cmd_opts.fargs[1]
+        local bufnr = vim.api.nvim_get_current_buf()
+
+        local clients
+        if arg and arg ~= "" then
+            -- Accept either "basedpyright" or "zero-basedpyright"
+            local lsp_name = arg:match("^zero%-") and arg or ("zero-" .. arg)
+            clients = vim.lsp.get_clients({ name = lsp_name })
+        else
+            -- Stop all zero-* clients attached to the current buffer
+            clients = vim.tbl_filter(
+                function(c) return c.name:match("^zero%-") end,
+                vim.lsp.get_clients({ bufnr = bufnr })
+            )
+        end
+
+        if #clients == 0 then
+            vim.notify("ZeroNvim: no matching LSP client found", vim.log.levels.WARN)
+            return
+        end
+        for _, client in ipairs(clients) do
+            client.stop()
+            vim.notify("ZeroNvim: stopped LSP " .. client.name, vim.log.levels.INFO)
+        end
+    end, {
+        nargs = "?",
+        desc = "Stop remote LSP client (e.g. :ZeroLspStop basedpyright or :ZeroLspStop)",
+        complete = function(arg_lead, _, _)
+            local completions = {}
+            for _, c in ipairs(vim.lsp.get_clients()) do
+                if c.name:match("^zero%-") then
+                    local short = c.name:gsub("^zero%-", "")
+                    if short:find(arg_lead, 1, true) == 1 then
+                        table.insert(completions, short)
+                    end
+                end
+            end
+            return completions
         end,
     })
 

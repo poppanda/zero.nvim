@@ -102,6 +102,7 @@ When editing a project (`<C-e>`), you can override LSP settings for that specifi
   "root": "/var/www/backend",
   "lsp": {
     "basedpyright": {
+      "filetypes": ["python"],
       "cmd": ["/var/www/backend/.venv/bin/basedpyright-langserver", "--stdio"],
       "settings": {
         "python": { "analysis": { "typeCheckingMode": "off" } }
