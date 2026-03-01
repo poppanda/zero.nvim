@@ -562,7 +562,7 @@ function M.setup(opts)
                             local cmd_args = server_cfg.cmd or { server_name, "--stdio" }
                             -- Schedule so we don't block FileType processing
                             local _buf = args.buf
-                            logger(string.format("ZeroNvim: Auto-starting LSP %s for buffer %d", lsp_name, _buf), vim.log.levels.INFO)
+                            logger(string.format("ZeroNvim: Auto-starting LSP %s for buffer %d", lsp_name, _buf), vim.log.levels.DEBUG)
                             vim.schedule(function()
                                 if vim.api.nvim_buf_is_valid(_buf) then
                                     require("zero-nvim.lsp").start_lsp(
@@ -631,7 +631,7 @@ function M.setup(opts)
                                     if fpath == croot or fpath:find(croot .. "/", 1, true) == 1 then
                                         local already = vim.lsp.get_clients({ bufnr = bnum, id = client.id })
                                         if #already == 0 then
-                                            logger(string.format("ZeroNvim: Auto-attaching LSP %s to buffer %d", client.name, bnum), vim.log.levels.INFO)
+                                            logger(string.format("ZeroNvim: Auto-attaching LSP %s to buffer %d", client.name, bnum), vim.log.levels.DEBUG)
                                             vim.lsp.buf_attach_client(bnum, client.id)
                                         else
                                             logger(string.format("ZeroNvim: LSP %s already attached to buffer %d", client.name, bnum), vim.log.levels.DEBUG)

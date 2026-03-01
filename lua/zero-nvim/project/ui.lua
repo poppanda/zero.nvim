@@ -80,12 +80,34 @@ function M.add_current_project(bufnr, on_complete)
     end)
 end
 
+--- Format JSON string nicely using system tools if available
+local function format_json(obj)
+    local ok, j = pcall(vim.json.encode, obj)
+    if not ok then return "{}" end
+    
+    local j_escaped = vim.fn.shellescape(j)
+    
+    -- Try jq first
+    if vim.fn.executable("jq") == 1 then
+        local formatted = vim.fn.system("echo " .. j_escaped .. " | jq .")
+        if vim.v.shell_error == 0 then return formatted end
+    end
+    -- Fallback to python json tool
+    if vim.fn.executable("python3") == 1 then
+        local formatted = vim.fn.system("echo " .. j_escaped .. " | python3 -m json.tool")
+        if vim.v.shell_error == 0 then return formatted end
+    end
+    
+    return j
+end
+
 --- Edit project config (JSON) in a floating window
 ---@param name string
 ---@param current_config table
 ---@param on_save fun(new_config: table)
 local function edit_project_config(name, current_config, on_save)
-    local content = vim.split(vim.json.encode(current_config), "\n")
+    local formatted_json = format_json(current_config)
+    local content = vim.split(formatted_json, "\n")
 
     local buf, win = utils.create_float({ title = "Edit Config: " .. name, width = 80, height = 20 })
 

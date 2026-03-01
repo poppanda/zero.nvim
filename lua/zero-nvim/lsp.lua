@@ -46,7 +46,7 @@ function M.start_lsp(bufnr, cmd_args, settings)
             -- Found existing client for this root, just attach and return
             local already = vim.lsp.get_clients({ bufnr = bufnr, id = client.id })
             if #already == 0 then
-                vim.notify(string.format("ZeroNvim: LSP %s already active for root %s, attaching to buffer %d.", lsp_name, root_dir, bufnr), vim.log.levels.INFO)
+                vim.notify(string.format("ZeroNvim: LSP %s already active for root %s, attaching to buffer %d.", lsp_name, root_dir, bufnr), vim.log.levels.DEBUG)
                 vim.lsp.buf_attach_client(bufnr, client.id)
             end
             return
@@ -59,13 +59,13 @@ function M.start_lsp(bufnr, cmd_args, settings)
         -- Override Command
         if p_conf.cmd and #p_conf.cmd > 0 then
             cmd_args = p_conf.cmd
-            vim.notify("ZeroNvim: Using project-specific LSP command for " .. server_name, vim.log.levels.INFO)
+            vim.notify("ZeroNvim: Using project-specific LSP command for " .. server_name, vim.log.levels.DEBUG)
         end
 
         -- Merge Settings
         if p_conf.settings then
             settings = vim.tbl_deep_extend("force", settings or {}, p_conf.settings)
-            vim.notify("ZeroNvim: Merged project-specific LSP settings for " .. server_name, vim.log.levels.INFO)
+            vim.notify("ZeroNvim: Merged project-specific LSP settings for " .. server_name, vim.log.levels.DEBUG)
         end
     end
 
@@ -101,7 +101,7 @@ function M.start_lsp(bufnr, cmd_args, settings)
         return
     end
 
-    vim.notify("ZeroNvim: LSP Proxy started on port " .. local_port .. " for " .. server_name, vim.log.levels.INFO)
+    vim.notify("ZeroNvim: LSP Proxy started on port " .. local_port .. " for " .. server_name, vim.log.levels.DEBUG)
 
     -- Use start_client (not start) to ALWAYS create a fresh TCP connection.
     -- vim.lsp.start would deduplicate and return the old dead client's id without
@@ -162,8 +162,8 @@ function M.start_lsp(bufnr, cmd_args, settings)
     if client_id then
         vim.lsp.buf_attach_client(bufnr, client_id)
         vim.notify(
-            string.format("ZeroNvim: LSP %s attached to buffer (id=%d, root=%s)", lsp_name, client_id, root_dir),
-            vim.log.levels.INFO
+            string.format("ZeroNvim: LSP %s attached to buffer", lsp_name),
+            vim.log.levels.DEBUG
         )
         -- Delayed status check
         vim.defer_fn(function()
@@ -175,7 +175,7 @@ function M.start_lsp(bufnr, cmd_args, settings)
                 vim.notify(
                     string.format("ZeroNvim: LSP %s is active (%s)", lsp_name,
                         c.initialized and "initialized" or "initializing"),
-                    vim.log.levels.INFO
+                    vim.log.levels.DEBUG
                 )
             end
         end, 3000)

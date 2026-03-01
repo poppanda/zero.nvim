@@ -75,7 +75,7 @@
 
 **达标标志：** 打开一个远程 Python 文件，能够通过远程 `pyright` 获得基本的语法检查和 Hover 文档。
 
-### Milestone 6：LSP 进阶与工作区支持 (Advanced LSP & Workspace)
+### Milestone 6：LSP 进阶与工作区支持 (Advanced LSP & Workspace) [COMPLETED]
 
 解决复杂的路径映射和工作区级功能，让 LSP 真正可用。
 

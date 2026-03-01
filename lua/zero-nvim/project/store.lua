@@ -40,6 +40,27 @@ local function ensure_dir(path)
     end
 end
 
+--- Format JSON string nicely using system tools if available
+local function format_json(obj)
+    local ok, j = pcall(vim.json.encode, obj)
+    if not ok then return nil end
+    
+    local j_escaped = vim.fn.shellescape(j)
+    
+    -- Try jq first
+    if vim.fn.executable("jq") == 1 then
+        local formatted = vim.fn.system("echo " .. j_escaped .. " | jq .")
+        if vim.v.shell_error == 0 then return formatted end
+    end
+    -- Fallback to python json tool
+    if vim.fn.executable("python3") == 1 then
+        local formatted = vim.fn.system("echo " .. j_escaped .. " | python3 -m json.tool")
+        if vim.v.shell_error == 0 then return formatted end
+    end
+    
+    return j
+end
+
 ---Load all projects from disk (with mtime caching)
 ---@return table<string, ZeroProjectConfig>
 function M.load()
@@ -92,8 +113,8 @@ function M.save(data)
         return
     end
 
-    local ok, content = pcall(vim.json.encode, data)
-    if not ok then
+    local content = format_json(data)
+    if not content then
         file:close()
         vim.notify("zero-nvim: Failed to encode projects data", vim.log.levels.ERROR)
         return
