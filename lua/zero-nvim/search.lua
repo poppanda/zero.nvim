@@ -432,11 +432,38 @@ function M.execute_search(case_sensitive, whole_word)
 
     session.id = tostring(vim.loop.now())
 
+    local file_types = (session.toggle_state and session.toggle_state.file_types) or {}
+
+    -- Separate rg built-in types from custom extensions
+    local rg_builtin = {
+        c = true, cpp = true, css = true, go = true, h = true, html = true,
+        java = true, js = true, json = true, lua = true, md = true, py = true,
+        rust = true, sh = true, sql = true, toml = true, ts = true, txt = true,
+        xml = true, yaml = true,
+    }
+    local builtin_list = {}
+    local glob_list = {}
+    for _, ft in ipairs(file_types) do
+        if rg_builtin[ft] then
+            table.insert(builtin_list, ft)
+        else
+            table.insert(glob_list, ft)
+        end
+    end
+
     if session.is_local then
         if session.job_id then pcall(vim.fn.jobstop, session.job_id) end
         local args = { "rg", "--line-number", "--column", "--no-heading", "--color=never", "--with-filename" }
         if case_sensitive then table.insert(args, "--case-sensitive") else table.insert(args, "--ignore-case") end
         if whole_word then table.insert(args, "--word-regexp") end
+        for _, ft in ipairs(builtin_list) do
+            table.insert(args, "--type")
+            table.insert(args, ft)
+        end
+        for _, ft in ipairs(glob_list) do
+            table.insert(args, "--glob")
+            table.insert(args, "*." .. ft)
+        end
         table.insert(args, query)
         table.insert(args, path)
 
@@ -450,8 +477,13 @@ function M.execute_search(case_sensitive, whole_word)
             end,
         })
     else
+        -- Format: "type:lua,rust;glob:vue,svelte"
+        local parts = {}
+        if #builtin_list > 0 then table.insert(parts, "type:" .. table.concat(builtin_list, ",")) end
+        if #glob_list > 0 then table.insert(parts, "glob:" .. table.concat(glob_list, ",")) end
+        local types_str = table.concat(parts, ";")
         vim.fn.rpcrequest(session.chan, "global_search", session.user, session.host, session.port, path, query,
-            session.id, case_sensitive or false, whole_word or false)
+            session.id, case_sensitive or false, whole_word or false, types_str)
     end
 end
 

@@ -18,6 +18,7 @@ pub fn handle_global_search(
     session_id: &str,
     case_sensitive: bool,
     whole_word: bool,
+    file_types: &str,
     state: &Arc<Mutex<DaemonState>>,
     tx: mpsc::Sender<Value>,
 ) -> Result<Value, anyhow::Error> {
@@ -34,6 +35,7 @@ pub fn handle_global_search(
     let path_clone = path.to_string();
     let query_clone = query.to_string();
     let session_id_clone = session_id.to_string();
+    let file_types_clone = file_types.to_string();
 
     drop(state_lock);
 
@@ -46,6 +48,7 @@ pub fn handle_global_search(
             &session_id_clone,
             case_sensitive,
             whole_word,
+            &file_types_clone,
             tx,
         ) {
             eprintln!("run_search error: {:?}", e);
@@ -62,6 +65,7 @@ fn run_search(
     session_id: &str,
     case_sensitive: bool,
     whole_word: bool,
+    file_types: &str,
     tx: mpsc::Sender<Value>,
 ) -> Result<(), anyhow::Error> {
     let mut channel = sess
@@ -86,9 +90,26 @@ fn run_search(
         flags.push("--word-regexp");
     }
 
+    // Parse file_types: "type:lua,rust;glob:vue,svelte"
+    let mut type_flags: Vec<String> = Vec::new();
+    if !file_types.is_empty() {
+        for part in file_types.split(';') {
+            if let Some(types) = part.strip_prefix("type:") {
+                for t in types.split(',').filter(|t| !t.is_empty()) {
+                    type_flags.push(format!("--type {}", t));
+                }
+            } else if let Some(globs) = part.strip_prefix("glob:") {
+                for g in globs.split(',').filter(|g| !g.is_empty()) {
+                    type_flags.push(format!("--glob '*.{}'", g));
+                }
+            }
+        }
+    }
+
     let rg_core = format!(
-        "PATH=\"$PATH:/usr/local/bin:/opt/homebrew/bin:$HOME/.cargo/bin:/home/linuxbrew/.linuxbrew/bin\" rg {} {} {}",
+        "PATH=\"$PATH:/usr/local/bin:/opt/homebrew/bin:$HOME/.cargo/bin:/home/linuxbrew/.linuxbrew/bin\" rg {} {} {} {}",
         flags.join(" "),
+        type_flags.join(" "),
         quote(query),
         quote(path)
     );

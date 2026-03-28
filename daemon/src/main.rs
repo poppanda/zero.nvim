@@ -233,6 +233,7 @@ fn dispatch(
                 .ok_or(anyhow::anyhow!("Missing session_id"))?;
             let case_sensitive = args.get(6).and_then(|v| v.as_bool()).unwrap_or(false);
             let whole_word = args.get(7).and_then(|v| v.as_bool()).unwrap_or(false);
+            let file_types = args.get(8).and_then(|v| v.as_str()).unwrap_or("").to_string();
             search::handle_global_search(
                 user,
                 host,
@@ -242,6 +243,7 @@ fn dispatch(
                 session_id,
                 case_sensitive,
                 whole_word,
+                &file_types,
                 &state,
                 tx,
             )
