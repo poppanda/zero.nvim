@@ -428,17 +428,20 @@ function M.open_search_ui(title_prefix, initial_path, callbacks)
         vim.keymap.set({ "i", "n" }, "<CR>", callbacks.on_enter, opts)
     end
 
-    -- path_buf specific normal-mode navigation
+    -- path_buf: j→query, J→results
     vim.keymap.set("n", "j", function() focus_window("query") end, { buffer = path_buf, silent = true })
     vim.keymap.set("n", "<Down>", function() focus_window("query") end, { buffer = path_buf, silent = true })
+    vim.keymap.set("n", "J", function() focus_window("query") end, { buffer = path_buf, silent = true })
 
-    -- input_buf specific normal-mode navigation
+    -- input_buf: k→path, j→results, K→path (same), J→results (same)
     vim.keymap.set("n", "k", function() focus_window("path") end, { buffer = input_buf, silent = true })
     vim.keymap.set("n", "<Up>", function() focus_window("path") end, { buffer = input_buf, silent = true })
     vim.keymap.set("n", "j", function() focus_window("results") end, { buffer = input_buf, silent = true })
     vim.keymap.set("n", "<Down>", function() focus_window("results") end, { buffer = input_buf, silent = true })
+    vim.keymap.set("n", "K", function() focus_window("path") end, { buffer = input_buf, silent = true })
+    vim.keymap.set("n", "J", function() focus_window("results") end, { buffer = input_buf, silent = true })
 
-    -- results_buf specific normal-mode navigation
+    -- results_buf: k→prev result (top→query), j→next result, K→query, J→last result
     vim.keymap.set("n", "k", function()
         if callbacks.on_select_prev() then
             focus_window("query")
@@ -449,6 +452,8 @@ function M.open_search_ui(title_prefix, initial_path, callbacks)
             focus_window("query")
         end
     end, { buffer = results_buf, silent = true })
+    vim.keymap.set("n", "K", function() focus_window("query") end, { buffer = results_buf, silent = true })
+    vim.keymap.set("n", "J", function() focus_window("path") end, { buffer = results_buf, silent = true })
 
     vim.keymap.set("n", "j", callbacks.on_select_next, { buffer = results_buf, silent = true })
     vim.keymap.set("n", "<Down>", callbacks.on_select_next, { buffer = results_buf, silent = true })
@@ -459,7 +464,8 @@ function M.open_search_ui(title_prefix, initial_path, callbacks)
     vim.keymap.set("n", "<Left>", callbacks.on_toggle_fold, { buffer = results_buf, silent = true })
     vim.keymap.set("n", "<Right>", callbacks.on_toggle_fold, { buffer = results_buf, silent = true })
 
-    -- Start in query window, insert mode
+    -- Default: start in query window, insert mode
+    -- Caller can override by setting has_previous_state
     focus_window("query")
     vim.cmd("startinsert!")
 
@@ -476,6 +482,8 @@ function M.open_search_ui(title_prefix, initial_path, callbacks)
         timer1 = timer1,
         timer2 = timer2,
         toggle_state = toggle_state,
+        update_input_footer = update_input_footer,
+        update_path_footer = update_path_footer,
     }
 end
 

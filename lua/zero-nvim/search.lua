@@ -5,6 +5,11 @@ local ui = require("zero-nvim.ui")
 
 M.current_session = nil
 M.last_query = ""
+M.last_path = nil
+M.last_case_sensitive = false
+M.last_whole_word = false
+M.last_file_types = {}
+M.last_selected_index = 0
 
 function M.render_tree()
     local session = M.current_session
@@ -221,7 +226,13 @@ function M.render_tree()
         end
         vim.api.nvim_set_option_value("modifiable", false, { buf = buf })
 
-        if session.selected_index == 0 and #session.nodes > 0 then
+        if M.last_selected_index > 0 then
+            -- Restore last position: wait until enough nodes arrive
+            if #session.nodes >= M.last_selected_index then
+                M.set_selection(M.last_selected_index)
+                M.last_selected_index = 0
+            end
+        elseif session.selected_index == 0 and #session.nodes > 0 then
             M.set_selection(1)
         else
             -- re-clamp selection
@@ -259,6 +270,11 @@ function M.on_end(session_id)
     local session = M.current_session
     if not session or session.id ~= session_id then return end
     if #session.files == 0 then M.render_tree() end
+    -- If last_selected_index still pending (results fewer than expected), clamp to last node
+    if M.last_selected_index > 0 and #session.nodes > 0 then
+        M.set_selection(#session.nodes)
+        M.last_selected_index = 0
+    end
 end
 
 function M.on_error(session_id, error_msg)
@@ -394,6 +410,7 @@ function M.close_ui()
         session.timer:stop()
         session.timer:close()
     end
+    M.last_selected_index = session.selected_index or 0
     M.current_session = nil
     vim.cmd("stopinsert")
 end
@@ -408,6 +425,10 @@ function M.execute_search(case_sensitive, whole_word)
     local path = path_lines[1] or "/"
     local query = query_lines[1] or ""
     M.last_query = query
+    M.last_path = path
+    M.last_case_sensitive = case_sensitive
+    M.last_whole_word = whole_word
+    M.last_file_types = (session.toggle_state and session.toggle_state.file_types) or {}
 
     session.query = query
     session.files = {}
@@ -579,14 +600,40 @@ function M.open_ui(opts)
         end
     })
 
+    -- Restore last search state
     if M.last_query and M.last_query ~= "" then
         vim.api.nvim_buf_set_lines(ui_state.input_buf, 0, -1, false, { M.last_query })
         vim.api.nvim_win_set_cursor(ui_state.input_win, { 1, #M.last_query })
+    end
+    if M.last_path and not opts.initial_path then
+        vim.api.nvim_buf_set_lines(ui_state.path_buf, 0, -1, false, { M.last_path })
+    end
+    if ui_state.toggle_state then
+        ui_state.toggle_state.case_sensitive = M.last_case_sensitive or false
+        ui_state.toggle_state.whole_word = M.last_whole_word or false
+        if M.last_file_types and #M.last_file_types > 0 then
+            ui_state.toggle_state.file_types = vim.deepcopy(M.last_file_types)
+        end
+        if ui_state.update_input_footer then ui_state.update_input_footer() end
+        if ui_state.update_path_footer then ui_state.update_path_footer() end
     end
 
     -- Merge the UI objects directly into our session state for update_preview() and close_ui() access
     for k, v in pairs(ui_state) do
         M.current_session[k] = v
+    end
+
+    -- If restoring previous state, focus results and trigger search immediately
+    if M.last_query and M.last_query ~= "" then
+        -- Stop debounce timers to prevent duplicate search from buf_set_lines triggers
+        if M.current_session.timer1 then M.current_session.timer1:stop() end
+        if M.current_session.timer2 then M.current_session.timer2:stop() end
+        vim.cmd("stopinsert")
+        M.execute_search(
+            M.current_session.toggle_state.case_sensitive,
+            M.current_session.toggle_state.whole_word
+        )
+        M.focus_window("results")
     end
 end
 
