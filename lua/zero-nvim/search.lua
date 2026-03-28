@@ -10,41 +10,165 @@ function M.render_tree()
     local session = M.current_session
     if not session then return end
 
+    if not M._hl_defined then
+        vim.api.nvim_set_hl(0, "ZeroSearchMatch", { fg = "#61afef", bold = true })
+        vim.api.nvim_set_hl(0, "ZeroSearchCount", { fg = "#e5c07b" })
+        vim.api.nvim_set_hl(0, "ZeroSearchLineNr", { fg = "#5c6370" })
+        vim.api.nvim_set_hl(0, "ZeroSearchSep", { fg = "#5c6370" })
+        M._hl_defined = true
+    end
+
     session.nodes = {}
     local display_lines = {}
     local extmarks = {} -- { lnum, col, end_col, hl_group }
 
-    for _, file_obj in ipairs(session.files) do
+    local win_width = vim.api.nvim_win_is_valid(session.results_win)
+        and vim.api.nvim_win_get_width(session.results_win) or 60
+
+    for fi, file_obj in ipairs(session.files) do
         local is_expanded = file_obj.expanded
-        local icon = is_expanded and "▼" or "▶"
+        local icon = is_expanded and "" or ""
         local match_count = #file_obj.matches
-        local filename = vim.fs.basename(file_obj.file)
+        local filepath = file_obj.file
+        local filename = vim.fs.basename(filepath)
+        local dirpath = filepath:sub(1, #filepath - #filename)
 
         local ext = filename:match("%.([^%.]+)$") or ""
-        local file_icon = (ui.icon_map and ui.icon_map[ext]) and ui.icon_map[ext] or "📄"
+        local file_icon = (ui.icon_map and ui.icon_map[ext]) and ui.icon_map[ext] or "󰈔"
 
-        -- Parent line: " ▼ 📄 filename.rs     [N matches]"
-        local parent_text = string.format(" %s %s %s", icon, file_icon, filename)
-        local padding = string.rep(" ", math.max(1, 45 - #filename))
+        -- File header: "icon filename dirpath       [N matches]"
+        local name_part = string.format("%s %s %s ", icon, file_icon, filename)
         local count_text = string.format("[%d match%s]", match_count, match_count > 1 and "es" or "")
-        local full_line = parent_text .. padding .. count_text
+        local name_w = vim.fn.strdisplaywidth(name_part)
+        local dir_w = vim.fn.strdisplaywidth(dirpath)
+        local count_w = vim.fn.strdisplaywidth(count_text)
+        -- If dirpath would cause overflow, truncate it
+        local max_dir_w = win_width - name_w - count_w - 2
+        local display_dir = dirpath
+        if dir_w > max_dir_w and max_dir_w > 3 then
+            -- Truncate from the left: show "...tail/of/path/"
+            local chars = vim.fn.split(dirpath, "\\zs")
+            local truncated = {}
+            local w = 3 -- for "..."
+            for i = #chars, 1, -1 do
+                w = w + vim.fn.strdisplaywidth(chars[i])
+                if w > max_dir_w then break end
+                table.insert(truncated, 1, chars[i])
+            end
+            display_dir = "..." .. table.concat(truncated)
+            dir_w = vim.fn.strdisplaywidth(display_dir)
+        end
+        local padding = string.rep(" ", math.max(1, win_width - name_w - dir_w - count_w - 1))
+        local full_line = name_part .. display_dir .. padding .. count_text
 
         table.insert(display_lines, full_line)
         local current_row = #display_lines - 1
 
         table.insert(session.nodes, { type = "file", file = file_obj.file, ref = file_obj })
 
-        -- Highlights for parent
-        local icon_len = #string.format(" %s %s ", icon, file_icon)
-        table.insert(extmarks, { current_row, 0, icon_len, "Directory" })                 -- icon + file_icon
-        table.insert(extmarks, { current_row, icon_len, icon_len + #filename, "String" }) -- filename
-        table.insert(extmarks, { current_row, #full_line - #count_text, #full_line, "Comment" })
+        -- Highlights for file header
+        local icon_bytes = #string.format("%s %s ", icon, file_icon)
+        local name_end = icon_bytes + #filename
+        local dir_start = #name_part
+        local dir_end = dir_start + #display_dir
+        table.insert(extmarks, { current_row, 0, icon_bytes, "Title" })
+        table.insert(extmarks, { current_row, icon_bytes, name_end, "Title" })
+        table.insert(extmarks, { current_row, dir_start, dir_end, "Comment" })
+        table.insert(extmarks, { current_row, #full_line - #count_text, #full_line, "ZeroSearchCount" })
 
         if is_expanded then
             for _, match in ipairs(file_obj.matches) do
-                -- Child line: "  │   12: local x = 1"
-                local prefix = string.format("  │ %4d: ", match.lnum)
-                local c_line = prefix .. match.text
+                -- Match line: "123 │ code content here"
+                local lnum_str = string.format("%4d", match.lnum)
+                local prefix = lnum_str .. " │ "
+                local prefix_w = vim.fn.strdisplaywidth(prefix)
+                local max_text_width = win_width - prefix_w
+                local text = match.text
+                local query_len = #session.query
+                local col0 = math.max(0, match.col - 1)
+
+                -- Truncate long lines: center the match keyword in the visible area
+                local text_offset = 0
+                local display_text = text
+                if vim.fn.strdisplaywidth(text) > max_text_width then
+                    local ellipsis = "..."
+                    local ellipsis_w = 3
+                    local chars = vim.fn.split(text, "\\zs")
+                    local char_widths = {}
+                    local total_w = 0
+                    for i, ch in ipairs(chars) do
+                        local w = vim.fn.strdisplaywidth(ch)
+                        char_widths[i] = w
+                        total_w = total_w + w
+                    end
+
+                    local match_char = 1
+                    local byte_pos = 0
+                    for i, ch in ipairs(chars) do
+                        if byte_pos >= col0 then break end
+                        byte_pos = byte_pos + #ch
+                        match_char = i + 1
+                    end
+                    if match_char > #chars then match_char = #chars end
+
+                    local left = match_char
+                    local right = match_char
+                    local used = char_widths[match_char] or 0
+                    local reserved = ellipsis_w * 2
+                    local budget = max_text_width - reserved
+
+                    while right < #chars and used < budget do
+                        right = right + 1
+                        used = used + char_widths[right]
+                    end
+                    if used > budget and right > match_char then
+                        used = used - char_widths[right]
+                        right = right - 1
+                    end
+                    while left > 1 and used + char_widths[left - 1] <= budget do
+                        left = left - 1
+                        used = used + char_widths[left]
+                    end
+                    while right < #chars and used + char_widths[right + 1] <= budget do
+                        right = right + 1
+                        used = used + char_widths[right]
+                    end
+
+                    local need_left_ellipsis = left > 1
+                    local need_right_ellipsis = right < #chars
+
+                    if need_left_ellipsis or need_right_ellipsis then
+                        if not need_left_ellipsis then
+                            budget = budget + ellipsis_w
+                            while right < #chars and used + char_widths[right + 1] <= budget do
+                                right = right + 1
+                                used = used + char_widths[right]
+                            end
+                            need_right_ellipsis = right < #chars
+                        elseif not need_right_ellipsis then
+                            budget = budget + ellipsis_w
+                            while left > 1 and used + char_widths[left - 1] <= budget do
+                                left = left - 1
+                                used = used + char_widths[left]
+                            end
+                            need_left_ellipsis = left > 1
+                        end
+                    end
+
+                    local parts = {}
+                    for i = left, right do parts[#parts + 1] = chars[i] end
+                    local sliced = table.concat(parts)
+
+                    display_text = (need_left_ellipsis and ellipsis or "")
+                        .. sliced
+                        .. (need_right_ellipsis and ellipsis or "")
+
+                    local left_byte = 0
+                    for i = 1, left - 1 do left_byte = left_byte + #chars[i] end
+                    text_offset = left_byte - (need_left_ellipsis and #ellipsis or 0)
+                end
+
+                local c_line = prefix .. display_text
 
                 table.insert(display_lines, c_line)
                 local c_row = #display_lines - 1
@@ -57,18 +181,25 @@ function M.render_tree()
                     text = match.text
                 })
 
-                -- Highlights for child
-                table.insert(extmarks, { c_row, 2, 5, "Comment" }) -- │
-                table.insert(extmarks, { c_row, 6, 11, "LineNr" }) -- 1234:
+                -- Highlights: line number dim, separator dim
+                local lnum_end = #lnum_str
+                local sep_start = lnum_end + 1 -- space before │
+                local sep_end = sep_start + #"│"
+                table.insert(extmarks, { c_row, 0, lnum_end, "ZeroSearchLineNr" })
+                table.insert(extmarks, { c_row, sep_start, sep_end, "ZeroSearchSep" })
 
-                local match_len = #session.query
-                local match_start = #prefix + math.max(0, match.col - 1)
-                -- Simple highlight for the match within the string (approximation since rg might use regex)
-                if match.col > 0 and (match_start + match_len) <= #c_line then
-                    table.insert(extmarks, { c_row, match_start, match_start + match_len, "IncSearch" })
+                -- Highlight the match keyword in blue
+                local prefix_bytes = #prefix
+                local match_start = prefix_bytes + col0 - text_offset
+                if match.col > 0 and match_start >= prefix_bytes and (match_start + query_len) <= #c_line then
+                    table.insert(extmarks, { c_row, match_start, match_start + query_len, "ZeroSearchMatch" })
                 end
             end
-            table.insert(display_lines, "  │")
+        end
+
+        -- Add separator between file groups (but not after the last one)
+        if fi < #session.files then
+            table.insert(display_lines, "")
             table.insert(session.nodes, { type = "spacer" })
         end
     end
@@ -236,8 +367,11 @@ function M.set_selection(idx)
 
     local buf = session.results_buf
     if vim.api.nvim_buf_is_valid(buf) then
-        pcall(vim.api.nvim_buf_clear_namespace, buf, session.ns, 0, -1)
-        pcall(vim.api.nvim_buf_add_highlight, buf, session.ns, "CursorLine", idx - 1, 0, -1)
+        if not session.cursor_ns then
+            session.cursor_ns = vim.api.nvim_create_namespace("zero_search_cursor")
+        end
+        pcall(vim.api.nvim_buf_clear_namespace, buf, session.cursor_ns, 0, -1)
+        pcall(vim.api.nvim_buf_add_highlight, buf, session.cursor_ns, "CursorLine", idx - 1, 0, -1)
     end
 
     M.update_preview()
