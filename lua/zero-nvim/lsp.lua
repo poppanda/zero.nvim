@@ -2,135 +2,112 @@ local M = {}
 local zero = require("zero-nvim")
 local manager = require("zero-nvim.project.manager")
 
+-- In-flight start lock keyed by "lsp_name:root_dir". Prevents racing starts
+-- when prewarm and FileType-autostart both fire for the same root.
+local starting = {}
 
---- Attempt to start a remote LSP via the TCP proxy daemon.
---- Works on `zero://` buffers (both file and directory).
----@param bufnr? integer Buffer number (defaults to current buffer)
----@param cmd_args string[] Language server command and args (e.g. {"basedpyright", "--stdio"})
----@param settings? table Optional settings for the language server (e.g. { python = { pythonPath = ... } })
-function M.start_lsp(bufnr, cmd_args, settings)
-    bufnr = bufnr or vim.api.nvim_get_current_buf()
-    local name = vim.api.nvim_buf_get_name(bufnr)
+--- Build LSP client capabilities with workspace/didChangeWatchedFiles disabled
+--- (Neovim's libuv fs_event watcher does not understand zero:// URIs).
+local function make_caps()
+    local capabilities = vim.lsp.protocol.make_client_capabilities()
+    if capabilities.workspace and capabilities.workspace.didChangeWatchedFiles then
+        capabilities.workspace.didChangeWatchedFiles.dynamicRegistration = false
+    end
+    return capabilities
+end
 
-    local user, host, port, path = zero.parse_uri(name)
-    if not user then
-        vim.notify("ZeroNvim: Current buffer is not a zero:// buffer (got: " .. name .. ")",
-            vim.log.levels.ERROR)
-        return
+--- Resolve pythonPath for pyright/basedpyright with caching.
+--- The first probe round-trips to the remote `which python3`; later calls
+--- hit the in-memory cache on init.lua state.
+local function maybe_inject_python_path(chan, user, host, port, server_name, settings)
+    if not server_name:match("pyright") then return settings end
+    if settings and settings.python and settings.python.pythonPath then return settings end
+
+    local cached = zero.get_python_path(user, host, port)
+    if not cached then
+        local ok, py = pcall(vim.fn.rpcrequest, chan, "exec_remote", user, host, port,
+            "which python3 2>/dev/null || which python 2>/dev/null || echo ''")
+        if ok and type(py) == "string" and #vim.trim(py) > 0 then
+            cached = vim.trim(py)
+            zero.set_python_path(user, host, port, cached)
+            vim.notify("ZeroNvim: Auto-detected pythonPath: " .. cached, vim.log.levels.DEBUG)
+        end
     end
 
-    -- [NEW] Project Configuration Merging
-    local server_name = cmd_args[1]
-    local project_name, project_config = manager.match_project(host, path)
-
-    -- Prefer the registered project root so the language server has full
-    -- visibility of the project. Falling back to the file's parent directory
-    -- means cross-directory jumps may produce results outside root_dir.
-    -- root_dir MUST be a plain path (not a zero:// URI): vim.uri_from_fname
-    -- would produce file://zero://... which crashes LSP servers on rootPath.
-    local root_dir
-    if project_config and project_config.root then
-        root_dir = project_config.root:gsub("/+$", "")
-    else
-        local is_dir = (path:sub(-1) == "/")
-        root_dir = is_dir and path or vim.fs.dirname(path)
-        root_dir = root_dir:gsub("/$", "")
+    if cached then
+        return vim.tbl_deep_extend("force", settings or {}, { python = { pythonPath = cached } })
     end
+    return settings
+end
 
+--- Start a remote LSP client for `root_dir`, or return the existing one's id.
+--- Buffer-less by design: prewarm and FileType-autostart both go through here.
+---@param user string
+---@param host string
+---@param port integer
+---@param root_dir string
+---@param server_name string
+---@param cmd_args string[]
+---@param settings? table
+---@return integer? client_id
+---@return string? err
+local function ensure_lsp_client(user, host, port, root_dir, server_name, cmd_args, settings)
     local lsp_name = "zero-" .. server_name
+    local lock_key = lsp_name .. ":" .. root_dir
 
-    -- Check if there's already an active client for this project root
-    -- DO THIS EARLY to avoid starting duplicate SSH proxy processes!
+    -- Reuse an active client for this exact root_dir.
     for _, client in ipairs(vim.lsp.get_clients({ name = lsp_name })) do
         if client.config and client.config.root_dir == root_dir then
-            -- Found existing client for this root, just attach and return
-            local already = vim.lsp.get_clients({ bufnr = bufnr, id = client.id })
-            if #already == 0 then
-                vim.notify(string.format("ZeroNvim: LSP %s already active for root %s, attaching to buffer %d.", lsp_name, root_dir, bufnr), vim.log.levels.DEBUG)
-                vim.lsp.buf_attach_client(bufnr, client.id)
-            end
-            return
+            return client.id
         end
     end
 
-    if project_config and project_config.lsp and project_config.lsp[server_name] then
-        local p_conf = project_config.lsp[server_name]
+    -- Another start is in flight for this (server, root). Bail; the in-flight
+    -- caller will end up with the client and later attaches will reuse it.
+    if starting[lock_key] then
+        return nil, "STARTING"
+    end
+    starting[lock_key] = true
 
-        -- Override Command
-        if p_conf.cmd and #p_conf.cmd > 0 then
-            cmd_args = p_conf.cmd
-            vim.notify("ZeroNvim: Using project-specific LSP command for " .. server_name, vim.log.levels.DEBUG)
-        end
-
-        -- Merge Settings
-        if p_conf.settings then
-            settings = vim.tbl_deep_extend("force", settings or {}, p_conf.settings)
-            vim.notify("ZeroNvim: Merged project-specific LSP settings for " .. server_name, vim.log.levels.DEBUG)
-        end
+    local function clear_lock()
+        starting[lock_key] = nil
     end
 
     local cmd_str = table.concat(cmd_args, " ")
     if not cmd_str or cmd_str == "" then
-        vim.notify("ZeroNvim: Missing LSP command", vim.log.levels.ERROR)
-        return
+        clear_lock()
+        return nil, "Missing LSP command"
     end
 
     local chan, err = zero.ensure_connection(user, host, port)
     if not chan then
-        vim.notify("ZeroNvim: Daemon not connected: " .. tostring(err), vim.log.levels.ERROR)
-        return
+        clear_lock()
+        return nil, "Daemon not connected: " .. tostring(err)
     end
+
+    settings = maybe_inject_python_path(chan, user, host, port, server_name, settings)
 
     local client_prefix = string.format("zero://%s@%s:%d", user, host, port)
-
-    -- Auto-detect pythonPath for pyright/basedpyright if not explicitly configured.
-    -- Without a valid pythonPath, basedpyright's analysis thread can deadlock and stop
-    -- responding to hover/definition requests even after a successful initialize.
-    if server_name:match("pyright") and not (settings and settings.python and settings.python.pythonPath) then
-        local ok_exec, python_path = pcall(vim.fn.rpcrequest, chan, "exec_remote", user, host, port,
-            "which python3 2>/dev/null || which python 2>/dev/null || echo ''")
-        if ok_exec and type(python_path) == "string" and #vim.trim(python_path) > 0 then
-            settings = vim.tbl_deep_extend("force", settings or {}, { python = { pythonPath = vim.trim(python_path) } })
-            vim.notify("ZeroNvim: Auto-detected pythonPath: " .. vim.trim(python_path), vim.log.levels.DEBUG)
-        end
-    end
-
     local ok, local_port = pcall(vim.fn.rpcrequest, chan, "lsp_start", user, host, port, cmd_str, client_prefix)
     if not ok or type(local_port) ~= "number" then
-        vim.notify("ZeroNvim: Failed to start LSP proxy: " .. tostring(local_port), vim.log.levels.ERROR)
-        return
+        clear_lock()
+        return nil, "Failed to start LSP proxy: " .. tostring(local_port)
     end
 
     vim.notify("ZeroNvim: LSP Proxy started on port " .. local_port .. " for " .. server_name, vim.log.levels.DEBUG)
-
-    -- Use start_client (not start) to ALWAYS create a fresh TCP connection.
-    -- vim.lsp.start would deduplicate and return the old dead client's id without
-    -- connecting to our new listener port.
-    local capabilities = vim.lsp.protocol.make_client_capabilities()
-    -- Disable didChangeWatchedFiles since Neovim's fs.watch (libuv) doesn't work on zero:// URIs
-    -- or if the LSP tries to watch on the remote end, it fails with ENOENT and crashes.
-    if capabilities.workspace and capabilities.workspace.didChangeWatchedFiles then
-        capabilities.workspace.didChangeWatchedFiles.dynamicRegistration = false
-    end
 
     local client_id = vim.lsp.start_client({
         name = lsp_name,
         cmd = vim.lsp.rpc.connect('127.0.0.1', local_port),
         root_dir = root_dir,
-        capabilities = capabilities,
+        capabilities = make_caps(),
         settings = settings,
         before_init = function(params)
             params.processId = vim.NIL
-            -- M6 Task 1: Workspace Root — explicitly force rootUri/rootPath to the
-            -- remote file:// path so the LSP always sees the correct project root.
-            -- root_dir is already a plain remote path (e.g. /home/user/project),
-            -- but setting it here guards against any edge case where Neovim's
-            -- machinery might derive a zero:// URI (which language servers do not
-            -- understand) from an open buffer name.
+            -- Force rootUri/rootPath to a plain remote file:// path. zero:// URIs
+            -- crash language servers; Neovim's machinery may otherwise inject one.
             params.rootPath = root_dir
             params.rootUri = vim.uri_from_fname(root_dir)
-            -- workspaceFolders: fix any zero:// URIs that Neovim may have added
-            -- before our before_init ran.
             if params.workspaceFolders then
                 for _, wf in ipairs(params.workspaceFolders) do
                     if wf.uri and wf.uri:match("^zero://") then
@@ -140,7 +117,11 @@ function M.start_lsp(bufnr, cmd_args, settings)
                 end
             end
         end,
+        on_init = function()
+            clear_lock()
+        end,
         on_exit = function(code, signal)
+            clear_lock()
             vim.schedule(function()
                 vim.notify(
                     string.format("ZeroNvim: LSP '%s' exited (code=%s, signal=%s)", lsp_name, tostring(code),
@@ -159,28 +140,131 @@ function M.start_lsp(bufnr, cmd_args, settings)
         end,
     })
 
-    if client_id then
-        vim.lsp.buf_attach_client(bufnr, client_id)
-        vim.notify(
-            string.format("ZeroNvim: LSP %s attached to buffer", lsp_name),
-            vim.log.levels.DEBUG
-        )
-        -- Delayed status check
-        vim.defer_fn(function()
-            local clients = vim.lsp.get_clients({ bufnr = bufnr, name = lsp_name })
-            if #clients == 0 then
-                vim.notify("ZeroNvim: !! LSP " .. lsp_name .. " not active after 3s.", vim.log.levels.WARN)
-            else
-                local c = clients[1]
-                vim.notify(
-                    string.format("ZeroNvim: LSP %s is active (%s)", lsp_name,
-                        c.initialized and "initialized" or "initializing"),
-                    vim.log.levels.DEBUG
-                )
+    if not client_id then
+        clear_lock()
+        return nil, "vim.lsp.start_client returned nil"
+    end
+
+    -- Safety net: clear the lock even if on_init never fires (server crashes
+    -- mid-handshake). 5s is long enough for a normal initialize.
+    vim.defer_fn(clear_lock, 5000)
+
+    return client_id
+end
+
+--- Attempt to start a remote LSP via the TCP proxy daemon.
+--- Works on `zero://` buffers (both file and directory).
+---@param bufnr? integer Buffer number (defaults to current buffer)
+---@param cmd_args string[] Language server command and args (e.g. {"basedpyright", "--stdio"})
+---@param settings? table Optional settings for the language server
+---@param opts? { project_config?: table, root_dir?: string }
+---       Optional precomputed values from the caller (e.g. FileType handler) so
+---       we don't redo project lookup. Both must come together if provided.
+function M.start_lsp(bufnr, cmd_args, settings, opts)
+    bufnr = bufnr or vim.api.nvim_get_current_buf()
+    opts = opts or {}
+
+    local name = vim.api.nvim_buf_get_name(bufnr)
+    local user, host, port, path = zero.parse_uri(name)
+    if not user then
+        vim.notify("ZeroNvim: Current buffer is not a zero:// buffer (got: " .. name .. ")",
+            vim.log.levels.ERROR)
+        return
+    end
+
+    local server_name = cmd_args[1]
+    local project_config = opts.project_config
+    if project_config == nil then
+        local _, pc = manager.match_project(host, path)
+        project_config = pc
+    end
+
+    local root_dir = opts.root_dir
+    if not root_dir then
+        if project_config and project_config.root then
+            root_dir = project_config.root:gsub("/+$", "")
+        else
+            local is_dir = (path:sub(-1) == "/")
+            root_dir = is_dir and path or vim.fs.dirname(path)
+            root_dir = root_dir:gsub("/$", "")
+        end
+    end
+
+    if project_config and project_config.lsp and project_config.lsp[server_name] then
+        local p_conf = project_config.lsp[server_name]
+        if p_conf.cmd and #p_conf.cmd > 0 then
+            cmd_args = p_conf.cmd
+            vim.notify("ZeroNvim: Using project-specific LSP command for " .. server_name, vim.log.levels.DEBUG)
+        end
+        if p_conf.settings then
+            settings = vim.tbl_deep_extend("force", settings or {}, p_conf.settings)
+            vim.notify("ZeroNvim: Merged project-specific LSP settings for " .. server_name, vim.log.levels.DEBUG)
+        end
+    end
+
+    local client_id, err = ensure_lsp_client(user, host, port, root_dir, server_name, cmd_args, settings)
+    if not client_id then
+        if err == "STARTING" then
+            -- Another start is in flight for this (server, root). The in-flight
+            -- caller will register the client; we just need to attach this buffer
+            -- once it shows up. Retry twice (covers fast and slow `initialize`).
+            local _bufnr, _root = bufnr, root_dir
+            local lsp_name = "zero-" .. server_name
+            local function try_attach()
+                if not vim.api.nvim_buf_is_valid(_bufnr) then return true end
+                for _, client in ipairs(vim.lsp.get_clients({ name = lsp_name })) do
+                    if client.config and client.config.root_dir == _root then
+                        local already = vim.lsp.get_clients({ bufnr = _bufnr, id = client.id })
+                        if #already == 0 then
+                            vim.lsp.buf_attach_client(_bufnr, client.id)
+                        end
+                        return true
+                    end
+                end
+                return false
             end
-        end, 3000)
-    else
-        vim.notify("ZeroNvim: vim.lsp.start_client returned nil — client could not be created", vim.log.levels.ERROR)
+            vim.defer_fn(function()
+                if not try_attach() then vim.defer_fn(try_attach, 1500) end
+            end, 500)
+            return
+        end
+        vim.notify("ZeroNvim: " .. tostring(err), vim.log.levels.ERROR)
+        return
+    end
+
+    if vim.api.nvim_buf_is_valid(bufnr) then
+        local already = vim.lsp.get_clients({ bufnr = bufnr, id = client_id })
+        if #already == 0 then
+            vim.lsp.buf_attach_client(bufnr, client_id)
+            vim.notify(
+                string.format("ZeroNvim: LSP zero-%s attached to buffer %d", server_name, bufnr),
+                vim.log.levels.DEBUG
+            )
+        end
+    end
+end
+
+--- Pre-warm every LSP server declared in a project config without attaching to
+--- a buffer. By the time the user opens their first file matching a configured
+--- filetype, the LSP client is already running and the FileType-autostart path
+--- short-circuits to a plain buf_attach_client.
+---@param user string
+---@param host string
+---@param port integer
+---@param project_config table
+function M.prewarm_lsps(user, host, port, project_config)
+    if not project_config or type(project_config.lsp) ~= "table" then return end
+    if not project_config.root then return end
+    local root_dir = project_config.root:gsub("/+$", "")
+
+    for server_name, server_cfg in pairs(project_config.lsp) do
+        local cmd_args = (server_cfg.cmd and #server_cfg.cmd > 0) and server_cfg.cmd or { server_name, "--stdio" }
+        local settings = server_cfg.settings
+        -- Schedule each server independently. Daemon RPC is single-threaded so
+        -- they end up serialized anyway, but this keeps the trigger non-blocking.
+        vim.schedule(function()
+            ensure_lsp_client(user, host, port, root_dir, server_name, vim.deepcopy(cmd_args), settings)
+        end)
     end
 end
 

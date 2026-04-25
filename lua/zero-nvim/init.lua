@@ -19,6 +19,7 @@ local state = {
     connected_hosts = {},
     scanned_projects = {},
     mason_bins = {}, -- key: "user@host:port" -> list of mason bin names
+    python_paths = {}, -- key: "user@host:port" -> resolved python interpreter path
 }
 
 local options = {}
@@ -72,6 +73,8 @@ local function get_daemon_chan()
             state.channel_id = nil
             state.connected_hosts = {}
             state.scanned_projects = {}
+            state.mason_bins = {}
+            state.python_paths = {}
         end,
         on_stderr = function(_, data)
             for _, line in ipairs(data) do
@@ -135,6 +138,16 @@ function M.get_mason_bins()
         return bins -- Return bins for the first (usually only) connected host
     end
     return {}
+end
+
+--- Cached remote python interpreter path keyed by user@host:port.
+--- Populated by lsp.lua on first pyright probe and reused for subsequent starts.
+function M.get_python_path(user, host, port)
+    return state.python_paths[string.format("%s@%s:%s", user, host, port)]
+end
+
+function M.set_python_path(user, host, port, path)
+    state.python_paths[string.format("%s@%s:%s", user, host, port)] = path
 end
 
 function M.get_entries(user, host, port, path)
@@ -284,6 +297,18 @@ function M.open_remote(user, host, port, path)
 
     local uri = string.format("zero://%s@%s:%d%s", user, host, port, path)
     vim.cmd("edit " .. uri)
+
+    -- Pre-warm declared LSP servers when opening a project root directory so
+    -- that the first matching file the user opens attaches instantly instead
+    -- of waiting on ssh + LSP initialize.
+    if is_dir then
+        local _, project_config = require("zero-nvim.project.manager").match_project(host, path)
+        if project_config and type(project_config.lsp) == "table" and next(project_config.lsp) then
+            vim.schedule(function()
+                require("zero-nvim.lsp").prewarm_lsps(user, host, port, project_config)
+            end)
+        end
+    end
 end
 
 --- ZeroLink command handler.
@@ -562,13 +587,16 @@ function M.setup(opts)
                             local cmd_args = server_cfg.cmd or { server_name, "--stdio" }
                             -- Schedule so we don't block FileType processing
                             local _buf = args.buf
+                            local _proj = project_config
+                            local _root = root_dir
                             logger(string.format("ZeroNvim: Auto-starting LSP %s for buffer %d", lsp_name, _buf), vim.log.levels.DEBUG)
                             vim.schedule(function()
                                 if vim.api.nvim_buf_is_valid(_buf) then
                                     require("zero-nvim.lsp").start_lsp(
                                         _buf,
                                         vim.deepcopy(cmd_args),
-                                        server_cfg.settings
+                                        server_cfg.settings,
+                                        { project_config = _proj, root_dir = _root }
                                     )
                                 end
                                 -- Clear the lock shortly after so future legitimate retries aren't blocked

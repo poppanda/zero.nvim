@@ -75,12 +75,23 @@ pub fn handle_start_lsp(
             // Spawn ssh as a child process. It reuses ~/.ssh/config + SSH Agent.
             // Prepend mason/bin to PATH so tools installed via Mason are found
             // without needing a login shell or modifying ~/.profile.
+            //
+            // ControlMaster=auto + ControlPersist multiplexes LSP launches over a
+            // single SSH connection. The first LSP pays the full TCP+key+auth cost;
+            // subsequent ones (or restart-after-stop) attach in milliseconds.
+            // %C hashes (local_user, host, port, remote_user) → unique per target.
             let login_cmd = format!("PATH=$HOME/.local/share/nvim/mason/bin:$PATH {}", cmd_s);
             let ssh_result = Command::new("ssh")
                 .arg("-o")
                 .arg("StrictHostKeyChecking=no")
                 .arg("-o")
                 .arg("BatchMode=yes") // non-interactive (uses Agent)
+                .arg("-o")
+                .arg("ControlMaster=auto")
+                .arg("-o")
+                .arg("ControlPath=/tmp/zero-nvim-cm-%C")
+                .arg("-o")
+                .arg("ControlPersist=10m")
                 .arg("-p")
                 .arg(port.to_string())
                 .arg(format!("{}@{}", user_s, host_s))
