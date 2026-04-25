@@ -48,10 +48,7 @@ impl DaemonState {
         let mut reader = std::io::BufReader::new(&mut file);
         // ALLOW_UNKNOWN_FIELDS 模式更宽容，跳过未知指令
         match SshConfig::default().parse(&mut reader, ParseRule::ALLOW_UNKNOWN_FIELDS) {
-            Ok(config) => {
-                eprintln!("Daemon: 成功解析 SSH 配置: {}", config_path.display());
-                Some(config)
-            }
+            Ok(config) => Some(config),
             Err(e) => {
                 eprintln!(
                     "Daemon: SSH 配置解析失败: {} — {}",

@@ -35,7 +35,6 @@ pub fn handle_start_lsp(
     client_prefix: &str,
     state: &Arc<Mutex<DaemonState>>,
 ) -> Result<Value, anyhow::Error> {
-    eprintln!("handle_start_lsp triggered for cmd: {}", cmd);
     let key = DaemonState::connection_key(user, host, port);
 
     // Verify the connection exists in state
@@ -57,19 +56,10 @@ pub fn handle_start_lsp(
     let listener = TcpListener::bind("127.0.0.1:0").context("Failed to bind random TCP port")?;
     let local_port = listener.local_addr()?.port();
 
-    eprintln!("LSP Proxy listening on 127.0.0.1:{}", local_port);
+    eprintln!("Daemon: LSP proxy :{} → {}@{}:{} ({})", local_port, user, host, port, cmd);
 
     thread::spawn(move || {
-        eprintln!(
-            "Background thread spawned to accept LSP connection on {}",
-            local_port
-        );
-
         if let Ok((tcp_stream, _)) = listener.accept() {
-            eprintln!(
-                "Accepted Neovim LSP connection from {}",
-                tcp_stream.peer_addr().unwrap()
-            );
             drop(listener);
 
             // Spawn ssh as a child process. It reuses ~/.ssh/config + SSH Agent.
@@ -103,8 +93,6 @@ pub fn handle_start_lsp(
 
             match ssh_result {
                 Ok(mut child) => {
-                    eprintln!("SSH child process started for LSP: {}", cmd_s);
-
                     let child_stdin = child.stdin.take().expect("child stdin");
                     let child_stdout = child.stdout.take().expect("child stdout");
                     let child_stderr = child.stderr.take().expect("child stderr");
@@ -129,10 +117,7 @@ pub fn handle_start_lsp(
                     thread::spawn(move || {
                         let mut r = tcp_reader;
                         let mut w = child_stdin;
-                        if let Err(e) = pump_and_translate(&mut r, &mut w, &from1, &to1, "TCP->SSH")
-                        {
-                            eprintln!("TCP -> SSH pump ended: {:?}", e);
-                        }
+                        let _ = pump_and_translate(&mut r, &mut w, &from1, &to1, "TCP->SSH");
                     });
 
                     // Thread 2: SSH stdout → TCP (Neovim)
@@ -142,13 +127,13 @@ pub fn handle_start_lsp(
                     thread::spawn(move || {
                         let mut r = child_stdout;
                         let mut w = tcp_writer;
-                        if let Err(e) = pump_and_translate(&mut r, &mut w, &from2, &to2, "SSH->TCP")
-                        {
-                            eprintln!("SSH -> TCP pump ended: {:?}", e);
-                        }
+                        let _ = pump_and_translate(&mut r, &mut w, &from2, &to2, "SSH->TCP");
                         // Wait for child process to finish
-                        let status = child.wait();
-                        eprintln!("SSH process exited with status: {:?}", status);
+                        if let Ok(status) = child.wait() {
+                            if !status.success() {
+                                eprintln!("Daemon: LSP process exited abnormally: {:?}", status);
+                            }
+                        }
                     });
                 }
                 Err(e) => {
@@ -222,17 +207,7 @@ fn pump_and_translate<R: Read, W: Write>(
         // tcp->ssh: "zero://user@host:port" → "file://"   (zero://user@host:22/path → file:///path)
         // ssh->tcp: "file://"               → "zero://user@host:port" (file:///path → zero://user@host:22/path)
         let new_body = match String::from_utf8(body) {
-            Ok(s) => {
-                // Log just the JSON-RPC method/id for diagnostics (no payload content)
-                let method = s.find("\"method\":\"")
-                    .map(|i| {
-                        let rest = &s[i + 10..];
-                        rest.find('"').map(|j| &rest[..j]).unwrap_or("?")
-                    })
-                    .unwrap_or(if s.contains("\"result\"") { "<response>" } else { "<notification>" });
-                eprintln!("[{}] {} ({}b)", label, method, s.len());
-                s.replace(from, to).into_bytes()
-            }
+            Ok(s) => s.replace(from, to).into_bytes(),
             Err(e) => e.into_bytes(),
         };
 

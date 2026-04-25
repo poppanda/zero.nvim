@@ -179,7 +179,6 @@ M.write_file = function(bufnr)
 
     if ok and ret == true then
       vim.bo[bufnr].modified = false
-      vim.notify("Saved: " .. res.path, vim.log.levels.INFO)
     else
       vim.notify("Save failed: " .. tostring(ret), vim.log.levels.ERROR)
     end

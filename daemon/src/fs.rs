@@ -232,8 +232,6 @@ pub fn handle_write_file(
 
     eprintln!("Daemon: 文件已写入 {} ({} bytes)", path, content.len());
 
-    eprintln!("Daemon: 文件已写入 {} ({} bytes)", path, content.len());
-
     // Invalidate parent directory cache
     invalidate_parent_cache(state, &key, Path::new(path));
 
@@ -247,7 +245,6 @@ fn invalidate_parent_cache(state: &Arc<Mutex<DaemonState>>, key: &str, path: &Pa
             // Remove parent from cache to force refresh on next read_dir
             // We use to_path_buf() because map keys are PathBuf
             cache.directories.remove(&parent.to_path_buf());
-            eprintln!("Daemon: Invalidate cache for {:?}", parent);
         }
     }
 }

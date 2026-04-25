@@ -31,7 +31,6 @@ pub fn handle_connect(
     }
 
     // ── 建立 TCP 连接和 SSH 握手 ──
-    eprintln!("Daemon: 正在连接 {}", key);
     let tcp = TcpStream::connect(format!("{}:{}", host, port))?;
     tcp.set_nodelay(true)?;
     let mut sess = Session::new()?;
@@ -49,7 +48,6 @@ pub fn handle_connect(
                 if let Ok(identities) = agent.identities() {
                     for identity in identities {
                         if agent.userauth(user, &identity).is_ok() {
-                            eprintln!("Daemon: SSH Agent 认证成功");
                             authenticated = true;
                             break;
                         }
@@ -85,15 +83,10 @@ pub fn handle_connect(
                 };
 
                 if expanded.exists() {
-                    eprintln!(
-                        "Daemon: 尝试 SSH Config IdentityFile: {}",
-                        expanded.display()
-                    );
                     if sess
                         .userauth_pubkey_file(user, None, &expanded, None)
                         .is_ok()
                     {
-                        eprintln!("Daemon: IdentityFile 认证成功: {}", expanded.display());
                         authenticated = true;
                         break;
                     }
@@ -111,12 +104,10 @@ pub fn handle_connect(
             for key_name in &default_keys {
                 let priv_key_path = ssh_dir.join(key_name);
                 if priv_key_path.exists() {
-                    eprintln!("Daemon: 尝试默认密钥: {}", priv_key_path.display());
                     if sess
                         .userauth_pubkey_file(user, None, &priv_key_path, None)
                         .is_ok()
                     {
-                        eprintln!("Daemon: 默认密钥认证成功: {}", key_name);
                         authenticated = true;
                         break;
                     }
@@ -129,7 +120,6 @@ pub fn handle_connect(
     if !authenticated {
         if let Some(pwd) = password {
             if sess.userauth_password(user, pwd).is_ok() {
-                eprintln!("Daemon: 密码认证成功");
                 authenticated = true;
             }
         }
@@ -148,6 +138,6 @@ pub fn handle_connect(
             directories: HashMap::new(),
         },
     );
-    eprintln!("Daemon: 会话建立成功 {}", key);
+    eprintln!("Daemon: 已连接 {}", key);
     Ok(Value::Boolean(true))
 }

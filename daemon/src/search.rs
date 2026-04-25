@@ -22,7 +22,6 @@ pub fn handle_global_search(
     state: &Arc<Mutex<DaemonState>>,
     tx: mpsc::Sender<Value>,
 ) -> Result<Value, anyhow::Error> {
-    eprintln!("handle_global_search triggered for path: {}", path);
     let key = DaemonState::connection_key(user, host, port);
 
     let state_lock = state.lock().unwrap();
@@ -39,8 +38,9 @@ pub fn handle_global_search(
 
     drop(state_lock);
 
+    eprintln!("Daemon: 搜索 \"{}\" in {}", query, path);
+
     thread::spawn(move || {
-        eprintln!("Background thread spawned for global_search");
         if let Err(e) = run_search(
             sess_clone,
             &path_clone,
@@ -51,7 +51,7 @@ pub fn handle_global_search(
             &file_types_clone,
             tx,
         ) {
-            eprintln!("run_search error: {:?}", e);
+            eprintln!("Daemon: 搜索失败: {:?}", e);
         }
     });
 
@@ -117,8 +117,6 @@ fn run_search(
     // Using sh -c to ensure the PATH assignment works robustly without relying on interactive profiles
     let rg_cmd = format!("sh -c {}", quote(&rg_core));
 
-    eprintln!("Executing remote command: {}", rg_cmd);
-
     channel.exec(&rg_cmd).context("Failed to exec rg command")?;
 
     let stdout = channel.stream(0);
@@ -130,18 +128,15 @@ fn run_search(
     let mut chunk = Vec::new();
     let chunk_size = 50;
 
-    let mut line_count = 0;
     for line_result in reader.lines() {
         if let Ok(line) = line_result {
             chunk.push(Value::String(line.into()));
-            line_count += 1;
             if chunk.len() >= chunk_size {
                 send_chunk(&tx, session_id, &chunk);
                 chunk.clear();
             }
         }
     }
-    eprintln!("run_search read {} lines from stdout", line_count);
 
     if !chunk.is_empty() {
         send_chunk(&tx, session_id, &chunk);
@@ -152,7 +147,7 @@ fn run_search(
     let mut stderr_str = String::new();
     let _ = stderr_stream.read_to_string(&mut stderr_str);
     if !stderr_str.trim().is_empty() {
-        eprintln!("rg stderr: {}", stderr_str.trim());
+        eprintln!("Daemon: rg stderr: {}", stderr_str.trim());
         send_error(&tx, session_id, stderr_str.trim());
     }
 
