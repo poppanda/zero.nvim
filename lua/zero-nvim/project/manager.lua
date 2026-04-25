@@ -44,6 +44,26 @@ function M.get(name)
     return projects[name]
 end
 
+---Insert or merge a single LSP server entry into a project.
+---Deep-merges the new config onto any existing entry so partial updates
+---(e.g. only changing settings) don't drop unrelated keys like cmd/filetypes.
+---@param project_name string
+---@param server_name string
+---@param server_cfg table
+---@return boolean ok
+function M.upsert_lsp(project_name, server_name, server_cfg)
+    local projects = store.load()
+    local proj = projects[project_name]
+    if not proj then
+        vim.notify(string.format("ZeroNvim: project '%s' not found", project_name), vim.log.levels.ERROR)
+        return false
+    end
+    proj.lsp = proj.lsp or {}
+    proj.lsp[server_name] = vim.tbl_deep_extend("force", proj.lsp[server_name] or {}, server_cfg)
+    store.save(projects)
+    return true
+end
+
 ---Find the best matching project for a given remote path
 ---Uses Longest Prefix Match strategy on the root path
 ---@param host string The remote host

@@ -6,7 +6,7 @@ local zero = require("zero-nvim")
 --- Show a floating input prompt
 ---@param opts { title: string, default?: string }
 ---@param on_confirm fun(text: string)
-local function prompt_float(opts, on_confirm)
+function M.prompt_float(opts, on_confirm)
     local width = 40
     local height = 1
     local buf, win = utils.create_float({
@@ -67,7 +67,7 @@ function M.add_current_project(bufnr, on_complete)
     local default_name = vim.fs.basename(clean_path)
 
     -- Use custom prompt float instead of vim.ui.input for consistency
-    prompt_float({ title = "Project Name", default = default_name }, function(name)
+    M.prompt_float({ title = "Project Name", default = default_name }, function(name)
         local config = {
             host = host,
             user = user,
@@ -81,12 +81,12 @@ function M.add_current_project(bufnr, on_complete)
 end
 
 --- Format JSON string nicely using system tools if available
-local function format_json(obj)
+function M.format_json(obj)
     local ok, j = pcall(vim.json.encode, obj)
     if not ok then return "{}" end
-    
+
     local j_escaped = vim.fn.shellescape(j)
-    
+
     -- Try jq first
     if vim.fn.executable("jq") == 1 then
         local formatted = vim.fn.system("echo " .. j_escaped .. " | jq .")
@@ -97,16 +97,17 @@ local function format_json(obj)
         local formatted = vim.fn.system("echo " .. j_escaped .. " | python3 -m json.tool")
         if vim.v.shell_error == 0 then return formatted end
     end
-    
+
     return j
 end
 
---- Edit project config (JSON) in a floating window
----@param name string
+--- Edit a JSON object in a floating window. Save (`:w`) parses, validates, and
+--- invokes on_save with the decoded table; closing the window cancels.
+---@param name string Buffer-name suffix, e.g. project name
 ---@param current_config table
 ---@param on_save fun(new_config: table)
-local function edit_project_config(name, current_config, on_save)
-    local formatted_json = format_json(current_config)
+function M.edit_json(name, current_config, on_save)
+    local formatted_json = M.format_json(current_config)
     local content = vim.split(formatted_json, "\n")
 
     local buf, win = utils.create_float({ title = "Edit Config: " .. name, width = 80, height = 20 })
@@ -175,7 +176,7 @@ function M.show_project_picker()
 
     local buf, win = utils.create_float({
         title = "Zero Projects",
-        footer = "<CR>:Open | <C-a>:Add | <C-e>:Edit | <C-d>:Del | <C-h>:Check",
+        footer = "<CR>:Open | <C-a>:Add | <C-e>:Edit | <C-d>:Del | <C-l>:Add LSP | <C-h>:Check",
         width = final_width,
         height = win_height,
     })
@@ -228,7 +229,7 @@ function M.show_project_picker()
         local name = get_selected_name()
         if name then
             close()
-            edit_project_config(name, projects[name], function(new_config)
+            M.edit_json(name, projects[name], function(new_config)
                 manager.add(name, new_config)
                 refresh()
             end)
@@ -246,6 +247,21 @@ function M.show_project_picker()
                 end
             end)
         end
+    end, { buffer = buf, silent = true })
+
+    -- Action: Add LSP via wizard
+    vim.keymap.set("n", "<C-l>", function()
+        local name = get_selected_name()
+        if not name then return end
+        local config = projects[name]
+        close()
+        require("zero-nvim.ui.lsp_add_wizard").open({
+            user = config.user,
+            host = config.host,
+            port = config.port,
+            project_name = name,
+            project_config = config,
+        })
     end, { buffer = buf, silent = true })
 
     -- Action: Health Check

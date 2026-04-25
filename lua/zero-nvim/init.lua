@@ -132,10 +132,21 @@ function M.scan_mason_bins(user, host, port)
     state.mason_bins[key] = bins
 end
 
---- Get cached mason bin completions for the currently connected remote host.
-function M.get_mason_bins()
-    for key, bins in pairs(state.mason_bins) do
-        return bins -- Return bins for the first (usually only) connected host
+--- Get cached mason bin completions.
+--- When user/host/port are provided, returns the bins for that exact remote.
+--- When called with no args, returns the first cached host's bins (legacy
+--- behaviour preserved for callers that lack buffer context).
+---@param user? string
+---@param host? string
+---@param port? integer
+---@return string[]
+function M.get_mason_bins(user, host, port)
+    if user and host and port then
+        local key = string.format("%s@%s:%s", user, host, port)
+        return state.mason_bins[key] or {}
+    end
+    for _, bins in pairs(state.mason_bins) do
+        return bins
     end
     return {}
 end
@@ -754,7 +765,11 @@ function M.setup(opts)
             local parts = vim.split(cmd_line, "%s+")
             -- Only complete the first arg (the LSP binary name)
             if #parts <= 2 then
-                local bins = M.get_mason_bins()
+                -- Prefer the bins cached for the current buffer's remote so
+                -- multi-host setups suggest the right list.
+                local bname = vim.api.nvim_buf_get_name(0)
+                local u, h, p = M.parse_uri(bname)
+                local bins = (u and h and p) and M.get_mason_bins(u, h, p) or M.get_mason_bins()
                 local completions = {}
                 for _, name in ipairs(bins) do
                     if name:find(arg_lead, 1, true) == 1 then
@@ -809,6 +824,47 @@ function M.setup(opts)
                 end
             end
             return completions
+        end,
+    })
+
+    -- Register :ZeroLspAdd [server] — interactive wizard that writes an LSP
+    -- entry into the current project's config and prewarms it.
+    vim.api.nvim_create_user_command("ZeroLspAdd", function(cmd_opts)
+        local prefill = cmd_opts.fargs[1]
+        local bname = vim.api.nvim_buf_get_name(0)
+        local user, host, port, path = M.parse_uri(bname)
+        if not user then
+            vim.notify("ZeroNvim: open a file inside a configured remote project first", vim.log.levels.ERROR)
+            return
+        end
+        local manager = require("zero-nvim.project.manager")
+        local project_name, project_config = manager.match_project(host, path)
+        if not project_name then
+            vim.notify(string.format(
+                "ZeroNvim: no project matches %s:%s — run :ZeroProject add first", host, path),
+                vim.log.levels.ERROR)
+            return
+        end
+        require("zero-nvim.ui.lsp_add_wizard").open({
+            user = user, host = host, port = port,
+            project_name = project_name,
+            project_config = project_config,
+            prefill_server = prefill,
+        })
+    end, {
+        nargs = "?",
+        desc = "Add an LSP server to the current project (interactive)",
+        complete = function(arg_lead, _, _)
+            local bname = vim.api.nvim_buf_get_name(0)
+            local u, h, p = M.parse_uri(bname)
+            local bins = (u and h and p) and M.get_mason_bins(u, h, p) or M.get_mason_bins()
+            local out = {}
+            for _, name in ipairs(bins) do
+                if name:find(arg_lead, 1, true) == 1 then
+                    table.insert(out, name)
+                end
+            end
+            return out
         end,
     })
 
