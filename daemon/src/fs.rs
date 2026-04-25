@@ -27,13 +27,11 @@ pub fn handle_fetch_path(
     state: &Arc<Mutex<DaemonState>>,
 ) -> Result<Value, anyhow::Error> {
     let key = DaemonState::connection_key(user, host, port);
-    let state_lock = state.lock().unwrap();
-    let sess = state_lock
-        .sessions
-        .get(&key)
-        .ok_or(anyhow::anyhow!("NOT_CONNECTED: {}", key))?;
+    let conn = DaemonState::get_conn(state, &key)?;
+    let conn_guard = conn.lock().unwrap();
 
-    let mut channel = sess
+    let mut channel = conn_guard
+        .session
         .channel_session()
         .map_err(|e| anyhow::anyhow!("无法开启 SSH 通道: {}", e))?;
 
@@ -92,13 +90,11 @@ pub fn handle_fetch_paths(
     }
 
     let key = DaemonState::connection_key(user, host, port);
-    let state_lock = state.lock().unwrap();
-    let sess = state_lock
-        .sessions
-        .get(&key)
-        .ok_or(anyhow::anyhow!("NOT_CONNECTED: {}", key))?;
+    let conn = DaemonState::get_conn(state, &key)?;
+    let conn_guard = conn.lock().unwrap();
 
-    let mut channel = sess
+    let mut channel = conn_guard
+        .session
         .channel_session()
         .map_err(|e| anyhow::anyhow!("无法开启 SSH 通道: {}", e))?;
 
@@ -172,15 +168,12 @@ pub fn handle_fetch_file(
     state: &Arc<Mutex<DaemonState>>,
 ) -> Result<Value, anyhow::Error> {
     let key = DaemonState::connection_key(user, host, port);
-    let state_lock = state.lock().unwrap();
-    let sess = state_lock
-        .sessions
-        .get(&key)
-        .ok_or(anyhow::anyhow!("NOT_CONNECTED: {}", key))?;
+    let conn = DaemonState::get_conn(state, &key)?;
+    let mut conn_guard = conn.lock().unwrap();
 
     // 使用 SFTP 直接读取，而非 shell exec cat
     // 优势: 无 shell 注入风险、支持任意文件名
-    let sftp = sess
+    let sftp = conn_guard
         .sftp()
         .map_err(|e| anyhow::anyhow!("SFTP 初始化失败: {}", e))?;
     let mut remote_file = sftp
@@ -207,13 +200,10 @@ pub fn handle_write_file(
     state: &Arc<Mutex<DaemonState>>,
 ) -> Result<Value, anyhow::Error> {
     let key = DaemonState::connection_key(user, host, port);
-    let state_lock = state.lock().unwrap();
-    let sess = state_lock
-        .sessions
-        .get(&key)
-        .ok_or(anyhow::anyhow!("NOT_CONNECTED: {}", key))?;
+    let conn = DaemonState::get_conn(state, &key)?;
+    let mut conn_guard = conn.lock().unwrap();
 
-    let sftp = sess
+    let sftp = conn_guard
         .sftp()
         .map_err(|e| anyhow::anyhow!("SFTP 初始化失败: {}", e))?;
 
@@ -225,10 +215,8 @@ pub fn handle_write_file(
         .write_all(content.as_bytes())
         .map_err(|e| anyhow::anyhow!("写入失败 {}: {}", path, e))?;
 
-    // Drop sftp/lock before invalidation
     drop(remote_file);
-    drop(sftp);
-    drop(state_lock);
+    drop(conn_guard);
 
     eprintln!("Daemon: 文件已写入 {} ({} bytes)", path, content.len());
 
@@ -274,13 +262,10 @@ pub fn handle_read_dir(
     }
 
     // 缓存未命中 → 通过 SFTP 读取
-    let mut state_lock = state.lock().unwrap();
-    let sess = state_lock
-        .sessions
-        .get(&key)
-        .ok_or(anyhow::anyhow!("NOT_CONNECTED: {}", key))?;
+    let conn = DaemonState::get_conn(state, &key)?;
+    let mut conn_guard = conn.lock().unwrap();
 
-    let sftp = sess
+    let sftp = conn_guard
         .sftp()
         .map_err(|e| anyhow::anyhow!("SFTP 初始化失败: {}", e))?;
     let sftp_entries = sftp.readdir(Path::new(path))?;
@@ -302,9 +287,12 @@ pub fn handle_read_dir(
         });
     }
 
+    drop(conn_guard);
+
     let result = entries_to_msgpack(&dir_entries);
 
     // 存入缓存
+    let mut state_lock = state.lock().unwrap();
     if let Some(cache) = state_lock.caches.get_mut(&key) {
         cache.directories.insert(path_buf, dir_entries);
     }
@@ -324,13 +312,10 @@ pub fn handle_stat(
     state: &Arc<Mutex<DaemonState>>,
 ) -> Result<Value, anyhow::Error> {
     let key = DaemonState::connection_key(user, host, port);
-    let state_lock = state.lock().unwrap();
-    let sess = state_lock
-        .sessions
-        .get(&key)
-        .ok_or(anyhow::anyhow!("NOT_CONNECTED: {}", key))?;
+    let conn = DaemonState::get_conn(state, &key)?;
+    let mut conn_guard = conn.lock().unwrap();
 
-    let sftp = sess
+    let sftp = conn_guard
         .sftp()
         .map_err(|e| anyhow::anyhow!("SFTP 初始化失败: {}", e))?;
     let stat = sftp.stat(Path::new(path))?;
@@ -354,12 +339,9 @@ pub fn handle_scan_project(
     let key = DaemonState::connection_key(user, host, port);
     let max_depth = 3;
 
-    let state_lock = state.lock().unwrap();
-    let sess = state_lock
-        .sessions
-        .get(&key)
-        .ok_or(anyhow::anyhow!("NOT_CONNECTED: {}", key))?;
-    let sftp = sess
+    let conn = DaemonState::get_conn(state, &key)?;
+    let mut conn_guard = conn.lock().unwrap();
+    let sftp = conn_guard
         .sftp()
         .map_err(|e| anyhow::anyhow!("SFTP 初始化失败: {}", e))?;
 
@@ -407,8 +389,8 @@ pub fn handle_scan_project(
         scanned.insert(current_path, dir_entries);
     }
 
-    // 释放读锁，获取写锁，写入缓存
-    drop(state_lock);
+    drop(conn_guard);
+
     let mut state_lock = state.lock().unwrap();
     if let Some(cache) = state_lock.caches.get_mut(&key) {
         let count = scanned.len();
@@ -433,13 +415,10 @@ pub fn handle_mkdir(
     state: &Arc<Mutex<DaemonState>>,
 ) -> Result<Value, anyhow::Error> {
     let key = DaemonState::connection_key(user, host, port);
-    let state_lock = state.lock().unwrap();
-    let sess = state_lock
-        .sessions
-        .get(&key)
-        .ok_or(anyhow::anyhow!("NOT_CONNECTED: {}", key))?;
+    let conn = DaemonState::get_conn(state, &key)?;
+    let mut conn_guard = conn.lock().unwrap();
 
-    let sftp = sess
+    let sftp = conn_guard
         .sftp()
         .map_err(|e| anyhow::anyhow!("SFTP 初始化失败: {}", e))?;
 
@@ -447,17 +426,8 @@ pub fn handle_mkdir(
     sftp.mkdir(Path::new(path), 0o755)
         .map_err(|e| anyhow::anyhow!("创建目录失败 {}: {}", path, e))?;
 
-    // Drop sftp/session/lock explicitly or by scope if necessary.
-    // Here we can just call invalidate after letting them drop at end of function?
-    // No, sftp borrows from state_lock. We must drop state_lock before invalidate acquires it mutably.
-    // So we must scope the SFTP part.
-    // However, since we are rewriting the function body significantly, simpler to just wrap existing body in block?
-    // Actually, `state_lock` is defined at top of function.
-    // Let's rewrite the whole function body to be safe or use drop.
-    drop(sftp); // Drop sftp first
-    drop(state_lock); // Drop lock
+    drop(conn_guard);
 
-    // Invalidate parent cache
     invalidate_parent_cache(state, &key, Path::new(path));
 
     Ok(Value::Boolean(true))
@@ -475,21 +445,17 @@ pub fn handle_remove_file(
     state: &Arc<Mutex<DaemonState>>,
 ) -> Result<Value, anyhow::Error> {
     let key = DaemonState::connection_key(user, host, port);
-    let state_lock = state.lock().unwrap();
-    let sess = state_lock
-        .sessions
-        .get(&key)
-        .ok_or(anyhow::anyhow!("NOT_CONNECTED: {}", key))?;
+    let conn = DaemonState::get_conn(state, &key)?;
+    let mut conn_guard = conn.lock().unwrap();
 
-    let sftp = sess
+    let sftp = conn_guard
         .sftp()
         .map_err(|e| anyhow::anyhow!("SFTP 初始化失败: {}", e))?;
 
     sftp.unlink(Path::new(path))
         .map_err(|e| anyhow::anyhow!("删除文件失败 {}: {}", path, e))?;
 
-    drop(sftp);
-    drop(state_lock);
+    drop(conn_guard);
 
     invalidate_parent_cache(state, &key, Path::new(path));
 
@@ -508,21 +474,17 @@ pub fn handle_remove_dir(
     state: &Arc<Mutex<DaemonState>>,
 ) -> Result<Value, anyhow::Error> {
     let key = DaemonState::connection_key(user, host, port);
-    let state_lock = state.lock().unwrap();
-    let sess = state_lock
-        .sessions
-        .get(&key)
-        .ok_or(anyhow::anyhow!("NOT_CONNECTED: {}", key))?;
+    let conn = DaemonState::get_conn(state, &key)?;
+    let mut conn_guard = conn.lock().unwrap();
 
-    let sftp = sess
+    let sftp = conn_guard
         .sftp()
         .map_err(|e| anyhow::anyhow!("SFTP 初始化失败: {}", e))?;
 
     sftp.rmdir(Path::new(path))
         .map_err(|e| anyhow::anyhow!("删除目录失败 {}: {}", path, e))?;
 
-    drop(sftp);
-    drop(state_lock);
+    drop(conn_guard);
 
     invalidate_parent_cache(state, &key, Path::new(path));
     // Also remove the dir itself from cache if present
@@ -549,13 +511,10 @@ pub fn handle_rename(
     state: &Arc<Mutex<DaemonState>>,
 ) -> Result<Value, anyhow::Error> {
     let key = DaemonState::connection_key(user, host, port);
-    let state_lock = state.lock().unwrap();
-    let sess = state_lock
-        .sessions
-        .get(&key)
-        .ok_or(anyhow::anyhow!("NOT_CONNECTED: {}", key))?;
+    let conn = DaemonState::get_conn(state, &key)?;
+    let mut conn_guard = conn.lock().unwrap();
 
-    let sftp = sess
+    let sftp = conn_guard
         .sftp()
         .map_err(|e| anyhow::anyhow!("SFTP 初始化失败: {}", e))?;
 
@@ -563,8 +522,7 @@ pub fn handle_rename(
     sftp.rename(Path::new(src), Path::new(dst), None)
         .map_err(|e| anyhow::anyhow!("重命名失败 {} -> {}: {}", src, dst, e))?;
 
-    drop(sftp);
-    drop(state_lock);
+    drop(conn_guard);
 
     invalidate_parent_cache(state, &key, Path::new(src));
     invalidate_parent_cache(state, &key, Path::new(dst));
@@ -598,13 +556,11 @@ pub fn handle_exec_remote(
     state: &Arc<Mutex<DaemonState>>,
 ) -> Result<Value, anyhow::Error> {
     let key = DaemonState::connection_key(user, host, port);
-    let state_lock = state.lock().unwrap();
-    let sess = state_lock
-        .sessions
-        .get(&key)
-        .ok_or(anyhow::anyhow!("NOT_CONNECTED: {}", key))?;
+    let conn = DaemonState::get_conn(state, &key)?;
+    let conn_guard = conn.lock().unwrap();
 
-    let mut channel = sess
+    let mut channel = conn_guard
+        .session
         .channel_session()
         .map_err(|e| anyhow::anyhow!("channel_session 失败: {}", e))?;
     channel

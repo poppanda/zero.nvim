@@ -4,7 +4,7 @@
 // 实现 connect RPC 方法。
 // 认证策略按优先级: SSH Agent → Config IdentityFile → 默认密钥 → 密码
 
-use crate::state::{DaemonState, ProjectCache};
+use crate::state::{ConnSession, DaemonState, ProjectCache};
 use rmpv::Value;
 use ssh2::Session;
 use std::collections::HashMap;
@@ -21,12 +21,14 @@ pub fn handle_connect(
     let key = DaemonState::connection_key(user, host, port);
 
     // ── 检查是否已有有效连接 ──
-    {
+    let existing = {
         let state_lock = state.lock().unwrap();
-        if let Some(sess) = state_lock.sessions.get(&key) {
-            if sess.authenticated() {
-                return Ok(Value::Boolean(true));
-            }
+        state_lock.sessions.get(&key).cloned()
+    };
+    if let Some(conn) = existing {
+        let guard = conn.lock().unwrap();
+        if guard.session.authenticated() {
+            return Ok(Value::Boolean(true));
         }
     }
 
@@ -131,7 +133,9 @@ pub fn handle_connect(
 
     // ── 保存会话和初始化缓存 ──
     let mut state_lock = state.lock().unwrap();
-    state_lock.sessions.insert(key.clone(), sess);
+    state_lock
+        .sessions
+        .insert(key.clone(), Arc::new(Mutex::new(ConnSession::new(sess))));
     state_lock.caches.insert(
         key.clone(),
         ProjectCache {

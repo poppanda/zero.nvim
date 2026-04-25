@@ -2,7 +2,7 @@
 // search.rs — 远程全局搜索
 // =============================================================================
 
-use crate::state::DaemonState;
+use crate::state::{ConnSession, DaemonState};
 use anyhow::Context;
 use rmpv::Value;
 use std::io::{BufRead, BufReader};
@@ -23,26 +23,20 @@ pub fn handle_global_search(
     tx: mpsc::Sender<Value>,
 ) -> Result<Value, anyhow::Error> {
     let key = DaemonState::connection_key(user, host, port);
+    let conn = DaemonState::get_conn(state, &key)?;
 
-    let state_lock = state.lock().unwrap();
-    let sess = state_lock
-        .sessions
-        .get(&key)
-        .ok_or(anyhow::anyhow!("NOT_CONNECTED: {}", key))?;
-
-    let sess_clone = sess.clone();
     let path_clone = path.to_string();
     let query_clone = query.to_string();
     let session_id_clone = session_id.to_string();
     let file_types_clone = file_types.to_string();
 
-    drop(state_lock);
-
     eprintln!("Daemon: 搜索 \"{}\" in {}", query, path);
 
+    // 把 conn 的 Arc 交给后台线程，run_search 会在执行期间持有 conn 锁，
+    // 与同会话上的其他 SFTP/exec 操作互斥（libssh2 不可并发使用同一 session）。
     thread::spawn(move || {
         if let Err(e) = run_search(
-            sess_clone,
+            conn,
             &path_clone,
             &query_clone,
             &session_id_clone,
@@ -59,7 +53,7 @@ pub fn handle_global_search(
 }
 
 fn run_search(
-    sess: ssh2::Session,
+    conn: Arc<Mutex<ConnSession>>,
     path: &str,
     query: &str,
     session_id: &str,
@@ -68,7 +62,9 @@ fn run_search(
     file_types: &str,
     tx: mpsc::Sender<Value>,
 ) -> Result<(), anyhow::Error> {
-    let mut channel = sess
+    let conn_guard = conn.lock().unwrap();
+    let mut channel = conn_guard
+        .session
         .channel_session()
         .context("Failed to create channel_session")?;
 
