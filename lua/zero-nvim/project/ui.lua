@@ -1,5 +1,6 @@
 local M = {}
 local manager = require("zero-nvim.project.manager")
+local store = require("zero-nvim.project.store")
 local utils = require("zero-nvim.ui.utils")
 local zero = require("zero-nvim")
 
@@ -80,25 +81,10 @@ function M.add_current_project(bufnr, on_complete)
     end)
 end
 
---- Format JSON string nicely using system tools if available
+--- Format JSON string nicely. Wraps store.format_json to give callers a
+--- safe "{}" fallback when encoding fails.
 function M.format_json(obj)
-    local ok, j = pcall(vim.json.encode, obj)
-    if not ok then return "{}" end
-
-    local j_escaped = vim.fn.shellescape(j)
-
-    -- Try jq first
-    if vim.fn.executable("jq") == 1 then
-        local formatted = vim.fn.system("echo " .. j_escaped .. " | jq .")
-        if vim.v.shell_error == 0 then return formatted end
-    end
-    -- Fallback to python json tool
-    if vim.fn.executable("python3") == 1 then
-        local formatted = vim.fn.system("echo " .. j_escaped .. " | python3 -m json.tool")
-        if vim.v.shell_error == 0 then return formatted end
-    end
-
-    return j
+    return store.format_json(obj) or "{}"
 end
 
 --- Edit a JSON object in a floating window. Save (`:w`) parses, validates, and

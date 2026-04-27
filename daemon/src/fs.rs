@@ -21,6 +21,10 @@ use std::sync::{Arc, Mutex};
 // fetch_path — 合并 stat 和 fetch，通过 Exec 通道直接获取，显著降低延迟
 // =============================================================================
 
+/// 远程文件读取上限（10 MiB）。超过该大小的文件直接拒绝，避免 RPC 通道被一次
+/// 性塞入海量数据导致 Neovim UI 长时间卡死。需要查看大文件请走 ripgrep / less。
+const MAX_FETCH_SIZE: u64 = 10 * 1024 * 1024;
+
 pub fn handle_fetch_path(
     user: &str,
     host: &str,
@@ -35,9 +39,10 @@ pub fn handle_fetch_path(
             .map_err(|e| anyhow::anyhow!("无法开启 SSH 通道: {}", e))?;
 
         let escaped_path = format!("'{}'", path.replace('\'', "'\\''"));
+        // 远端先 stat 大小：超出阈值直接返回 TOOBIG，不执行 cat，避免无谓传输。
         let script = format!(
-            "if [ -d {0} ]; then echo -n 'DIR'; elif [ -f {0} ]; then echo -n 'FILE'; cat {0}; else echo -n 'MISSING'; fi",
-            escaped_path
+            "if [ -d {0} ]; then printf 'DIR'; elif [ -f {0} ]; then size=$(wc -c < {0} 2>/dev/null | tr -d ' '); if [ \"${{size:-0}}\" -gt {1} ]; then printf 'TOOBIG:%s' \"$size\"; else printf 'FILE'; cat {0}; fi; else printf 'MISSING'; fi",
+            escaped_path, MAX_FETCH_SIZE
         );
 
         channel
@@ -60,11 +65,28 @@ pub fn handle_fetch_path(
             ]))
         } else if out.starts_with(b"FILE") {
             let content_bytes = &out[4..];
-            let content_str = String::from_utf8_lossy(content_bytes).into_owned();
+            // 严格 UTF-8 校验：lossy 转换会把无效字节静默替换成 U+FFFD，写回时
+            // 数据被永久破坏。遇到二进制文件直接拒绝，让用户走专用工具。
+            let content_str = std::str::from_utf8(content_bytes).map_err(|_| {
+                anyhow::anyhow!(
+                    "文件含非 UTF-8 内容（可能是二进制文件），无法在 Neovim 中编辑: {}",
+                    path
+                )
+            })?;
             Ok(Value::Array(vec![
                 Value::String("file".into()),
                 Value::String(content_str.into()),
             ]))
+        } else if out.starts_with(b"TOOBIG:") {
+            let size_str = String::from_utf8_lossy(&out[b"TOOBIG:".len()..])
+                .trim()
+                .to_string();
+            Err(anyhow::anyhow!(
+                "文件过大无法打开 ({} 字节，上限 {} 字节): {}",
+                size_str,
+                MAX_FETCH_SIZE,
+                path
+            ))
         } else if out.starts_with(b"MISSING") {
             Err(anyhow::anyhow!("路径不存在: {}", path))
         } else {

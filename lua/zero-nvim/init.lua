@@ -20,6 +20,7 @@ local state = {
     scanned_projects = {},
     mason_bins = {}, -- key: "user@host:port" -> list of mason bin names
     python_paths = {}, -- key: "user@host:port" -> resolved python interpreter path
+    remote_homes = {}, -- key: "user@host:port" -> remote $HOME (resolved on first probe)
 }
 
 local options = {}
@@ -31,19 +32,10 @@ local function logger(msg, level)
     end
 end
 
-function M.parse_uri(uri)
-    -- zero://user@host:port/path
-    local user, host, port_str, path = string.match(uri, "^zero://([^@]+)@([^:]+):(%d+)(/.*)$")
-    if user and host and port_str and path then
-        return user, host, tonumber(port_str), path
-    end
-    -- zero://user@host/path  (no port, default 22)
-    user, host, path = string.match(uri, "^zero://([^@]+)@([^:/]+)(/.*)$")
-    if user and host and path then
-        return user, host, 22, path
-    end
+local uri_helpers = require("zero-nvim.uri")
 
-    return nil
+function M.parse_uri(uri)
+    return uri_helpers.parse(uri)
 end
 
 local function get_daemon_bin()
@@ -75,6 +67,7 @@ local function get_daemon_chan()
             state.scanned_projects = {}
             state.mason_bins = {}
             state.python_paths = {}
+            state.remote_homes = {}
         end,
         on_stderr = function(_, data)
             for _, line in ipairs(data) do
@@ -110,17 +103,35 @@ function M.ensure_connection(user, host, port, password)
     return chan
 end
 
---- Scan ~/.local/share/nvim/mason/bin/ on the remote server and cache the bin names.
+--- Resolve and cache the remote user's $HOME. Used by anything that wants to
+--- address a path relative to the user's home (mason bin scan etc.). Hard-
+--- coding /home/<user> breaks on macOS (/Users/...), root (/root), and
+--- containerized hosts where $HOME is non-standard.
+---@return string?
+function M.get_remote_home(user, host, port)
+    local key = string.format("%s@%s:%s", user, host, port)
+    if state.remote_homes[key] then return state.remote_homes[key] end
+    local chan = get_daemon_chan()
+    if not chan then return nil end
+    local ok, home = pcall(vim.fn.rpcrequest, chan, "exec_remote", user, host, port, 'printf %s "$HOME"')
+    if not ok or type(home) ~= "string" or home == "" then return nil end
+    state.remote_homes[key] = home
+    return home
+end
+
+--- Scan <remote-home>/.local/share/nvim/mason/bin/ and cache the bin names.
 --- Results are used as autocomplete suggestions for :ZeroLspStart.
 function M.scan_mason_bins(user, host, port)
     local chan = get_daemon_chan()
     if not chan then return end
+    local home = M.get_remote_home(user, host, port)
+    if not home then return end
     local key = string.format("%s@%s:%s", user, host, port)
-    local mason_bin_path = string.format("/home/%s/.local/share/nvim/mason/bin", user)
+    local mason_bin_path = home .. "/.local/share/nvim/mason/bin"
     local ok, entries = pcall(vim.fn.rpcrequest, chan, "read_dir", user, host, port, mason_bin_path)
     if not ok or type(entries) ~= "table" then
-        -- Try with ec2-user style home if user != ec2-user etc.
-        -- Or fallback silently — autocomplete just won't show Mason bins.
+        -- Mason not installed on remote — fallback silently, autocomplete
+        -- just won't show Mason bins.
         return
     end
     local bins = {}
@@ -223,8 +234,9 @@ function M.handle_fetch(buf, user, host, port, path, password, refresh)
     local chan, err = M.ensure_connection(user, host, port, password)
 
     if not chan then
+        local err_str = type(err) == "string" and err or tostring(err or "unknown error")
         -- 核心改进：只有明确包含 AUTH_FAILED 字样才弹窗
-        if not password and err:match("AUTH_FAILED") then
+        if not password and err_str:match("AUTH_FAILED") then
             vim.ui.input({ prompt = "SSH Password: ", secret = true }, function(input)
                 if input then
                     vim.schedule(function() M.handle_fetch(buf, user, host, port, path, input) end)
@@ -233,7 +245,7 @@ function M.handle_fetch(buf, user, host, port, path, password, refresh)
             return
         end
         -- 其他错误（如 Banner 失败，SFTP 不支持等）直接报错
-        logger("Connection failed: " .. err, vim.log.levels.ERROR)
+        logger("Connection failed: " .. err_str, vim.log.levels.ERROR)
         return
     end
 
@@ -290,23 +302,35 @@ end
 function M.open_remote(user, host, port, path)
     -- Ensure path starts with /
     if not path:match("^/") then
-        -- Expand ~ to /home/user
+        -- Expand ~ to remote $HOME (resolved by daemon, falls back to /home/<user>)
+        local function home()
+            -- Connection is required to probe; ensure_connection is idempotent.
+            M.ensure_connection(user, host, port)
+            return M.get_remote_home(user, host, port) or ("/home/" .. user)
+        end
         if path:match("^~") then
-            path = path:gsub("^~", "/home/" .. user)
+            path = path:gsub("^~", home())
         else
-            path = "/home/" .. user .. "/" .. path
+            path = home() .. "/" .. path
         end
     end
 
-    -- Determine if this is a directory path (ends with / or has no extension)
-    local is_dir = path:match("/$") or not path:match("%.[^/]+$")
-
-    if is_dir then
-        -- Ensure trailing slash
-        if not path:match("/$") then path = path .. "/" end
+    -- Stat via daemon: extension-only heuristics misclassify files like
+    -- Makefile / Dockerfile / LICENSE as directories.
+    local is_dir = path:match("/$") ~= nil
+    if not is_dir then
+        local chan = M.ensure_connection(user, host, port)
+        if chan then
+            local ok, ftype = pcall(vim.fn.rpcrequest, chan, "stat", user, host, port, path)
+            if ok and ftype == "directory" then
+                is_dir = true
+            end
+        end
     end
 
-    local uri = string.format("zero://%s@%s:%d%s", user, host, port, path)
+    if is_dir and not path:match("/$") then path = path .. "/" end
+
+    local uri = uri_helpers.format(user, host, port, path)
     vim.cmd("edit " .. uri)
 
     -- Pre-warm declared LSP servers when opening a project root directory so
@@ -377,6 +401,29 @@ function M.setup(opts)
     options = vim.tbl_deep_extend("force", defaults, opts or {})
 
     local group = vim.api.nvim_create_augroup("ZeroNvim", { clear = true })
+
+    -- zero:// buffers are virtual: content lives on the remote server, edits go
+    -- through BufWriteCmd. A swap file recovers nothing useful, but Neovim
+    -- still tries to create one and — worse — refuses to load the buffer
+    -- (E325 ATTENTION) when it finds a stale swap left by a previously
+    -- crashed nvim process. Disable swap up-front, and silently bypass any
+    -- pre-existing swap file. Registered outside the oil guard so oil and
+    -- builtin explorer share the fix.
+    vim.api.nvim_create_autocmd("BufNew", {
+        pattern = "zero://*",
+        callback = function(args)
+            vim.bo[args.buf].swapfile = false
+        end,
+        group = group,
+    })
+
+    vim.api.nvim_create_autocmd("SwapExists", {
+        pattern = "zero://*",
+        callback = function()
+            vim.v.swapchoice = "e"
+        end,
+        group = group,
+    })
 
     -- When oil is the explorer, oil's adapter handles all zero:// buffer I/O
     -- (read_file, write_file, list). Registering BufReadCmd/BufWriteCmd here
@@ -576,6 +623,99 @@ function M.setup(opts)
             end
         end,
     })
+
+    -- Patch vim.fn.readfile so third-party plugins (references viewers, code
+    -- preview windows, etc.) that read file content directly via readfile()
+    -- — bypassing Neovim's BufReadCmd machinery — still work for zero:// URIs.
+    -- Without this they error out with "cannot read file: zero://...".
+    -- Patching at vim.fn.readfile catches Lua-side callers; Vimscript
+    -- `:call readfile()` is unaffected (uses the C builtin directly).
+    do
+        local _orig_readfile = vim.fn.readfile
+        vim.fn.readfile = function(path, ...)
+            if type(path) == "string" and path:match("^zero://") then
+                local u, h, p, fpath = M.parse_uri(path)
+                if u and state.channel_id then
+                    local ok, res = pcall(vim.fn.rpcrequest, state.channel_id,
+                        "fetch_path", u, h, p, fpath)
+                    if ok and type(res) == "table" and res[1] == "file" and res[2] then
+                        local lines = vim.split(res[2], "\n")
+                        -- readfile() drops the trailing empty line that comes
+                        -- from a final newline in the file.
+                        if #lines > 0 and lines[#lines] == "" then
+                            table.remove(lines)
+                        end
+                        return lines
+                    end
+                end
+                return {}
+            end
+            return _orig_readfile(path, ...)
+        end
+    end
+
+    -- Patch vim.lsp.buf_request_all to pre-load any zero:// buffers referenced
+    -- in the LSP response. Third-party reference/preview plugins (e.g.
+    -- code-view.nvim) call buf_request_all directly and then use io.open() on
+    -- the URI string — io.open can't read zero://, but those plugins typically
+    -- check for an already-loaded buffer with the same name first. By forcing
+    -- bufadd+bufload before their handler runs, our BufReadCmd populates the
+    -- buffer and they fall into that fast path.
+    do
+        local _orig_brall = vim.lsp.buf_request_all
+        local jump_methods = {
+            ["textDocument/definition"]     = true,
+            ["textDocument/declaration"]    = true,
+            ["textDocument/typeDefinition"] = true,
+            ["textDocument/implementation"] = true,
+            ["textDocument/references"]     = true,
+        }
+        vim.lsp.buf_request_all = function(bufnr, method, params, handler)
+            if not jump_methods[method] or not state.channel_id then
+                return _orig_brall(bufnr, method, params, handler)
+            end
+            return _orig_brall(bufnr, method, params, function(results, ctx)
+                local seen = {}
+                local function preload(loc)
+                    if type(loc) ~= "table" then return end
+                    local uri = loc.uri or loc.targetUri
+                    if not uri or seen[uri] then return end
+                    seen[uri] = true
+                    if not uri:match("^zero://") or uri:match("/$") then return end
+                    local u, h, p, fpath = M.parse_uri(uri)
+                    if not u then return end
+                    local b = vim.fn.bufnr(uri)
+                    if b == -1 then b = vim.fn.bufadd(uri) end
+                    if not vim.api.nvim_buf_is_loaded(b) then
+                        pcall(vim.fn.bufload, b)
+                    end
+                    -- Defensive: even after bufadd → BufNew → BufReadCmd, the
+                    -- buffer may still be empty (autocmd ordering, pcall'd
+                    -- failures, etc.). Without content, third-party plugins
+                    -- that read via nvim_buf_get_lines will see 1 empty line
+                    -- and crash on out-of-range cursor moves. Force-fetch
+                    -- here as a last resort — handle_fetch is idempotent.
+                    local lc = vim.api.nvim_buf_line_count(b)
+                    local has_content = lc > 1 or
+                        (lc == 1 and vim.api.nvim_buf_get_lines(b, 0, 1, false)[1] ~= "")
+                    if not has_content then
+                        pcall(M.handle_fetch, b, u, h, p, fpath)
+                    end
+                end
+                for _, r in pairs(results or {}) do
+                    local res = r and r.result
+                    if type(res) == "table" then
+                        if res.uri or res.targetUri then
+                            preload(res)
+                        else
+                            for _, loc in ipairs(res) do preload(loc) end
+                        end
+                    end
+                end
+                return handler(results, ctx)
+            end)
+        end
+    end
 
     -- Patch vim.lsp.util.locations_to_items to pre-load zero:// buffers before
     -- the LSP jump. This is the call site in buf.lua's on_response callback

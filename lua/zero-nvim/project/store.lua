@@ -40,13 +40,15 @@ local function ensure_dir(path)
     end
 end
 
---- Format JSON string nicely using system tools if available
-local function format_json(obj)
+--- Format JSON string nicely using system tools if available.
+--- Returns nil if the input cannot be encoded. Callers that want a
+--- placeholder on failure should fall back themselves (see project/ui.lua).
+function M.format_json(obj)
     local ok, j = pcall(vim.json.encode, obj)
     if not ok then return nil end
-    
+
     local j_escaped = vim.fn.shellescape(j)
-    
+
     -- Try jq first
     if vim.fn.executable("jq") == 1 then
         local formatted = vim.fn.system("echo " .. j_escaped .. " | jq .")
@@ -57,7 +59,7 @@ local function format_json(obj)
         local formatted = vim.fn.system("echo " .. j_escaped .. " | python3 -m json.tool")
         if vim.v.shell_error == 0 then return formatted end
     end
-    
+
     return j
 end
 
@@ -113,7 +115,7 @@ function M.save(data)
         return
     end
 
-    local content = format_json(data)
+    local content = M.format_json(data)
     if not content then
         file:close()
         vim.notify("zero-nvim: Failed to encode projects data", vim.log.levels.ERROR)

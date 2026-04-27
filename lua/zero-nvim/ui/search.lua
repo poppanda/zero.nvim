@@ -354,7 +354,6 @@ function M.open_search_ui(title_prefix, initial_path, callbacks)
         vim.keymap.set("n", "<BS>", function()
             if filter_query ~= "" then
                 filter_query = ""
-                vim.api.nvim_buf_set_lines(search_buf, 0, -1, false, { "" })
                 rebuild_filtered()
                 render_list()
             end

@@ -2,6 +2,7 @@ local M = {}
 
 local zero = require("zero-nvim")
 local ui = require("zero-nvim.ui")
+local uri = require("zero-nvim.uri")
 
 M.current_session = nil
 M.last_query = ""
@@ -571,8 +572,8 @@ function M.open_ui(opts)
             if session.is_local then
                 vim.cmd("edit " .. vim.fn.fnameescape(node.file))
             else
-                local uri = string.format("zero://%s@%s:%d%s", session.user, session.host, session.port, node.file)
-                vim.cmd("edit " .. uri)
+                local target = uri.format(session.user, session.host, session.port, node.file)
+                vim.cmd("edit " .. target)
             end
             vim.schedule(function()
                 pcall(vim.api.nvim_win_set_cursor, 0, { node.lnum, math.max(0, node.col - 1) })
@@ -645,18 +646,11 @@ function M.live_grep(opts)
     local default_user, default_host, default_port
 
     if is_remote then
-        local user, host, port_str, path
-
-        user, host, port_str, path = buf_name:match("^zero://([^@]+)@([^:]+):(%d+)(/.*)$")
-        if not user then
-            user, host, path = buf_name:match("^zero://([^@]+)@([^/:]+)(/.*)$")
-            port_str = "22"
-        end
-
+        local user, host, port, path = uri.parse(buf_name)
         if user and host and path then
             default_user = user
             default_host = host
-            default_port = tonumber(port_str) or 22
+            default_port = port
             default_path = path:match("/$") and path or vim.fs.dirname(path)
             if default_path == "" or default_path == "." then default_path = "/" end
         end

@@ -159,6 +159,10 @@ impl DaemonState {
 
 /// 判断错误是否表示 SSH 会话已经断开（broken pipe / socket disconnect / libssh2 socket 错误等）。
 /// 命中即触发 with_conn 的自动重连重试。
+///
+/// 只匹配真正"socket 已死"的错误码，避免把协议层短暂错误（KEX_FAILURE / PROTO /
+/// BAD_USE）当成断连——那些错误下旧会话往往还能继续工作，重连反而会引入幂等
+/// 性问题（例如流式搜索的重复输出）。
 fn is_session_dead(err: &anyhow::Error) -> bool {
     // 沿 source chain 查找具体类型 — 当 handler 用 `.context()` 包裹时有效
     for cause in err.chain() {
@@ -178,7 +182,11 @@ fn is_session_dead(err: &anyhow::Error) -> bool {
         }
         if let Some(ssh_err) = cause.downcast_ref::<ssh2::Error>() {
             if let ssh2::ErrorCode::Session(c) = ssh_err.code() {
-                if matches!(c, -7 | -16 | -29 | -30 | -39 | -43 | -49) {
+                // -7  LIBSSH2_ERROR_TIMEOUT
+                // -29 LIBSSH2_ERROR_SOCKET_NONE
+                // -43 LIBSSH2_ERROR_SOCKET_DISCONNECT
+                // -49 LIBSSH2_ERROR_BAD_SOCKET
+                if matches!(c, -7 | -29 | -43 | -49) {
                     return true;
                 }
             }
@@ -189,10 +197,7 @@ fn is_session_dead(err: &anyhow::Error) -> bool {
     // chain 里就只剩下我们自己写的字符串，需要按特征字符串匹配。
     let s = err.to_string();
     s.contains("Session(-7)")          // LIBSSH2_ERROR_TIMEOUT
-        || s.contains("Session(-16)")  // LIBSSH2_ERROR_KEX_FAILURE
         || s.contains("Session(-29)")  // LIBSSH2_ERROR_SOCKET_NONE
-        || s.contains("Session(-30)")  // LIBSSH2_ERROR_PROTO
-        || s.contains("Session(-39)")  // LIBSSH2_ERROR_BAD_USE
         || s.contains("Session(-43)")  // LIBSSH2_ERROR_SOCKET_DISCONNECT
         || s.contains("Session(-49)")  // LIBSSH2_ERROR_BAD_SOCKET
         || s.contains("Broken pipe")
