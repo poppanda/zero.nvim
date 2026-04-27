@@ -6,6 +6,11 @@ local manager = require("zero-nvim.project.manager")
 -- when prewarm and FileType-autostart both fire for the same root.
 local starting = {}
 
+-- 已启动的 LSP 注册表 — key 是 client_id，value 含重启所需的全部参数。
+-- on_exit 时查表自动重启；on_init 成功时清零 attempts。
+local active_lsps = {}
+local MAX_RESTART_ATTEMPTS = 3
+
 --- Build LSP client capabilities with workspace/didChangeWatchedFiles disabled
 --- (Neovim's libuv fs_event watcher does not understand zero:// URIs).
 local function make_caps()
@@ -56,8 +61,10 @@ local function ensure_lsp_client(user, host, port, root_dir, server_name, cmd_ar
     local lock_key = lsp_name .. ":" .. root_dir
 
     -- Reuse an active client for this exact root_dir.
+    -- 排除已经在 stopping 中的客户端，避免自动重启路径里捡到正在退出的旧 client。
     for _, client in ipairs(vim.lsp.get_clients({ name = lsp_name })) do
-        if client.config and client.config.root_dir == root_dir then
+        if client.config and client.config.root_dir == root_dir
+            and not (client.is_stopped and client.is_stopped()) then
             return client.id
         end
     end
@@ -117,18 +124,77 @@ local function ensure_lsp_client(user, host, port, root_dir, server_name, cmd_ar
                 end
             end
         end,
-        on_init = function()
+        on_init = function(client, _)
             clear_lock()
+            -- 握手成功 → 重启计数清零，避免长期运行后偶发断连累积到上限
+            if client and active_lsps[client.id] then
+                active_lsps[client.id].attempts = 0
+            end
         end,
-        on_exit = function(code, signal)
+        on_exit = function(code, signal, client_id_arg)
             clear_lock()
-            vim.schedule(function()
-                vim.notify(
-                    string.format("ZeroNvim: LSP '%s' exited (code=%s, signal=%s)", lsp_name, tostring(code),
-                        tostring(signal)),
-                    (code == 0 or code == nil) and vim.log.levels.INFO or vim.log.levels.WARN
+            local entry = active_lsps[client_id_arg]
+            active_lsps[client_id_arg] = nil
+
+            -- 抓住 client 还没销毁前已附着的 buffer 列表，重启后重新 attach
+            local attached = {}
+            local dying = vim.lsp.get_client_by_id(client_id_arg)
+            if dying and dying.attached_buffers then
+                for b, _ in pairs(dying.attached_buffers) do
+                    if vim.api.nvim_buf_is_valid(b) then
+                        table.insert(attached, b)
+                    end
+                end
+            end
+
+            -- 主动 stop / 没注册过 / 重启次数耗尽 → 不重启，仅通知
+            if not entry or code == 0 or entry.attempts >= MAX_RESTART_ATTEMPTS then
+                vim.schedule(function()
+                    local level = (code == 0 or code == nil) and vim.log.levels.INFO or vim.log.levels.WARN
+                    if entry and entry.attempts >= MAX_RESTART_ATTEMPTS then
+                        level = vim.log.levels.ERROR
+                        vim.notify(string.format(
+                            "ZeroNvim: LSP '%s' 已重启 %d 次仍失败，停止自动重连。可手动 :ZeroLspStart 恢复。",
+                            lsp_name, entry.attempts), level)
+                    else
+                        vim.notify(string.format(
+                            "ZeroNvim: LSP '%s' exited (code=%s, signal=%s)",
+                            lsp_name, tostring(code), tostring(signal)), level)
+                    end
+                end)
+                return
+            end
+
+            -- 自动重启：递增退避 500ms / 1s / 1.5s
+            entry.attempts = entry.attempts + 1
+            local delay = 500 * entry.attempts
+            vim.defer_fn(function()
+                vim.notify(string.format(
+                    "ZeroNvim: LSP '%s' 异常退出，自动重启 (第 %d 次)...",
+                    lsp_name, entry.attempts), vim.log.levels.INFO)
+                local new_id, err2 = ensure_lsp_client(
+                    entry.user, entry.host, entry.port,
+                    entry.root_dir, entry.server_name,
+                    entry.cmd_args, entry.settings
                 )
-            end)
+                if new_id then
+                    -- 把新 client 重新 attach 到原来那些 buffer 上
+                    for _, b in ipairs(attached) do
+                        if vim.api.nvim_buf_is_valid(b) then
+                            pcall(vim.lsp.buf_attach_client, b, new_id)
+                        end
+                    end
+                    if #attached > 0 then
+                        vim.notify(string.format(
+                            "ZeroNvim: LSP '%s' 已恢复，重新附着 %d 个 buffer",
+                            lsp_name, #attached), vim.log.levels.INFO)
+                    end
+                else
+                    vim.notify(string.format(
+                        "ZeroNvim: LSP '%s' 重启失败: %s",
+                        lsp_name, tostring(err2)), vim.log.levels.ERROR)
+                end
+            end, delay)
         end,
         on_error = function(code, err2)
             vim.schedule(function()
@@ -144,6 +210,19 @@ local function ensure_lsp_client(user, host, port, root_dir, server_name, cmd_ar
         clear_lock()
         return nil, "vim.lsp.start_client returned nil"
     end
+
+    -- 注册到 active_lsps，供 on_exit 自动重启使用。
+    -- attempts 在 on_init 成功时清零，每次自动重启自增，到 MAX_RESTART_ATTEMPTS 停止。
+    active_lsps[client_id] = {
+        user = user,
+        host = host,
+        port = port,
+        root_dir = root_dir,
+        server_name = server_name,
+        cmd_args = cmd_args,
+        settings = settings,
+        attempts = 0,
+    }
 
     -- Safety net: clear the lock even if on_init never fires (server crashes
     -- mid-handshake). 5s is long enough for a normal initialize.
