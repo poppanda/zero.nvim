@@ -802,6 +802,41 @@ function M.setup(opts)
                 end
             end
 
+            -- Defensive cursor re-snap for single-location jumps to zero://
+            -- buffers. Some adapters (notably oil.nvim's BufReadCmd flow)
+            -- re-fetch and nvim_buf_set_lines(0, -1, ...) replace ALL lines
+            -- AFTER the LSP framework set the cursor — Neovim then resets
+            -- the cursor in displaying windows to (1,0). We pre-load via
+            -- batch fetch above + the oil adapter has a fast-path skip,
+            -- but keep this snap as a safety net for other clobbering paths.
+            if #locations == 1 then
+                local _loc = locations[1]
+                local _uri = _loc.uri or _loc.targetUri
+                local _range = _loc.range or _loc.targetSelectionRange
+                if _uri and _uri:match("^zero://") and _range and _range.start then
+                    local target_line = (_range.start.line or 0) + 1
+                    local target_char = _range.start.character or 0
+                    local target_bnum = vim.fn.bufnr(_uri)
+                    if target_bnum > 0 then
+                        vim.schedule(function()
+                            for _, w in ipairs(vim.api.nvim_list_wins()) do
+                                if vim.api.nvim_win_get_buf(w) == target_bnum then
+                                    local cur = vim.api.nvim_win_get_cursor(w)
+                                    if cur[1] ~= target_line then
+                                        local lc = vim.api.nvim_buf_line_count(target_bnum)
+                                        local lnum = math.min(target_line, math.max(1, lc))
+                                        local line = vim.api.nvim_buf_get_lines(target_bnum, lnum - 1, lnum, false)[1] or ""
+                                        local col = math.min(target_char, #line)
+                                        pcall(vim.api.nvim_win_set_cursor, w, { lnum, col })
+                                        vim._with({ win = w }, function() vim.cmd('normal! zv') end)
+                                    end
+                                end
+                            end
+                        end)
+                    end
+                end
+            end
+
             return _orig_lti(locations, offset_encoding)
         end
     end

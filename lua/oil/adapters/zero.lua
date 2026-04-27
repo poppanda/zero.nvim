@@ -317,8 +317,32 @@ end
 
 ---@param bufnr integer
 M.read_file = function(bufnr)
-  loading.set_loading(bufnr, true)
   local bufname = vim.api.nvim_buf_get_name(bufnr)
+
+  -- Fast path: if the buffer was already populated by zero-nvim's
+  -- locations_to_items batch fetch (LSP-jump preload), DON'T re-fetch
+  -- and DON'T re-set lines. nvim_buf_set_lines(0, -1, ...) replacing
+  -- ALL lines causes Neovim to reset the cursor in any window
+  -- displaying the buffer to (1,0) — clobbering the LSP target.
+  local lc = vim.api.nvim_buf_line_count(bufnr)
+  local already_loaded = lc > 1 or
+    (lc == 1 and vim.api.nvim_buf_get_lines(bufnr, 0, 1, false)[1] ~= "")
+  if already_loaded then
+    loading.set_loading(bufnr, false)
+    vim.bo[bufnr].modifiable = true
+    vim.bo[bufnr].modified = false
+    if vim.bo[bufnr].filetype == "" or vim.bo[bufnr].filetype == "oil" then
+      local basename = pathutil.basename(bufname)
+      local filetype = vim.filetype.match({ buf = bufnr, filename = basename })
+      if filetype then
+        vim.bo[bufnr].filetype = filetype
+      end
+    end
+    vim.cmd.doautocmd({ args = { "BufReadPost", bufname }, mods = { silent = true } })
+    return
+  end
+
+  loading.set_loading(bufnr, true)
   local res = M.parse_url(bufname)
   local zero = get_zero()
 
