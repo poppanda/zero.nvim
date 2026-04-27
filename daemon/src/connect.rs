@@ -6,10 +6,12 @@
 
 use crate::state::{ConnSession, DaemonState, ProjectCache};
 use rmpv::Value;
+use socket2::{Socket, TcpKeepalive};
 use ssh2::Session;
 use std::collections::HashMap;
 use std::net::TcpStream;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 pub fn handle_connect(
     user: &str,
@@ -35,6 +37,18 @@ pub fn handle_connect(
     // ── 建立 TCP 连接和 SSH 握手 ──
     let tcp = TcpStream::connect(format!("{}:{}", host, port))?;
     tcp.set_nodelay(true)?;
+
+    // 开启 TCP keepalive：长时间空闲或网络切换后内核会主动探测对端，
+    // 死连接会更快变为 BrokenPipe，让 with_conn 的自动重连能及时触发。
+    let socket: Socket = tcp.into();
+    let keepalive = TcpKeepalive::new()
+        .with_time(Duration::from_secs(60))
+        .with_interval(Duration::from_secs(15));
+    if let Err(e) = socket.set_tcp_keepalive(&keepalive) {
+        eprintln!("Daemon: 设置 TCP keepalive 失败 (忽略): {}", e);
+    }
+    let tcp: TcpStream = socket.into();
+
     let mut sess = Session::new()?;
     sess.set_tcp_stream(tcp);
     sess.set_timeout(10000);
@@ -131,17 +145,17 @@ pub fn handle_connect(
         return Err(anyhow::anyhow!("AUTH_FAILED: 认证失败 {}", key));
     }
 
-    // ── 保存会话和初始化缓存 ──
+    // ── 保存会话；缓存若已存在则保留（自动重连时不应清空目录缓存）──
     let mut state_lock = state.lock().unwrap();
     state_lock
         .sessions
         .insert(key.clone(), Arc::new(Mutex::new(ConnSession::new(sess))));
-    state_lock.caches.insert(
-        key.clone(),
-        ProjectCache {
+    state_lock
+        .caches
+        .entry(key.clone())
+        .or_insert_with(|| ProjectCache {
             directories: HashMap::new(),
-        },
-    );
+        });
     eprintln!("Daemon: 已连接 {}", key);
     Ok(Value::Boolean(true))
 }

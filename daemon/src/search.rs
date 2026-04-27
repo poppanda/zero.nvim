@@ -2,7 +2,7 @@
 // search.rs — 远程全局搜索
 // =============================================================================
 
-use crate::state::{ConnSession, DaemonState};
+use crate::state::DaemonState;
 use anyhow::Context;
 use rmpv::Value;
 use std::io::{BufRead, BufReader};
@@ -22,48 +22,58 @@ pub fn handle_global_search(
     state: &Arc<Mutex<DaemonState>>,
     tx: mpsc::Sender<Value>,
 ) -> Result<Value, anyhow::Error> {
-    let key = DaemonState::connection_key(user, host, port);
-    let conn = DaemonState::get_conn(state, &key)?;
-
-    let path_clone = path.to_string();
-    let query_clone = query.to_string();
-    let session_id_clone = session_id.to_string();
-    let file_types_clone = file_types.to_string();
+    let state = state.clone();
+    let user = user.to_string();
+    let host = host.to_string();
+    let path = path.to_string();
+    let query = query.to_string();
+    let session_id = session_id.to_string();
+    let file_types = file_types.to_string();
 
     eprintln!("Daemon: 搜索 \"{}\" in {}", query, path);
 
-    // 把 conn 的 Arc 交给后台线程，run_search 会在执行期间持有 conn 锁，
-    // 与同会话上的其他 SFTP/exec 操作互斥（libssh2 不可并发使用同一 session）。
+    // 后台线程跑搜索；走 with_conn 来覆盖死会话自动重连。
+    // 注意：with_conn 在 dead-session 错误时会重试一次闭包，如果连接是
+    // 在流式输出**中途**断的，重试会重发早期 chunk。这种情况罕见
+    // （典型场景是 idle 后 channel_session 直接失败，0 chunk 已发），
+    // 用户再触发一次搜索就能拿到干净结果，不为它增加复杂度。
     thread::spawn(move || {
-        if let Err(e) = run_search(
-            conn,
-            &path_clone,
-            &query_clone,
-            &session_id_clone,
-            case_sensitive,
-            whole_word,
-            &file_types_clone,
-            tx,
-        ) {
-            eprintln!("Daemon: 搜索失败: {:?}", e);
+        let result = DaemonState::with_conn(&state, &user, &host, port, |conn| {
+            run_search(
+                conn,
+                &path,
+                &query,
+                &session_id,
+                case_sensitive,
+                whole_word,
+                &file_types,
+                &tx,
+            )
+        });
+
+        if let Err(e) = &result {
+            let msg = format!("{}", e);
+            eprintln!("Daemon: 搜索失败: {}", msg);
+            send_error(&tx, &session_id, &msg);
         }
+        // 无条件发 end，确保 Lua 侧 UI 不会卡在加载状态
+        send_end(&tx, &session_id);
     });
 
     Ok(Value::Boolean(true))
 }
 
 fn run_search(
-    conn: Arc<Mutex<ConnSession>>,
+    conn: &mut crate::state::ConnSession,
     path: &str,
     query: &str,
     session_id: &str,
     case_sensitive: bool,
     whole_word: bool,
     file_types: &str,
-    tx: mpsc::Sender<Value>,
+    tx: &mpsc::Sender<Value>,
 ) -> Result<(), anyhow::Error> {
-    let conn_guard = conn.lock().unwrap();
-    let mut channel = conn_guard
+    let mut channel = conn
         .session
         .channel_session()
         .context("Failed to create channel_session")?;
@@ -116,7 +126,6 @@ fn run_search(
     channel.exec(&rg_cmd).context("Failed to exec rg command")?;
 
     let stdout = channel.stream(0);
-    // Read stderr in a separate buffer
     let mut stderr_stream = channel.stderr();
 
     let reader = BufReader::new(stdout);
@@ -128,14 +137,14 @@ fn run_search(
         if let Ok(line) = line_result {
             chunk.push(Value::String(line.into()));
             if chunk.len() >= chunk_size {
-                send_chunk(&tx, session_id, &chunk);
+                send_chunk(tx, session_id, &chunk);
                 chunk.clear();
             }
         }
     }
 
     if !chunk.is_empty() {
-        send_chunk(&tx, session_id, &chunk);
+        send_chunk(tx, session_id, &chunk);
     }
 
     // Read any remaining stderr output
@@ -144,11 +153,10 @@ fn run_search(
     let _ = stderr_stream.read_to_string(&mut stderr_str);
     if !stderr_str.trim().is_empty() {
         eprintln!("Daemon: rg stderr: {}", stderr_str.trim());
-        send_error(&tx, session_id, stderr_str.trim());
+        send_error(tx, session_id, stderr_str.trim());
     }
 
     let _ = channel.wait_close();
-    send_end(&tx, session_id);
 
     Ok(())
 }

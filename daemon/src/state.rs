@@ -105,4 +105,99 @@ impl DaemonState {
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("NOT_CONNECTED: {}", key))
     }
+
+    /// 在会话上执行操作；若错误看起来是连接已死，则丢弃旧会话、重连一次后重试一次。
+    ///
+    /// 回调只能持有 `&mut ConnSession`，不能借用 `state`，避免锁顺序冲突
+    /// （with_conn 在外层动态获取 state 锁来移除/重建 entry）。
+    pub fn with_conn<F, T>(
+        state: &Arc<Mutex<Self>>,
+        user: &str,
+        host: &str,
+        port: u16,
+        mut f: F,
+    ) -> Result<T, anyhow::Error>
+    where
+        F: FnMut(&mut ConnSession) -> Result<T, anyhow::Error>,
+    {
+        let key = Self::connection_key(user, host, port);
+
+        // 第一次尝试 — 用现有会话
+        let first = {
+            let conn = Self::get_conn(state, &key)?;
+            let mut guard = conn.lock().unwrap();
+            f(&mut guard)
+        };
+
+        let first_err = match first {
+            Ok(v) => return Ok(v),
+            Err(e) if is_session_dead(&e) => e,
+            Err(e) => return Err(e),
+        };
+
+        eprintln!(
+            "Daemon: {} 连接异常 ({})，尝试自动重连...",
+            key, first_err
+        );
+
+        // 把死会话从 state 里清掉，让 handle_connect 走完整握手
+        {
+            let mut state_lock = state.lock().unwrap();
+            state_lock.sessions.remove(&key);
+        }
+
+        crate::connect::handle_connect(user, host, port, None, state)
+            .map_err(|re| anyhow::anyhow!("自动重连失败: {} (原错误: {})", re, first_err))?;
+        eprintln!("Daemon: {} 重连成功，重试操作", key);
+
+        // 第二次尝试 — 用新会话
+        let conn = Self::get_conn(state, &key)?;
+        let mut guard = conn.lock().unwrap();
+        f(&mut guard)
+    }
+}
+
+/// 判断错误是否表示 SSH 会话已经断开（broken pipe / socket disconnect / libssh2 socket 错误等）。
+/// 命中即触发 with_conn 的自动重连重试。
+fn is_session_dead(err: &anyhow::Error) -> bool {
+    // 沿 source chain 查找具体类型 — 当 handler 用 `.context()` 包裹时有效
+    for cause in err.chain() {
+        if let Some(io_err) = cause.downcast_ref::<std::io::Error>() {
+            use std::io::ErrorKind::*;
+            if matches!(
+                io_err.kind(),
+                BrokenPipe
+                    | ConnectionReset
+                    | ConnectionAborted
+                    | NotConnected
+                    | UnexpectedEof
+                    | TimedOut
+            ) {
+                return true;
+            }
+        }
+        if let Some(ssh_err) = cause.downcast_ref::<ssh2::Error>() {
+            if let ssh2::ErrorCode::Session(c) = ssh_err.code() {
+                if matches!(c, -7 | -16 | -29 | -30 | -39 | -43 | -49) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    // 字符串兜底 — 当 handler 用 `anyhow!("...{}", e)` 形式包裹时，
+    // chain 里就只剩下我们自己写的字符串，需要按特征字符串匹配。
+    let s = err.to_string();
+    s.contains("Session(-7)")          // LIBSSH2_ERROR_TIMEOUT
+        || s.contains("Session(-16)")  // LIBSSH2_ERROR_KEX_FAILURE
+        || s.contains("Session(-29)")  // LIBSSH2_ERROR_SOCKET_NONE
+        || s.contains("Session(-30)")  // LIBSSH2_ERROR_PROTO
+        || s.contains("Session(-39)")  // LIBSSH2_ERROR_BAD_USE
+        || s.contains("Session(-43)")  // LIBSSH2_ERROR_SOCKET_DISCONNECT
+        || s.contains("Session(-49)")  // LIBSSH2_ERROR_BAD_SOCKET
+        || s.contains("Broken pipe")
+        || s.contains("Connection reset")
+        || s.contains("Connection aborted")
+        || s.contains("Socket disconnect")
+        || s.contains("unexpected end of file")
 }
