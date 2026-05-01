@@ -75,16 +75,28 @@ end
 ---
 --- opts.cwd 是远端绝对路径（gitsigns 传入 toplevel）；env 是 lua dict，
 --- stdin 可能是字符串或 string[]；timeout 是秒，daemon 期望毫秒。
+---
+--- 流式回调（vim.SystemOpts.stdout / .stderr）：当 caller 提供函数时，每个 chunk
+--- 立刻 `cb(nil, text)`；EOF（exit/aborted）调一次 `cb(nil, nil)` 关闭流。这是
+--- gitsigns blame --incremental 用 buffered_line_reader（coroutine yield）等数据
+--- 的契约——少了那个 nil 收尾，coroutine 永远阻塞，blame 不会出结果。
+--- 用了流式回调的通道，对应 SystemCompleted.stdout/stderr 留空（与 vim.system 语义一致）。
 ---@param cmd string[]
 ---@param opts table
 ---@param ctx table
----@param on_exit fun(obj: table)
+---@param gitsigns_on_exit fun(obj: table)
 function M.system(cmd, opts, ctx, gitsigns_on_exit)
     -- gitsigns 的 stage_hunks 用 string[] patch；daemon stdin 是 bytes。
+    -- vim.system 对 string[] 的语义是 *每* 行都补一个 '\n'（含末尾），等价于
+    -- table.concat(arr, "\n") .. "\n"。漏掉这个末尾 '\n'，git apply 会报
+    -- "corrupt patch at line N"（patch 必须以 \n 结尾），stage_hunk 直接失败。
     local stdin = opts.stdin
     if type(stdin) == "table" then
-        stdin = table.concat(stdin, "\n")
+        stdin = table.concat(stdin, "\n") .. "\n"
     end
+
+    local stdout_cb = type(opts.stdout) == "function" and opts.stdout or nil
+    local stderr_cb = type(opts.stderr) == "function" and opts.stderr or nil
 
     local stdout_chunks, stderr_chunks = {}, {}
 
@@ -97,15 +109,26 @@ function M.system(cmd, opts, ctx, gitsigns_on_exit)
     }, {
         on_event = function(ev)
             if ev.kind == "stdout" then
-                stdout_chunks[#stdout_chunks + 1] = ev.text
+                if stdout_cb then
+                    stdout_cb(nil, ev.text)
+                else
+                    stdout_chunks[#stdout_chunks + 1] = ev.text
+                end
             elseif ev.kind == "stderr" then
-                stderr_chunks[#stderr_chunks + 1] = ev.text
+                if stderr_cb then
+                    stderr_cb(nil, ev.text)
+                else
+                    stderr_chunks[#stderr_chunks + 1] = ev.text
+                end
             end
         end,
         on_exit = function(code, signal, reason, _dur)
+            -- 流式回调用 nil 收尾——blame 的 coroutine reader 靠这个跳出 yield。
+            if stdout_cb then stdout_cb(nil, nil) end
+            if stderr_cb then stderr_cb(nil, nil) end
             gitsigns_on_exit({
-                stdout = table.concat(stdout_chunks),
-                stderr = table.concat(stderr_chunks),
+                stdout = stdout_cb and "" or table.concat(stdout_chunks),
+                stderr = stderr_cb and "" or table.concat(stderr_chunks),
                 -- aborted（比如 buffer wipeout 触发取消）→ 用 -1 让 gitsigns ignore_error 路径处理；
                 -- 正常退出走 daemon 报告的 code。
                 code = reason and -1 or (code or 0),
@@ -115,8 +138,11 @@ function M.system(cmd, opts, ctx, gitsigns_on_exit)
     })
 
     if err then
-        -- 启动失败（连接没建好、target 不可达等）：直接合成失败 SystemCompleted
+        -- 启动失败（连接没建好、target 不可达等）：直接合成失败 SystemCompleted。
+        -- 流式回调也要发 nil，避免 blame 的 coroutine 永远等。
         vim.schedule(function()
+            if stdout_cb then stdout_cb(nil, nil) end
+            if stderr_cb then stderr_cb(nil, nil) end
             gitsigns_on_exit({ stdout = "", stderr = tostring(err), code = -1, signal = 0 })
         end)
     end
