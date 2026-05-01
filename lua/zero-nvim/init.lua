@@ -449,6 +449,9 @@ function M.setup(opts)
                 -- Only fetch if daemon is connected (avoid errors on startup)
                 if not state.channel_id then return end
                 M.handle_fetch(args.buf, user, host, port, path)
+                -- Wake plugins (gitsigns attach autocmd, etc.) that listen for
+                -- BufReadPost — bufadd-driven flow doesn't fire it on its own.
+                vim.api.nvim_exec_autocmds("BufReadPost", { buffer = args.buf })
             end,
             group = group,
         })
@@ -471,6 +474,9 @@ function M.setup(opts)
                 if ft and ft ~= "" then
                     vim.bo[args.buf].filetype = ft
                 end
+                -- BufReadCmd replaces BufRead — downstream readers (gitsigns
+                -- attach autocmd, etc.) need an explicit BufReadPost to wake up.
+                vim.api.nvim_exec_autocmds("BufReadPost", { buffer = args.buf })
             end,
             group = group,
         })
@@ -1050,6 +1056,12 @@ function M.setup(opts)
         nargs = 0,
         desc = "Local buffer search and replace using floating windows",
     })
+
+    -- Register the gitsigns data-layer backend so zero:// buffers in remote
+    -- git repos get the same diff signs / hunk navigation / blame as local
+    -- files. Requires the forked gitsigns that exposes `gitsigns.backends`;
+    -- with upstream gitsigns this is a silent no-op (local files unaffected).
+    require("zero-nvim.gitsigns.backend").setup()
 end
 
 return M
