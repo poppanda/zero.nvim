@@ -55,6 +55,8 @@ pub struct DaemonState {
     pub caches: HashMap<String, ProjectCache>,
     /// 解析后的 SSH 配置（启动时加载一次）
     pub ssh_config: Option<SshConfig>,
+    /// 流式命令注册表：session_id → 句柄。供 cmd_cancel RPC 查询。
+    pub running_commands: Arc<Mutex<crate::cmd::CmdRegistry>>,
 }
 
 impl DaemonState {
@@ -65,6 +67,7 @@ impl DaemonState {
             sessions: HashMap::new(),
             caches: HashMap::new(),
             ssh_config,
+            running_commands: Arc::new(Mutex::new(crate::cmd::CmdRegistry::new())),
         }
     }
 

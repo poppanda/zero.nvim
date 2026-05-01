@@ -8,6 +8,7 @@
 //   - connect:    SSH 连接管理
 //   - fs:         远程文件系统操作（读/写/目录/扫描）
 
+mod cmd;
 mod connect;
 mod fs;
 mod lsp;
@@ -197,7 +198,14 @@ fn dispatch(
             fs::handle_rename(user, host, port, src, dst, &state)
         }
 
-        // ── 远端命令执行 ──
+        // ── 通用远程命令基座 ──
+        "cmd_sync" => cmd::dispatch::handle_cmd_sync(params, &state),
+
+        "cmd_stream" => cmd::dispatch::handle_cmd_stream(params, &state, tx),
+
+        "cmd_cancel" => cmd::dispatch::handle_cmd_cancel(params, &state),
+
+        // ── 远端命令执行 (legacy) ──
         "exec_remote" => {
             let args = params.as_array().ok_or(anyhow::anyhow!("Invalid params"))?;
             let user = args.get(0).and_then(|v| v.as_str()).ok_or(anyhow::anyhow!("Missing user"))?;
