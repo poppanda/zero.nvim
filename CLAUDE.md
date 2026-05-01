@@ -40,7 +40,7 @@ Single-process RPC server. `main.rs` reads Msgpack-RPC from stdin, dispatches to
 - **connect.rs** — SSH auth chain: agent → config IdentityFile → default keys → password
 - **fs.rs** — SFTP operations with directory caching (invalidated on write)
 - **lsp.rs** — LSP proxy: binds ephemeral TCP port locally, spawns `ssh` subprocess to remote LSP, three threads handle bidirectional I/O with URI translation (`file://zero://user@host:port/path` ↔ `file:///path`). Uses system `ssh` (not libssh2) for thread-safe pipes.
-- **search.rs** — Streams remote `rg` results back via RPC notifications
+- **cmd/** — Generic remote command base (replaces former `search.rs`). Three RPCs: `cmd_sync` (one-shot), `cmd_stream` (streaming with batched stdout/stderr notifications + cancel), `cmd_cancel`. Each streaming command owns a dedicated SSH session (via `connect::open_dedicated_session`) so it doesn't block the SFTP pool. Cancel escalates close → SIGTERM (via remote PID) → SIGKILL.
 - **ssh_config.rs** — Parses `~/.ssh/config` via ssh2-config crate
 
 ### Lua Plugin (`lua/zero-nvim/`)
@@ -90,7 +90,7 @@ vim.lsp.buf.definition
 
 ## RPC Methods (daemon)
 
-`connect`, `stat`, `fetch_file`, `write_file`, `read_dir`, `scan_project`, `mkdir`, `remove_file`, `remove_dir`, `rename`, `global_search`, `lsp_start`, `list_ssh_hosts`, `resolve_ssh_target`
+`connect`, `stat`, `fetch_file`, `fetch_path`, `fetch_paths`, `write_file`, `read_dir`, `scan_project`, `mkdir`, `remove_file`, `remove_dir`, `rename`, `exec_remote`, `cmd_sync`, `cmd_stream`, `cmd_cancel`, `lsp_start`, `list_ssh_hosts`, `resolve_ssh_target`
 
 ## Debug
 

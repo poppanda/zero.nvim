@@ -12,7 +12,6 @@ mod cmd;
 mod connect;
 mod fs;
 mod lsp;
-mod search;
 mod ssh_config;
 mod state;
 
@@ -213,48 +212,6 @@ fn dispatch(
             let port = args.get(2).and_then(|v| v.as_u64()).unwrap_or(22) as u16;
             let cmd  = args.get(3).and_then(|v| v.as_str()).ok_or(anyhow::anyhow!("Missing cmd"))?;
             fs::handle_exec_remote(user, host, port, cmd, &state)
-        }
-
-        // ── 搜索 ──
-        "global_search" => {
-            let args = params.as_array().ok_or(anyhow::anyhow!("Invalid params"))?;
-            let user = args
-                .get(0)
-                .and_then(|v| v.as_str())
-                .ok_or(anyhow::anyhow!("Missing user"))?;
-            let host = args
-                .get(1)
-                .and_then(|v| v.as_str())
-                .ok_or(anyhow::anyhow!("Missing host"))?;
-            let port = args.get(2).and_then(|v| v.as_u64()).unwrap_or(22) as u16;
-            let path = args
-                .get(3)
-                .and_then(|v| v.as_str())
-                .ok_or(anyhow::anyhow!("Missing path"))?;
-            let query = args
-                .get(4)
-                .and_then(|v| v.as_str())
-                .ok_or(anyhow::anyhow!("Missing query"))?;
-            let session_id = args
-                .get(5)
-                .and_then(|v| v.as_str())
-                .ok_or(anyhow::anyhow!("Missing session_id"))?;
-            let case_sensitive = args.get(6).and_then(|v| v.as_bool()).unwrap_or(false);
-            let whole_word = args.get(7).and_then(|v| v.as_bool()).unwrap_or(false);
-            let file_types = args.get(8).and_then(|v| v.as_str()).unwrap_or("").to_string();
-            search::handle_global_search(
-                user,
-                host,
-                port,
-                path,
-                query,
-                session_id,
-                case_sensitive,
-                whole_word,
-                &file_types,
-                &state,
-                tx,
-            )
         }
 
         // ── LSP 代理 ──

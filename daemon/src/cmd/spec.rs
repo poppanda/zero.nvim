@@ -59,21 +59,15 @@ impl RemoteCommand {
         }
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn env(mut self, k: impl Into<String>, v: impl Into<String>) -> Self {
         self.env.push((k.into(), v.into()));
         self
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn cwd(mut self, cwd: impl Into<String>) -> Self {
         self.cwd = Some(cwd.into());
-        self
-    }
-
-    #[allow(dead_code)]
-    pub fn stdin(mut self, data: Vec<u8>) -> Self {
-        self.stdin = Some(data);
         self
     }
 

@@ -48,9 +48,4 @@ impl CmdRegistry {
     pub fn remove(&mut self, sid: &str) -> Option<Arc<CmdHandle>> {
         self.inner.remove(sid)
     }
-
-    #[allow(dead_code)]
-    pub fn len(&self) -> usize {
-        self.inner.len()
-    }
 }

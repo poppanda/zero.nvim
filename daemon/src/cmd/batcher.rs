@@ -110,10 +110,6 @@ impl Batcher {
         out
     }
 
-    #[allow(dead_code)]
-    pub fn has_pending(&self) -> bool {
-        !self.stdout_buf.is_empty() || !self.stderr_buf.is_empty()
-    }
 }
 
 #[cfg(test)]

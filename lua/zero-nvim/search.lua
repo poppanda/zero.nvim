@@ -3,6 +3,8 @@ local M = {}
 local zero = require("zero-nvim")
 local ui = require("zero-nvim.ui")
 local uri = require("zero-nvim.uri")
+local cmd = require("zero-nvim.cmd")
+local rg_parser = require("zero-nvim.cmd.parsers.rg")
 
 M.current_session = nil
 M.last_query = ""
@@ -11,6 +13,73 @@ M.last_case_sensitive = false
 M.last_whole_word = false
 M.last_file_types = {}
 M.last_selected_index = 0
+
+-- =============================================================================
+-- 内部：rg argv 构造
+-- =============================================================================
+
+-- ripgrep 内置 type（其余走 --glob '*.<ext>'）
+local RG_BUILTIN = {
+    c = true, cpp = true, css = true, go = true, h = true, html = true,
+    java = true, js = true, json = true, lua = true, md = true, py = true,
+    rust = true, sh = true, sql = true, toml = true, ts = true, txt = true,
+    xml = true, yaml = true,
+}
+
+-- 远端 PATH 注入：sshd non-interactive shell 通常缺 brew/cargo bin
+local REMOTE_PATH_PREFIX =
+"/usr/local/bin:/opt/homebrew/bin:$HOME/.cargo/bin:/home/linuxbrew/.linuxbrew/bin"
+
+local function build_rg_args(query, path, case_sensitive, whole_word, file_types)
+    local args = { "rg", "--json" }
+    if case_sensitive then
+        table.insert(args, "--case-sensitive")
+    else
+        table.insert(args, "--ignore-case")
+    end
+    if whole_word then table.insert(args, "--word-regexp") end
+    for _, ft in ipairs(file_types or {}) do
+        if RG_BUILTIN[ft] then
+            table.insert(args, "--type"); table.insert(args, ft)
+        else
+            table.insert(args, "--glob"); table.insert(args, "*." .. ft)
+        end
+    end
+    table.insert(args, "--")
+    table.insert(args, query)
+    table.insert(args, path)
+    return args
+end
+
+-- 远端：用 sh -c 包一层让 $PATH 在远端运行时展开
+local function wrap_remote_argv(rg_args)
+    local out = {
+        "sh", "-c",
+        ('PATH="%s:$PATH" exec "$@"'):format(REMOTE_PATH_PREFIX),
+        "--",
+    }
+    vim.list_extend(out, rg_args)
+    return out
+end
+
+-- =============================================================================
+-- 内部：增量渲染防抖
+-- =============================================================================
+
+local function schedule_render(session)
+    if session._render_scheduled then return end
+    session._render_scheduled = true
+    vim.defer_fn(function()
+        session._render_scheduled = false
+        if M.current_session == session then
+            M.render_tree()
+        end
+    end, 50)
+end
+
+-- =============================================================================
+-- 渲染（与旧版一致，未动）
+-- =============================================================================
 
 function M.render_tree()
     local session = M.current_session
@@ -42,20 +111,17 @@ function M.render_tree()
         local ext = filename:match("%.([^%.]+)$") or ""
         local file_icon = (ui.icon_map and ui.icon_map[ext]) and ui.icon_map[ext] or "󰈔"
 
-        -- File header: "icon filename dirpath       [N matches]"
         local name_part = string.format("%s %s %s ", icon, file_icon, filename)
         local count_text = string.format("[%d match%s]", match_count, match_count > 1 and "es" or "")
         local name_w = vim.fn.strdisplaywidth(name_part)
         local dir_w = vim.fn.strdisplaywidth(dirpath)
         local count_w = vim.fn.strdisplaywidth(count_text)
-        -- If dirpath would cause overflow, truncate it
         local max_dir_w = win_width - name_w - count_w - 2
         local display_dir = dirpath
         if dir_w > max_dir_w and max_dir_w > 3 then
-            -- Truncate from the left: show "...tail/of/path/"
             local chars = vim.fn.split(dirpath, "\\zs")
             local truncated = {}
-            local w = 3 -- for "..."
+            local w = 3
             for i = #chars, 1, -1 do
                 w = w + vim.fn.strdisplaywidth(chars[i])
                 if w > max_dir_w then break end
@@ -72,7 +138,6 @@ function M.render_tree()
 
         table.insert(session.nodes, { type = "file", file = file_obj.file, ref = file_obj })
 
-        -- Highlights for file header
         local icon_bytes = #string.format("%s %s ", icon, file_icon)
         local name_end = icon_bytes + #filename
         local dir_start = #name_part
@@ -84,16 +149,15 @@ function M.render_tree()
 
         if is_expanded then
             for _, match in ipairs(file_obj.matches) do
-                -- Match line: "123 │ code content here"
                 local lnum_str = string.format("%4d", match.lnum)
                 local prefix = lnum_str .. " │ "
                 local prefix_w = vim.fn.strdisplaywidth(prefix)
                 local max_text_width = win_width - prefix_w
                 local text = match.text
-                local query_len = #session.query
+                -- 旧 text 模式 col 是 1-based；新 JSON 模式我们也产 1-based。
                 local col0 = math.max(0, match.col - 1)
+                local match_len = match.match_len or #(session.query or "")
 
-                -- Truncate long lines: center the match keyword in the visible area
                 local text_offset = 0
                 local display_text = text
                 if vim.fn.strdisplaywidth(text) > max_text_width then
@@ -187,23 +251,20 @@ function M.render_tree()
                     text = match.text
                 })
 
-                -- Highlights: line number dim, separator dim
                 local lnum_end = #lnum_str
-                local sep_start = lnum_end + 1 -- space before │
+                local sep_start = lnum_end + 1
                 local sep_end = sep_start + #"│"
                 table.insert(extmarks, { c_row, 0, lnum_end, "ZeroSearchLineNr" })
                 table.insert(extmarks, { c_row, sep_start, sep_end, "ZeroSearchSep" })
 
-                -- Highlight the match keyword in blue
                 local prefix_bytes = #prefix
                 local match_start = prefix_bytes + col0 - text_offset
-                if match.col > 0 and match_start >= prefix_bytes and (match_start + query_len) <= #c_line then
-                    table.insert(extmarks, { c_row, match_start, match_start + query_len, "ZeroSearchMatch" })
+                if match.col > 0 and match_start >= prefix_bytes and (match_start + match_len) <= #c_line then
+                    table.insert(extmarks, { c_row, match_start, match_start + match_len, "ZeroSearchMatch" })
                 end
             end
         end
 
-        -- Add separator between file groups (but not after the last one)
         if fi < #session.files then
             table.insert(display_lines, "")
             table.insert(session.nodes, { type = "spacer" })
@@ -228,7 +289,6 @@ function M.render_tree()
         vim.api.nvim_set_option_value("modifiable", false, { buf = buf })
 
         if M.last_selected_index > 0 then
-            -- Restore last position: wait until enough nodes arrive
             if #session.nodes >= M.last_selected_index then
                 M.set_selection(M.last_selected_index)
                 M.last_selected_index = 0
@@ -236,53 +296,9 @@ function M.render_tree()
         elseif session.selected_index == 0 and #session.nodes > 0 then
             M.set_selection(1)
         else
-            -- re-clamp selection
             M.set_selection(session.selected_index)
         end
     end
-end
-
-function M.on_chunk(session_id, lines)
-    local session = M.current_session
-    if not session or session.id ~= session_id then return end
-
-    local changed = false
-    for _, line in ipairs(lines) do
-        local file, lnum, col, text = line:match("^([^:]+):(%d+):(%d+):(.*)$")
-        if file then
-            if not session.file_map[file] then
-                local new_file = { file = file, expanded = true, matches = {} }
-                session.file_map[file] = new_file
-                table.insert(session.files, new_file)
-            end
-            table.insert(session.file_map[file].matches, {
-                lnum = tonumber(lnum),
-                col = tonumber(col),
-                text = text,
-            })
-            changed = true
-        end
-    end
-
-    if changed then M.render_tree() end
-end
-
-function M.on_end(session_id)
-    local session = M.current_session
-    if not session or session.id ~= session_id then return end
-    if #session.files == 0 then M.render_tree() end
-    -- If last_selected_index still pending (results fewer than expected), clamp to last node
-    if M.last_selected_index > 0 and #session.nodes > 0 then
-        M.set_selection(#session.nodes)
-        M.last_selected_index = 0
-    end
-end
-
-function M.on_error(session_id, error_msg)
-    local session = M.current_session
-    if not session or session.id ~= session_id then return end
-    local msg = error_msg:gsub("^sh: %d+: ", "")
-    vim.notify("ZeroSearch Error: " .. msg, vim.log.levels.ERROR)
 end
 
 function M.toggle_fold()
@@ -301,7 +317,6 @@ function M.update_preview()
 
     local node = session.nodes[session.selected_index]
 
-    -- Clear preview if spacer or invalid
     if not node or node.type == "spacer" then
         if vim.api.nvim_buf_is_valid(session.preview_buf) then
             vim.api.nvim_set_option_value("modifiable", true, { buf = session.preview_buf })
@@ -349,7 +364,6 @@ function M.update_preview()
             vim.api.nvim_win_call(win, function() vim.cmd("normal! zz") end)
 
             pcall(vim.api.nvim_buf_clear_namespace, session.preview_buf, session.ns, 0, -1)
-            -- Highlight the matched line if it's a match node
             if node.type == "match" then
                 pcall(vim.api.nvim_buf_add_highlight, session.preview_buf, session.ns, "Search", lnum - 1, 0, -1)
             end
@@ -364,7 +378,6 @@ function M.set_selection(idx)
     if idx < 1 then idx = 1 end
     if idx > #session.nodes then idx = #session.nodes end
 
-    -- Skip spacer nodes when navigating
     if session.nodes[idx].type == "spacer" then
         if idx > session.selected_index and idx < #session.nodes then
             idx = idx + 1
@@ -394,18 +407,29 @@ function M.set_selection(idx)
     M.update_preview()
 end
 
+-- 取消任何在飞的搜索（远程 cmd.stream 或本地 jobstart）
+local function cancel_inflight(session)
+    if session.job_id then
+        pcall(vim.fn.jobstop, session.job_id)
+        session.job_id = nil
+    end
+    if session.stream_sid then
+        pcall(cmd.cancel, session.stream_sid)
+        session.stream_sid = nil
+    end
+    session._local_parser = nil
+end
+
 function M.close_ui()
     local session = M.current_session
     if not session then return end
+    cancel_inflight(session)
     local wins = { session.path_win, session.input_win, session.results_win, session.preview_win }
     for _, win in ipairs(wins) do
         if vim.api.nvim_win_is_valid(win) then vim.api.nvim_win_close(win, true) end
     end
     for _, buf in ipairs({ session.path_buf, session.input_buf, session.results_buf, session.preview_buf }) do
         if vim.api.nvim_buf_is_valid(buf) then vim.api.nvim_buf_delete(buf, { force = true }) end
-    end
-    if session.job_id then
-        pcall(vim.fn.jobstop, session.job_id)
     end
     if session.timer then
         session.timer:stop()
@@ -431,11 +455,15 @@ function M.execute_search(case_sensitive, whole_word)
     M.last_whole_word = whole_word
     M.last_file_types = (session.toggle_state and session.toggle_state.file_types) or {}
 
+    cancel_inflight(session)
+
     session.query = query
     session.files = {}
     session.file_map = {}
     session.nodes = {}
     session.selected_index = 0
+    session._stderr_buf = nil
+    session._parse_errors = 0
 
     if vim.api.nvim_buf_is_valid(session.results_buf) then
         vim.api.nvim_set_option_value("modifiable", true, { buf = session.results_buf })
@@ -453,59 +481,102 @@ function M.execute_search(case_sensitive, whole_word)
     if query == "" or path == "" then return end
 
     session.id = tostring(vim.loop.now())
+    local sid_capture = session.id
 
     local file_types = (session.toggle_state and session.toggle_state.file_types) or {}
+    local rg_args = build_rg_args(query, path, case_sensitive, whole_word, file_types)
 
-    -- Separate rg built-in types from custom extensions
-    local rg_builtin = {
-        c = true, cpp = true, css = true, go = true, h = true, html = true,
-        java = true, js = true, json = true, lua = true, md = true, py = true,
-        rust = true, sh = true, sql = true, toml = true, ts = true, txt = true,
-        xml = true, yaml = true,
-    }
-    local builtin_list = {}
-    local glob_list = {}
-    for _, ft in ipairs(file_types) do
-        if rg_builtin[ft] then
-            table.insert(builtin_list, ft)
-        else
-            table.insert(glob_list, ft)
+    local function on_event(ev)
+        if M.current_session ~= session or session.id ~= sid_capture then return end
+        local kind = ev.kind
+        if kind == "match" then
+            local f = ev.file
+            if not session.file_map[f] then
+                local nf = { file = f, expanded = true, matches = {} }
+                session.file_map[f] = nf
+                table.insert(session.files, nf)
+            end
+            table.insert(session.file_map[f].matches, {
+                lnum = ev.lnum,
+                col = ev.col,
+                text = ev.text,
+                match_len = ev.match_len,
+            })
+            schedule_render(session)
+        elseif kind == "stderr" then
+            session._stderr_buf = (session._stderr_buf or "") .. ev.text
+        elseif kind == "parse_error" then
+            session._parse_errors = (session._parse_errors or 0) + 1
+        end
+        -- file_begin / file_end 忽略：match 上来时 lazy 创建条目
+    end
+
+    local function on_done(code, reason)
+        if M.current_session ~= session or session.id ~= sid_capture then return end
+        session.job_id = nil
+        session.stream_sid = nil
+        session._local_parser = nil
+
+        if reason == "aborted" or reason == "cancelled" then return end
+
+        -- rg 退出码：0 = 有匹配；1 = 无匹配；>=2 真错误
+        if code and code >= 2 and session._stderr_buf and #session._stderr_buf > 0 then
+            local msg = session._stderr_buf:gsub("^sh: %d+: ", "")
+            vim.notify("ZeroSearch Error: " .. msg, vim.log.levels.ERROR)
+        end
+        if (session._parse_errors or 0) > 0 and #session.files == 0 then
+            vim.notify(
+                ("ZeroSearch: rg --json 解析失败 %d 行（远端 rg 可能太老或不存在）"):format(
+                    session._parse_errors),
+                vim.log.levels.WARN)
+        end
+
+        M.render_tree()
+        if M.last_selected_index > 0 and #session.nodes > 0 then
+            M.set_selection(math.min(M.last_selected_index, #session.nodes))
+            M.last_selected_index = 0
         end
     end
 
     if session.is_local then
-        if session.job_id then pcall(vim.fn.jobstop, session.job_id) end
-        local args = { "rg", "--line-number", "--column", "--no-heading", "--color=never", "--with-filename" }
-        if case_sensitive then table.insert(args, "--case-sensitive") else table.insert(args, "--ignore-case") end
-        if whole_word then table.insert(args, "--word-regexp") end
-        for _, ft in ipairs(builtin_list) do
-            table.insert(args, "--type")
-            table.insert(args, ft)
-        end
-        for _, ft in ipairs(glob_list) do
-            table.insert(args, "--glob")
-            table.insert(args, "*." .. ft)
-        end
-        table.insert(args, query)
-        table.insert(args, path)
-
-        session.job_id = vim.fn.jobstart(args, {
-            on_stdout = function(j, data, e)
-                if not data or #data == 0 or (#data == 1 and data[1] == "") then return end
-                M.on_chunk(session.id, data)
+        local parser = rg_parser.new()
+        session._local_parser = parser
+        session.job_id = vim.fn.jobstart(rg_args, {
+            on_stdout = function(_, data)
+                if not data or #data == 0 then return end
+                local events = parser:feed(table.concat(data, "\n"))
+                if events then for _, ev in ipairs(events) do on_event(ev) end end
             end,
-            on_exit = function(j, exit_code, e)
-                M.on_end(session.id)
+            on_stderr = function(_, data)
+                if not data or #data == 0 then return end
+                local s = table.concat(data, "\n")
+                if #s > 0 then on_event({ kind = "stderr", text = s }) end
+            end,
+            on_exit = function(_, code)
+                if session._local_parser == parser then
+                    local tail = parser:finalize() or {}
+                    for _, ev in ipairs(tail) do on_event(ev) end
+                end
+                on_done(code, nil)
             end,
         })
     else
-        -- Format: "type:lua,rust;glob:vue,svelte"
-        local parts = {}
-        if #builtin_list > 0 then table.insert(parts, "type:" .. table.concat(builtin_list, ",")) end
-        if #glob_list > 0 then table.insert(parts, "glob:" .. table.concat(glob_list, ",")) end
-        local types_str = table.concat(parts, ";")
-        vim.fn.rpcrequest(session.chan, "global_search", session.user, session.host, session.port, path, query,
-            session.id, case_sensitive or false, whole_word or false, types_str)
+        local target = { user = session.user, host = session.host, port = session.port }
+        local sid, err = cmd.stream(target, {
+            argv = wrap_remote_argv(rg_args),
+            parser = rg_parser.new(),
+            owner_buf = session.results_buf,
+        }, {
+            on_event = on_event,
+            on_exit = function(code, _signal, reason, _dur)
+                on_done(code, reason)
+            end,
+        })
+        if not sid then
+            vim.notify("ZeroSearch: cmd.stream failed: " .. tostring(err), vim.log.levels.ERROR)
+            return
+        end
+        session.stream_sid = sid
     end
 end
 
@@ -535,13 +606,11 @@ function M.open_ui(opts)
             vim.notify("ZeroNvim: Cannot connect to daemon for search", vim.log.levels.ERROR)
             return
         end
-        opts.chan = chan
         title_prefix = string.format("%s@%s:%s", opts.user, opts.host, opts.port)
     end
 
     M.current_session = {
         is_local = opts.is_local,
-        chan = opts.chan,
         user = opts.user,
         host = opts.host,
         port = opts.port,
@@ -591,7 +660,7 @@ function M.open_ui(opts)
         on_select_prev = function()
             if M.current_session and M.current_session.selected_index then
                 if M.current_session.selected_index <= 1 then
-                    return true -- Signal to focus query input
+                    return true
                 else
                     M.set_selection(M.current_session.selected_index - 1)
                     return false
@@ -601,7 +670,6 @@ function M.open_ui(opts)
         end
     })
 
-    -- Restore last search state
     if M.last_query and M.last_query ~= "" then
         vim.api.nvim_buf_set_lines(ui_state.input_buf, 0, -1, false, { M.last_query })
         vim.api.nvim_win_set_cursor(ui_state.input_win, { 1, #M.last_query })
@@ -619,14 +687,11 @@ function M.open_ui(opts)
         if ui_state.update_path_footer then ui_state.update_path_footer() end
     end
 
-    -- Merge the UI objects directly into our session state for update_preview() and close_ui() access
     for k, v in pairs(ui_state) do
         M.current_session[k] = v
     end
 
-    -- If restoring previous state, focus results and trigger search immediately
     if M.last_query and M.last_query ~= "" then
-        -- Stop debounce timers to prevent duplicate search from buf_set_lines triggers
         if M.current_session.timer1 then M.current_session.timer1:stop() end
         if M.current_session.timer2 then M.current_session.timer2:stop() end
         vim.cmd("stopinsert")
