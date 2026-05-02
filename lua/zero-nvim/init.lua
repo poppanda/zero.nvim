@@ -521,6 +521,40 @@ function M.setup(opts)
         })
     end
 
+    -- oil 把 win-local 的 signcolumn / wrap / foldcolumn / list / conceallevel 等
+    -- 钉到 window 上 (lua/oil/view.lua:set_win_options)。从 oil 目录列表选文件后
+    -- buffer 切了，但 window-local 选项没切 —— 最直观的副作用是 gitsigns 因为
+    -- signcolumn="no" 检测到没有 sign 列、attach 直接跳过；wrap=false 也会让
+    -- markdown 等期望换行的 ftplugin 失效。
+    --
+    -- 仅在 explorer="oil" 模式下注册：其它模式根本没人跑 set_win_options，
+    -- 多余的 reset 反而会在 BufReadCmd 路径里把用户 ftplugin 的 setlocal 抹掉。
+    -- 跳过目录 buffer（zero://.../）—— 那是 oil 自己的列表，保留它的样式。
+    --
+    -- 注册顺序：放在下面 filetype-detection BufWinEnter **之前**。oil 流里
+    -- filetype 是经 FileType=oil 拦截器 vim.schedule 后才设到正确值，那时
+    -- ftplugin 才真正跑 setlocal —— 那次 setlocal 在我们的 reset 之后，
+    -- per-filetype 选项不会被复位掉。
+    if options.explorer == "oil" then
+        local oil_overridden_winopts = {
+            "signcolumn", "wrap", "cursorcolumn", "foldcolumn",
+            "spell", "list", "conceallevel", "concealcursor",
+        }
+        vim.api.nvim_create_autocmd("BufWinEnter", {
+            pattern = "zero://*",
+            group = group,
+            callback = function(args)
+                if args.file:match("/$") then return end
+                local win = vim.api.nvim_get_current_win()
+                if vim.api.nvim_win_get_buf(win) ~= args.buf then return end
+                for _, opt in ipairs(oil_overridden_winopts) do
+                    local default = vim.api.nvim_get_option_value(opt, { scope = "global" })
+                    vim.api.nvim_set_option_value(opt, default, { scope = "local", win = win })
+                end
+            end,
+        })
+    end
+
     -- Set filetype when a zero:// buffer first enters a window without one.
     -- Placed OUTSIDE the oil guard deliberately: BufReadCmd only runs when
     -- explorer ~= "oil", but BufWinEnter must run for oil users too.
