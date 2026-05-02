@@ -46,14 +46,18 @@ pub fn handle_cmd_sync(
     let cmd = parse_spec(spec)?;
     let out = run_sync(user, host, port, &cmd, state)?;
 
+    // stdout/stderr 用 String 而非 Binary：nvim 内部 RPC 把 bin 解成 vim.Blob
+    // (userdata)，传给 fnamemodify / vim.split 触发 E976 / 切出 Blob 切片。
+    // git 输出 99% 是 UTF-8 文本，from_utf8_lossy 处理偶发非 UTF-8 字节
+    // （替换为 U+FFFD）。同 cmd_stream 的 sink 改动。
     Ok(Value::Map(vec![
         (
             Value::String("stdout".into()),
-            Value::Binary(out.stdout),
+            Value::String(String::from_utf8_lossy(&out.stdout).into_owned().into()),
         ),
         (
             Value::String("stderr".into()),
-            Value::Binary(out.stderr),
+            Value::String(String::from_utf8_lossy(&out.stderr).into_owned().into()),
         ),
         (
             Value::String("code".into()),
@@ -97,8 +101,17 @@ pub fn handle_cmd_stream(
     let sink = move |ev: CommandEvent| {
         let kind = ev.kind();
         let payload = match ev {
-            CommandEvent::Stdout(b) => Value::Binary(b),
-            CommandEvent::Stderr(b) => Value::Binary(b),
+            // 用 String 而非 Binary 发 stdout/stderr：nvim 内部 msgpack-rpc
+            // 把 bin 解成 vim.Blob (userdata)，传给 fnamemodify 等 vim 函数
+            // 触发 E976。git 输出 99% 是 UTF-8 文本，from_utf8_lossy 处理偶
+            // 发非 UTF-8 字节（替换为 U+FFFD）。gitsigns 的 binary baseline
+            // 走 NUL-byte 探测路径，对 lossy 转换不敏感。
+            CommandEvent::Stdout(b) => Value::String(
+                String::from_utf8_lossy(&b).into_owned().into(),
+            ),
+            CommandEvent::Stderr(b) => Value::String(
+                String::from_utf8_lossy(&b).into_owned().into(),
+            ),
             CommandEvent::Exit {
                 code,
                 signal,

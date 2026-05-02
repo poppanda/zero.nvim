@@ -78,9 +78,17 @@ local function get_daemon_chan()
             state.remote_homes = {}
         end,
         on_stderr = function(_, data)
+            -- 调试模式：daemon stderr 同时 tee 到文件，方便 panic / SIGPIPE 死亡时
+            -- 事后回看（vim.notify 历史可能被 :messages 截掉）。开关通过环境变量。
+            local debug_log = os.getenv("ZERO_NVIM_DEBUG") and "/tmp/zero-daemon.log" or nil
+            local f = debug_log and io.open(debug_log, "a") or nil
             for _, line in ipairs(data) do
-                if line ~= "" then logger("Daemon: " .. line, vim.log.levels.WARN) end
+                if line ~= "" then
+                    logger("Daemon: " .. line, vim.log.levels.WARN)
+                    if f then f:write(os.date("%H:%M:%S ") .. line .. "\n") end
+                end
             end
+            if f then f:close() end
         end,
     })
     return state.channel_id
@@ -1104,6 +1112,11 @@ function M.setup(opts)
     -- files. Requires the forked gitsigns that exposes `gitsigns.backends`;
     -- with upstream gitsigns this is a silent no-op (local files unaffected).
     require("zero-nvim.gitsigns.backend").setup(options.gitsigns)
+
+    -- Register the neogit data/process-layer backend so :Neogit on remote
+    -- repos routes git execution to the daemon. Requires the forked neogit
+    -- that exposes `neogit.backends`; upstream neogit silently skips.
+    require("zero-nvim.neogit.backend").setup(options.neogit)
 end
 
 return M
