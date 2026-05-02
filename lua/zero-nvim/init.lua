@@ -11,6 +11,14 @@ local defaults = {
         prefix = "ZeroNvim: ",
     },
     explorer = "builtin",
+    gitsigns = {
+        -- 远端没有 .git/HEAD 文件监听，靠事件 + 可选轮询代偿。详见
+        -- lua/zero-nvim/gitsigns/refresh.lua 头部注释。
+        refresh = {
+            debounce_ms = 300, -- 事件触发的 debounce + in-flight 释放节奏
+            poll_ms = 0,       -- 0 = 关闭轮询；> 0 时每 poll_ms 检查一次
+        },
+    },
 }
 
 -- 插件内部状态
@@ -1061,7 +1069,7 @@ function M.setup(opts)
     -- git repos get the same diff signs / hunk navigation / blame as local
     -- files. Requires the forked gitsigns that exposes `gitsigns.backends`;
     -- with upstream gitsigns this is a silent no-op (local files unaffected).
-    require("zero-nvim.gitsigns.backend").setup()
+    require("zero-nvim.gitsigns.backend").setup(options.gitsigns)
 end
 
 return M

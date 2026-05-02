@@ -150,16 +150,24 @@ end
 
 --- 把 backend 注册到 fork 版 gitsigns。fork 提供 `gitsigns.backends` 模块。
 --- 如果用户装的是 upstream gitsigns（没这个模块），静默跳过——本地仍可用。
-function M.setup()
+---
+--- opts: { refresh = { debounce_ms?, poll_ms? } } —— 透传给 refresh 子模块。
+--- refresh 不依赖 backends 注册成功（autocmd 永远要装，本地 fallback 也好用），
+--- 所以即使上面 pcall 失败也照常 setup。
+---@param opts table?
+function M.setup(opts)
+    opts = opts or {}
     local ok, backends = pcall(require, "gitsigns.backends")
-    if not ok then return end
-    backends.register({
-        id = "zero",
-        pattern = "^zero://",
-        detect = M.detect,
-        resolve_path = M.resolve_path,
-        system = M.system,
-    })
+    if ok then
+        backends.register({
+            id = "zero",
+            pattern = "^zero://",
+            detect = M.detect,
+            resolve_path = M.resolve_path,
+            system = M.system,
+        })
+    end
+    require("zero-nvim.gitsigns.refresh").setup(opts.refresh)
 end
 
 return M
