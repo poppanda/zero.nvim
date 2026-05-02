@@ -48,18 +48,66 @@ pub fn handle_connect(
     let sess = open_session(user, host, port, password, ssh_config.as_ref())?;
 
     // ── 保存会话；缓存若已存在则保留（自动重连时不应清空目录缓存）──
-    let mut state_lock = state.lock().unwrap();
-    state_lock
-        .sessions
-        .insert(key.clone(), Arc::new(Mutex::new(ConnSession::new(sess))));
-    state_lock
-        .caches
-        .entry(key.clone())
-        .or_insert_with(|| ProjectCache {
-            directories: HashMap::new(),
-        });
+    {
+        let mut state_lock = state.lock().unwrap();
+        state_lock
+            .sessions
+            .insert(key.clone(), Arc::new(Mutex::new(ConnSession::new(sess))));
+        // 进到这一段意味着刚做了一次完整 SSH 握手 —— 要么首次连接、要么 with_conn
+        // 探测到旧 SFTP session 已死后调用了我们。这两种情况下，之前缓存的 exec
+        // session（如果有）也很可能跟着 TCP 一起断了。直接丢弃，让 schedule_exec_warm
+        // 跑后台预热重建一条。
+        state_lock.exec_sessions.remove(&key);
+        state_lock
+            .caches
+            .entry(key.clone())
+            .or_insert_with(|| ProjectCache {
+                directories: HashMap::new(),
+            });
+    } // 释放 state_lock 之后再启动后台预热线程，避免锁交叉
     eprintln!("Daemon: 已连接 {}", key);
+
+    schedule_exec_warm(user, host, port, state);
     Ok(Value::Boolean(true))
+}
+
+/// 后台预热该 target 的 exec session：连接成功后立刻起一条线程做 SSH 握手 +
+/// 缓存好备用，让用户第一条 `cmd.stream`（典型场景：`:Neogit` 触发的 git 命令）
+/// 不必再付一次 200-500ms 握手代价。
+///
+/// 故意非阻塞：connect RPC 立刻返回，预热在后台跑——失败也只打日志，首条
+/// cmd.stream 会自己走 `borrow_exec_session` 重试。
+///
+/// 若 exec session 已缓存则直接 no-op；handle_connect 在调用本函数前已经把
+/// 老条目清掉，所以这种情况只会出现在 schedule 重入（理论上不会发生）。
+fn schedule_exec_warm(
+    user: &str,
+    host: &str,
+    port: u16,
+    state: &Arc<Mutex<DaemonState>>,
+) {
+    let key = DaemonState::connection_key(user, host, port);
+    {
+        let st = state.lock().unwrap();
+        if st.exec_sessions.contains_key(&key) {
+            return;
+        }
+    }
+    let user = user.to_string();
+    let host = host.to_string();
+    let state = state.clone();
+    std::thread::spawn(move || {
+        match borrow_exec_session(&user, &host, port, &state) {
+            Ok(_) => eprintln!(
+                "Daemon: exec session 预热完成 {}@{}:{}",
+                user, host, port
+            ),
+            Err(e) => eprintln!(
+                "Daemon: exec session 预热失败 {}@{}:{}: {} (首次 cmd.stream 会重试)",
+                user, host, port, e
+            ),
+        }
+    });
 }
 
 /// 给流式命令使用的独占 Session。
@@ -80,6 +128,62 @@ pub fn open_dedicated_session(
         state_lock.ssh_config.clone()
     };
     open_session(user, host, port, None, ssh_config.as_ref())
+}
+
+/// 取（或惰性创建）该 target 的 exec session（流式命令复用池）。
+///
+/// 第一次调用对该 target 付一次 SSH 握手开销（TCP + 协议握手 + 认证 ≈ 200-500ms）；
+/// 后续 `cmd.stream` 共用此 Session，仅做 `channel_session()` 协议级轻量协商。
+/// 对 `:Neogit` 这种打开瞬间触发 6+ git 命令的场景，理论加速 3-5×。
+///
+/// 返回 `Arc<Mutex<Session>>`：调用方持锁的整个 duration 内独占该 Session。
+/// libssh2 不支持同会话并发 channel ops，必须串行化。Lua-side `target_gates`
+/// 已经把同 target 的 cmd.stream 调用排队到 1 路，所以 daemon 端 mutex 实际
+/// 上没有竞争。
+pub fn borrow_exec_session(
+    user: &str,
+    host: &str,
+    port: u16,
+    state: &Arc<Mutex<DaemonState>>,
+) -> Result<Arc<Mutex<Session>>, anyhow::Error> {
+    let key = DaemonState::connection_key(user, host, port);
+
+    // 已缓存：直接返回 Arc 克隆
+    {
+        let st = state.lock().unwrap();
+        if let Some(arc) = st.exec_sessions.get(&key) {
+            return Ok(arc.clone());
+        }
+    }
+
+    // 未缓存：建新 session（不持 state 锁完成握手）
+    let sess = open_dedicated_session(user, host, port, state)?;
+    let arc = Arc::new(Mutex::new(sess));
+
+    // 双检：握手期间可能被其他线程抢先填了
+    let mut st = state.lock().unwrap();
+    if let Some(existing) = st.exec_sessions.get(&key) {
+        // 抢先存在：丢弃我们刚建的，用已有的
+        return Ok(existing.clone());
+    }
+    st.exec_sessions.insert(key, arc.clone());
+    eprintln!("Daemon: exec session 已建立 {}@{}:{}", user, host, port);
+    Ok(arc)
+}
+
+/// 把 target 的 exec session 从缓存里移除：下次 borrow 会重新握手。
+/// 在 `is_session_dead` 命中（broken pipe / socket disconnect）时调用。
+pub fn drop_exec_session(
+    user: &str,
+    host: &str,
+    port: u16,
+    state: &Arc<Mutex<DaemonState>>,
+) {
+    let key = DaemonState::connection_key(user, host, port);
+    let mut st = state.lock().unwrap();
+    if st.exec_sessions.remove(&key).is_some() {
+        eprintln!("Daemon: exec session 已丢弃 {} (将于下次 cmd.stream 重建)", key);
+    }
 }
 
 /// 实际打开会话：TCP 连接 + handshake + 认证。

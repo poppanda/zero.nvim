@@ -57,6 +57,16 @@ pub struct DaemonState {
     pub ssh_config: Option<SshConfig>,
     /// 流式命令注册表：session_id → 句柄。供 cmd_cancel RPC 查询。
     pub running_commands: Arc<Mutex<crate::cmd::CmdRegistry>>,
+    /// 流式命令复用的 SSH 会话池，key 格式: "user@host:port"
+    ///
+    /// 与 `sessions`（SFTP 共享池）解耦：避免长跑 git 命令霸占 SFTP / read_dir
+    /// 的 mutex。每个 target 缓存 1 个 Session，所有 cmd_stream 复用，第一条命令
+    /// 付一次 SSH 握手开销，后续只是 channel_session() 协议轻量协商（毫秒级）。
+    ///
+    /// libssh2 不支持同会话多线程并发开 channel —— 这里靠 Mutex 串行化。
+    /// Lua-side `target_gates` 已经把 cmd.stream 调用串行化到 1 个/target，所以
+    /// daemon 端 mutex 不会成为新瓶颈。
+    pub exec_sessions: HashMap<String, Arc<Mutex<Session>>>,
 }
 
 impl DaemonState {
@@ -68,6 +78,7 @@ impl DaemonState {
             caches: HashMap::new(),
             ssh_config,
             running_commands: Arc::new(Mutex::new(crate::cmd::CmdRegistry::new())),
+            exec_sessions: HashMap::new(),
         }
     }
 
@@ -166,7 +177,7 @@ impl DaemonState {
 /// 只匹配真正"socket 已死"的错误码，避免把协议层短暂错误（KEX_FAILURE / PROTO /
 /// BAD_USE）当成断连——那些错误下旧会话往往还能继续工作，重连反而会引入幂等
 /// 性问题（例如流式搜索的重复输出）。
-fn is_session_dead(err: &anyhow::Error) -> bool {
+pub fn is_session_dead(err: &anyhow::Error) -> bool {
     // 沿 source chain 查找具体类型 — 当 handler 用 `.context()` 包裹时有效
     for cause in err.chain() {
         if let Some(io_err) = cause.downcast_ref::<std::io::Error>() {

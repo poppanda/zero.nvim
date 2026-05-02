@@ -18,8 +18,8 @@ use crate::cmd::cancel::{try_extract_pid, CancelToken};
 use crate::cmd::registry::CmdHandle;
 use crate::cmd::spec::{ConnTarget, RemoteCommand};
 use crate::cmd::CommandEvent;
-use crate::connect::open_dedicated_session;
-use crate::state::DaemonState;
+use crate::connect::{borrow_exec_session, drop_exec_session};
+use crate::state::{is_session_dead, DaemonState};
 use anyhow::Context;
 use std::io::{ErrorKind, Read, Write};
 use std::sync::{Arc, Mutex};
@@ -71,6 +71,12 @@ where
                 }
             }
             Err(e) => {
+                // 缓存的 exec session 可能已死（broken pipe / socket disconnect 等）：
+                // 丢掉缓存，让下条命令重新握手。其他错误（git 命令本身报错、cancel
+                // 等）保留缓存继续复用。
+                if is_session_dead(&e) {
+                    drop_exec_session(&target.user, &target.host, target.port, &state);
+                }
                 if cancel.is_cancelled() {
                     sink(CommandEvent::Aborted {
                         reason: format!("cancelled: {}", e),
@@ -108,9 +114,20 @@ fn run_inner<S>(
 where
     S: Fn(CommandEvent) + Send + Sync + 'static,
 {
-    // 1. 开独占 Session（blocking + 10s timeout 用于握手）
-    let session = open_dedicated_session(&target.user, &target.host, target.port, state)
-        .context("Failed to open dedicated session")?;
+    // 1. 借用复用的 exec Session（首次握手付一次 ≈ 200-500ms；后续命令直接命中缓存）。
+    //    注意：session-dead 错误的清理由外层 run_streaming 检查 result 时统一做，
+    //    这里返回 Err 即可。
+    let session_arc =
+        borrow_exec_session(&target.user, &target.host, target.port, state)
+            .context("Failed to borrow exec session")?;
+    let session = session_arc
+        .lock()
+        .map_err(|_| anyhow::anyhow!("exec session mutex poisoned"))?;
+
+    // 上一条命令结束时把 session 切到了 non-blocking + timeout=0。
+    // 在 channel_session / exec / write_all 阶段需要 blocking，重置回来。
+    session.set_blocking(true);
+    session.set_timeout(10000);
 
     // 2. 准备 channel（仍 blocking，方便 exec）
     let mut channel = session
