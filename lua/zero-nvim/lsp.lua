@@ -292,38 +292,15 @@ ensure_lsp_client = function(user, host, port, root_dir, server_name, cmd_args, 
             clear_lock()
             local entry = restart.entry(client_id_arg)
             local attached = attached_buffers(client_id_arg)
-            restart.remove_active(client_id_arg)
+            local action = restart.resolve_exit(client_id_arg, entry, attached, code)
 
-            if restart.consume_stale_exit(client_id_arg) then
-                restart.consume_pending_transport_restart(client_id_arg)
-                restart.consume_intentional_stop(client_id_arg)
+            if action.kind == "ignore" then
                 return
             end
 
-            local pending = restart.consume_pending_transport_restart(client_id_arg)
-            if pending then
-                restart_from_entry(client_id_arg, pending.entry or entry, pending.attached or attached, pending.reason)
-                return
-            end
-
-            if restart.consume_intentional_stop(client_id_arg) then
+            if action.kind == "notify_exit" then
                 vim.schedule(function()
-                    vim.notify(string.format(
-                        "ZeroNvim: LSP '%s' exited (code=%s, signal=%s)",
-                        lsp_name, tostring(code), tostring(signal)), vim.log.levels.INFO)
-                end)
-                return
-            end
-
-            -- 没注册过 → 没法重启，只通知。注意：不再把 code==0 当 "正常退出"
-            -- 而短路。SSH 闲置超时时远端先发 FIN，本地 ssh 子进程以 code=0
-            -- 干净退出，daemon 关掉 LSP proxy 的 TCP socket，Neovim rpc 端看到
-            -- stream 正常关闭、on_exit(0) 触发。上一版在这里 return 会导致
-            -- 长时间后所有 gd 报 "method not supported"。用户主动 stop 走
-            -- :ZeroLspStop（设置 intentional stop marker）已经在上面拦掉了。
-            if not entry then
-                vim.schedule(function()
-                    local level = (code == 0 or code == nil) and vim.log.levels.INFO or vim.log.levels.WARN
+                    local level = action.level == "warn" and vim.log.levels.WARN or vim.log.levels.INFO
                     vim.notify(string.format(
                         "ZeroNvim: LSP '%s' exited (code=%s, signal=%s)",
                         lsp_name, tostring(code), tostring(signal)), level)
@@ -331,26 +308,24 @@ ensure_lsp_client = function(user, host, port, root_dir, server_name, cmd_args, 
                 return
             end
 
-            restart_from_entry(client_id_arg, entry, attached,
-                code == 0 and "连接断开 (EOF)" or "异常退出")
+            if action.kind == "restart" then
+                -- resolve_exit deliberately restarts registered clients even on
+                -- code=0: idle SSH disconnects can look like clean EOF locally.
+                restart_from_entry(client_id_arg, action.entry, action.attached, action.reason)
+            end
         end,
         on_error = function(code, err2)
             if is_transport_error(code, err2) and client_id then
                 local entry = restart.entry(client_id)
-                if entry and not restart.is_intentional_stop(client_id) then
-                    restart.set_pending_transport_restart(client_id, {
-                        entry = entry,
-                        attached = attached_buffers(client_id),
-                        reason = "连接断开",
-                    })
+                if restart.queue_transport_restart(client_id, entry, attached_buffers(client_id), "连接断开") then
                     local client = vim.lsp.get_client_by_id(client_id)
                     if client and client.stop then
                         pcall(client.stop, true)
                     end
                     vim.defer_fn(function()
-                        if restart.entry(client_id) and restart.pending_transport_restart(client_id) then
-                            local pending = restart.consume_pending_transport_restart(client_id)
-                            restart_from_entry(client_id, pending.entry, pending.attached, pending.reason)
+                        local action = restart.resolve_transport_fallback(client_id)
+                        if action.kind == "restart" then
+                            restart_from_entry(client_id, action.entry, action.attached, action.reason)
                         end
                     end, 3000)
                     return
