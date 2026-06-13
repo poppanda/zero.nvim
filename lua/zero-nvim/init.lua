@@ -43,6 +43,7 @@ local function logger(msg, level)
 end
 
 local uri_helpers = require("zero-nvim.uri")
+local client_select = require("zero-nvim.lsp.client_select")
 
 function M.parse_uri(uri)
     return uri_helpers.parse(uri)
@@ -199,60 +200,7 @@ function M.set_python_path(user, host, port, path)
     state.python_paths[string.format("%s@%s:%s", user, host, port)] = path
 end
 
-local function common_path_components(a, b)
-    local n, pa, pb = 0, 1, 1
-    while pa <= #a and pb <= #b do
-        local ea = a:find("/", pa, true) or (#a + 1)
-        local eb = b:find("/", pb, true) or (#b + 1)
-        if a:sub(pa, ea - 1) ~= b:sub(pb, eb - 1) then break end
-        n = n + 1
-        pa, pb = ea + 1, eb + 1
-    end
-    return n
-end
-
-local function select_lsp_clients_for_path(clients, target_self, fpath)
-    local best_by_name = {}
-    local best_root_len = {}
-    local fallback_by_name = {}
-    local fallback_score = {}
-
-    for _, client in ipairs(clients or {}) do
-        local cfg = client.config
-        if client.name
-            and client.name:match("^zero%-")
-            and cfg
-            and cfg._zero_target == target_self
-            and not (client.is_stopped and client.is_stopped()) then
-            local croot = cfg.root_dir
-            if croot then
-                croot = croot:gsub("/+$", "")
-                if fpath == croot or fpath:find(croot .. "/", 1, true) == 1 then
-                    if (best_root_len[client.name] or -1) < #croot then
-                        best_by_name[client.name] = client
-                        best_root_len[client.name] = #croot
-                    end
-                else
-                    local score = common_path_components(croot, fpath)
-                    if (fallback_score[client.name] or -1) < score then
-                        fallback_by_name[client.name] = client
-                        fallback_score[client.name] = score
-                    end
-                end
-            end
-        end
-    end
-
-    for cname, client in pairs(fallback_by_name) do
-        if not best_by_name[cname] then
-            best_by_name[cname] = client
-        end
-    end
-
-    return best_by_name
-end
-
-M._test_select_lsp_clients_for_path = select_lsp_clients_for_path
+M._test_select_lsp_clients_for_path = client_select.select_attach_clients_for_path
 
 function M.get_entries(user, host, port, path)
     local chan, err = M.ensure_connection(user, host, port)
@@ -898,7 +846,7 @@ function M.setup(opts)
                         -- 公共目录组件最多的（"最近的项目"）。
                         logger("ZeroNvim: Checking auto-attach for buffer " .. bnum .. " (" .. fpath .. ")", vim.log.levels.DEBUG)
                         local target_self = string.format("%s@%s:%d", u, h, p)
-                        local best_by_name = select_lsp_clients_for_path(vim.lsp.get_clients(), target_self, fpath)
+                        local best_by_name = client_select.select_attach_clients_for_path(vim.lsp.get_clients(), target_self, fpath)
                         for cname, client in pairs(best_by_name) do
                             local same_name_attached = vim.lsp.get_clients({ bufnr = bnum, name = cname })
                             if #same_name_attached == 0 then

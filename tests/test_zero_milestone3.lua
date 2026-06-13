@@ -19,6 +19,7 @@ local function run_test()
                 { name = "subdir", type = "directory" }
             }
         end
+        if method == "fetch_path" then return { "directory" } end
         return true
     end
     vim.rpcnotify = function(chan, method, ...)
@@ -28,28 +29,28 @@ local function run_test()
     remote.setup()
 
     local buf = vim.api.nvim_create_buf(true, false)
-    local uri = "remote://user@localhost:/home/user/project"
+    local uri = "zero://user@localhost:22/home/user/project"
     vim.api.nvim_buf_set_name(buf, uri)
 
     -- Trigger fetch
     remote.handle_fetch(buf, "user", "localhost", 22, "/home/user/project")
 
     -- Verify RPC calls
-    local found_stat = false
+    local found_fetch_path = false
     local found_readdir = false
     local found_scan = false
 
     for _, call in ipairs(rpc_calls) do
-        if call.method == "stat" then found_stat = true end
+        if call.method == "fetch_path" then found_fetch_path = true end
         if call.method == "read_dir" then found_readdir = true end
         if call.method == "scan_project" then found_scan = true end
     end
 
-    if found_stat and found_readdir and found_scan then
-        print("Pass: Stat, ReadDir and ScanProject called.")
+    if found_fetch_path and found_readdir and found_scan then
+        print("Pass: FetchPath, ReadDir and ScanProject called.")
     else
-        error(string.format("Fail: Missing RPC calls. Stat:%s, ReadDir:%s, Scan:%s", 
-            tostring(found_stat), tostring(found_readdir), tostring(found_scan)))
+        error(string.format("Fail: Missing RPC calls. FetchPath:%s, ReadDir:%s, Scan:%s",
+            tostring(found_fetch_path), tostring(found_readdir), tostring(found_scan)))
     end
 
     -- Verify buffer content

@@ -8,6 +8,7 @@ local function run_test()
 
     -- Mocks
     local original_jobstart = vim.fn.jobstart
+    local original_executable = vim.fn.executable
     local original_rpcrequest = vim.fn.rpcrequest
     local original_input = vim.ui.input
     local original_notify = vim.notify
@@ -27,6 +28,12 @@ local function run_test()
         end
         return mock_channel_id
     end
+    vim.fn.executable = function(path)
+        if path == "/tmp/zero-nvim-daemon-test" then
+            return 1
+        end
+        return original_executable(path)
+    end
 
     -- Mock rpcrequest
     vim.fn.rpcrequest = function(chan, method, ...)
@@ -39,15 +46,15 @@ local function run_test()
         end
 
         if method == "connect" then
-            local user, host, password = args[1], args[2], args[3]
+            local user, host, password = args[1], args[2], args[4]
             -- Simulate failure if password is nil (first try)
             if password == nil then
-                 error("Authentication failed") 
+                 error("AUTH_FAILED: Authentication failed")
             end
             -- Simulate success if password provided
             return true
-        elseif method == "fetch_file" then
-            return "File Content\nLine 2"
+        elseif method == "fetch_path" then
+            return { "file", "File Content\nLine 2" }
         end
         return nil
     end
@@ -65,12 +72,12 @@ local function run_test()
     end
 
     -- Setup
-    remote.setup()
+    remote.setup({ daemon = { path = "/tmp/zero-nvim-daemon-test" } })
 
     -- TEST CASE 1: Connection with Password (simulation)
     print("\n--- Test Case 1: Connect with retry/password ---")
     local buf = vim.api.nvim_create_buf(true, false)
-    local uri = "remote://user@localhost:/tmp/file"
+    local uri = "zero://user@localhost:22/tmp/file"
     vim.api.nvim_buf_set_name(buf, uri)
 
     -- Trigger BufReadCmd
@@ -95,9 +102,9 @@ local function run_test()
             
             -- Wait for retry logic
             vim.wait(200, function() 
-                -- Wait until we see fetch_file called
+                -- Wait until we see fetch_path called
                 for _, call in ipairs(rpc_calls) do
-                    if call.method == "fetch_file" then return true end
+                    if call.method == "fetch_path" then return true end
                 end
                 return false
             end)
@@ -109,7 +116,7 @@ local function run_test()
             for _, call in ipairs(rpc_calls) do
                 if call.method == "connect" then
                     connect_count = connect_count + 1
-                elseif call.method == "fetch_file" then
+                elseif call.method == "fetch_path" then
                     fetch_called = true
                 end
             end
@@ -133,6 +140,7 @@ local function run_test()
     
     -- Restore
     vim.fn.jobstart = original_jobstart
+    vim.fn.executable = original_executable
     vim.fn.rpcrequest = original_rpcrequest
     vim.ui.input = original_input
     vim.notify = original_notify

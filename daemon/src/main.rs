@@ -240,6 +240,22 @@ fn dispatch(
         }
 
         // ── LSP 代理 ──
+        "lsp_probe" => {
+            let args = params.as_array().ok_or(anyhow::anyhow!("Invalid params"))?;
+            let user = args
+                .get(0)
+                .and_then(|v| v.as_str())
+                .ok_or(anyhow::anyhow!("Missing user"))?;
+            let host = args
+                .get(1)
+                .and_then(|v| v.as_str())
+                .ok_or(anyhow::anyhow!("Missing host"))?;
+            let port = args.get(2).and_then(|v| v.as_u64()).unwrap_or(22) as u16;
+            let cmd = args.get(3).ok_or(anyhow::anyhow!("Missing cmd"))?;
+            let cmd_argv = extract_lsp_cmd_argv(cmd)?;
+            lsp::handle_probe_lsp(user, host, port, cmd_argv, &state)
+        }
+
         "lsp_start" => {
             let args = params.as_array().ok_or(anyhow::anyhow!("Invalid params"))?;
             let user = args

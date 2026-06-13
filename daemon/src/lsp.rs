@@ -159,6 +159,72 @@ pub fn handle_start_lsp(
     Ok(Value::Integer(local_port.into()))
 }
 
+pub fn handle_probe_lsp(
+    user: &str,
+    host: &str,
+    port: u16,
+    cmd_argv: Vec<String>,
+    state: &Arc<Mutex<DaemonState>>,
+) -> Result<Value, anyhow::Error> {
+    let key = DaemonState::connection_key(user, host, port);
+    {
+        let state_lock = state.lock().unwrap();
+        if !state_lock.sessions.contains_key(&key) {
+            return Err(anyhow::anyhow!("NOT_CONNECTED: {}", key));
+        }
+    }
+
+    let probe_cmd = build_lsp_probe_command(&cmd_argv)?;
+    let output = Command::new("ssh")
+        .arg("-o")
+        .arg("StrictHostKeyChecking=no")
+        .arg("-o")
+        .arg("BatchMode=yes")
+        .arg("-o")
+        .arg("ControlMaster=auto")
+        .arg("-o")
+        .arg("ControlPath=/tmp/zero-nvim-cm-%C")
+        .arg("-o")
+        .arg("ControlPersist=10m")
+        .arg("-o")
+        .arg("ConnectTimeout=5")
+        .arg("-p")
+        .arg(port.to_string())
+        .arg(format!("{}@{}", user, host))
+        .arg(&probe_cmd)
+        .output();
+
+    match output {
+        Ok(out) if out.status.success() => Ok(lsp_probe_result(true, "")),
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let msg = if !stderr.trim().is_empty() {
+                stderr.trim().to_string()
+            } else if !stdout.trim().is_empty() {
+                stdout.trim().to_string()
+            } else {
+                format!("ssh exited with status {}", out.status)
+            };
+            Ok(lsp_probe_result(false, &msg))
+        }
+        Err(e) => Ok(lsp_probe_result(
+            false,
+            &format!("failed to spawn ssh: {}", e),
+        )),
+    }
+}
+
+fn lsp_probe_result(ok: bool, message: &str) -> Value {
+    Value::Map(vec![
+        (Value::String("ok".into()), Value::Boolean(ok)),
+        (
+            Value::String("message".into()),
+            Value::String(message.into()),
+        ),
+    ])
+}
+
 fn build_lsp_login_command(argv: &[String]) -> Result<String, anyhow::Error> {
     if argv.is_empty() {
         return Err(anyhow::anyhow!("LSP command argv is empty"));
@@ -171,6 +237,16 @@ fn build_lsp_login_command(argv: &[String]) -> Result<String, anyhow::Error> {
     Ok(format!(
         "PATH=$HOME/.local/share/nvim/mason/bin:$PATH exec {}",
         argv_quoted
+    ))
+}
+
+fn build_lsp_probe_command(argv: &[String]) -> Result<String, anyhow::Error> {
+    let bin = argv
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("LSP command argv is empty"))?;
+    Ok(format!(
+        "PATH=$HOME/.local/share/nvim/mason/bin:$PATH command -v -- {} >/dev/null 2>&1",
+        shell_quote(bin)
     ))
 }
 
@@ -277,6 +353,24 @@ mod tests {
     #[test]
     fn lsp_login_command_rejects_empty_argv() {
         let err = build_lsp_login_command(&[]).expect_err("empty argv must fail");
+        assert!(err.to_string().contains("empty"));
+    }
+
+    #[test]
+    fn lsp_probe_command_checks_first_argv_in_lsp_path() {
+        let argv = vec!["based pyright".to_string(), "--stdio".to_string()];
+
+        let cmd = build_lsp_probe_command(&argv).expect("probe command");
+
+        assert_eq!(
+            cmd,
+            "PATH=$HOME/.local/share/nvim/mason/bin:$PATH command -v -- 'based pyright' >/dev/null 2>&1"
+        );
+    }
+
+    #[test]
+    fn lsp_probe_command_rejects_empty_argv() {
+        let err = build_lsp_probe_command(&[]).expect_err("empty argv must fail");
         assert!(err.to_string().contains("empty"));
     }
 }

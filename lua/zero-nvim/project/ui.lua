@@ -366,13 +366,22 @@ function M.check_health(project_name_or_args)
 
         -- 3. LSP Checks
         -- Offset for LSP items
+        local lsp = require("zero-nvim.lsp")
         for i = 3, #checklist do
             local item = checklist[i]
             if item.status ~= "SKIP" then
-                update_line(i, "[●] " .. item.label .. " (Checking config...)")
+                local srv_name = item.key:gsub("^lsp_", "")
+                local srv_cfg = config.lsp and config.lsp[srv_name] or {}
+                local cmd_args = (srv_cfg.cmd and #srv_cfg.cmd > 0) and srv_cfg.cmd or { srv_name, "--stdio" }
+
+                update_line(i, "[●] " .. item.label .. " (Checking ssh + binary...)")
                 vim.cmd("redraw")
-                -- Simulation delay or actual check
-                update_line(i, "[?] " .. item.label .. ": Configured (Binary check pending)")
+                local lsp_ok, lsp_err = lsp.preflight(config.user, config.host, config.port, cmd_args)
+                if lsp_ok then
+                    update_line(i, "[✓] " .. item.label .. " (" .. table.concat(cmd_args, " ") .. ")")
+                else
+                    update_line(i, "[x] " .. item.label .. ": " .. tostring(lsp_err))
+                end
             end
         end
     end)
