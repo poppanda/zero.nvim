@@ -80,12 +80,7 @@ pub fn handle_connect(
 ///
 /// 若 exec session 已缓存则直接 no-op；handle_connect 在调用本函数前已经把
 /// 老条目清掉，所以这种情况只会出现在 schedule 重入（理论上不会发生）。
-fn schedule_exec_warm(
-    user: &str,
-    host: &str,
-    port: u16,
-    state: &Arc<Mutex<DaemonState>>,
-) {
+fn schedule_exec_warm(user: &str, host: &str, port: u16, state: &Arc<Mutex<DaemonState>>) {
     let key = DaemonState::connection_key(user, host, port);
     {
         let st = state.lock().unwrap();
@@ -96,18 +91,15 @@ fn schedule_exec_warm(
     let user = user.to_string();
     let host = host.to_string();
     let state = state.clone();
-    std::thread::spawn(move || {
-        match borrow_exec_session(&user, &host, port, &state) {
-            Ok(_) => eprintln!(
-                "Daemon: exec session 预热完成 {}@{}:{}",
-                user, host, port
-            ),
+    std::thread::spawn(
+        move || match borrow_exec_session(&user, &host, port, &state) {
+            Ok(_) => eprintln!("Daemon: exec session 预热完成 {}@{}:{}", user, host, port),
             Err(e) => eprintln!(
                 "Daemon: exec session 预热失败 {}@{}:{}: {} (首次 cmd.stream 会重试)",
                 user, host, port, e
             ),
-        }
-    });
+        },
+    );
 }
 
 /// 给流式命令使用的独占 Session。
@@ -173,16 +165,14 @@ pub fn borrow_exec_session(
 
 /// 把 target 的 exec session 从缓存里移除：下次 borrow 会重新握手。
 /// 在 `is_session_dead` 命中（broken pipe / socket disconnect）时调用。
-pub fn drop_exec_session(
-    user: &str,
-    host: &str,
-    port: u16,
-    state: &Arc<Mutex<DaemonState>>,
-) {
+pub fn drop_exec_session(user: &str, host: &str, port: u16, state: &Arc<Mutex<DaemonState>>) {
     let key = DaemonState::connection_key(user, host, port);
     let mut st = state.lock().unwrap();
     if st.exec_sessions.remove(&key).is_some() {
-        eprintln!("Daemon: exec session 已丢弃 {} (将于下次 cmd.stream 重建)", key);
+        eprintln!(
+            "Daemon: exec session 已丢弃 {} (将于下次 cmd.stream 重建)",
+            key
+        );
     }
 }
 
@@ -216,6 +206,13 @@ fn open_session(
     sess.set_timeout(10000);
     sess.handshake()
         .map_err(|e| anyhow::anyhow!("握手失败: {}", e))?;
+
+    // SSH-layer keepalive：libssh2 自己每 30s 发 SSH_MSG_IGNORE 心跳。TCP
+    // keepalive 包在某些 NAT/middlebox 上不算「应用流量」、idle 计时器照常往前
+    // 走；SSH 层心跳走的是 SSH session 字节流，对端 sshd 一定会处理，能真正把
+    // idle 计时器归零。`true` 第二参表示如果对端无应答，libssh2 在下次操作时
+    // 返回错误而不是无限挂起 —— with_conn 的死会话自动重连路径会接住。
+    sess.set_keepalive(true, 30);
 
     let mut authenticated = false;
 

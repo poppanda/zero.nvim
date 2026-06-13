@@ -109,7 +109,6 @@ impl Batcher {
         self.last_flush = now;
         out
     }
-
 }
 
 #[cfg(test)]

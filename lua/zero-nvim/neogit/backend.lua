@@ -255,12 +255,47 @@ function M.spawn(opts, cb, ctx)
     -- "table index is nil"。真实 cmd.stream sid 启动后存到 closure 变量
     -- real_sid，cancel 时优先取 real_sid（已启动）否则置 cancelled flag
     -- 让 dequeue 时跳过 spawn。
+    --
+    -- stdin pending 队列：caller（neogit Process）可能在 spawn 返回后立刻调
+    -- handle:send / handle:close_stdin（典型场景：commit 把 message 通过
+    -- stdin 推下去）。但此时 real_sid 可能还没就绪（gate 在排队）。把这些
+    -- 调用缓存下来，real_sid 一旦绑定就重放给 daemon。
     local real_sid = nil
     local cancelled = false
+    local stdin_queue = {} -- 元素：{kind="write", data=...} 或 {kind="close"}
+    local stdin_closed = false
+
+    -- 把 queue 一次性 flush 给 daemon
+    local function flush_stdin_queue(sid)
+        for _, msg in ipairs(stdin_queue) do
+            if msg.kind == "write" then
+                cmd.write_stdin(sid, msg.data)
+            elseif msg.kind == "close" then
+                cmd.close_stdin(sid)
+            end
+        end
+        stdin_queue = {}
+    end
+
     local handle = {
         id = gen_handle_id(),
-        send = function(_self, _text) end,
-        close_stdin = function(_self) end,
+        send = function(_self, text)
+            if stdin_closed then return end
+            if real_sid then
+                cmd.write_stdin(real_sid, text)
+            else
+                table.insert(stdin_queue, { kind = "write", data = text })
+            end
+        end,
+        close_stdin = function(_self)
+            if stdin_closed then return end
+            stdin_closed = true
+            if real_sid then
+                cmd.close_stdin(real_sid)
+            else
+                table.insert(stdin_queue, { kind = "close" })
+            end
+        end,
         stop = function(_self)
             cancelled = true
             if real_sid then cmd.cancel(real_sid) end
@@ -275,11 +310,14 @@ function M.spawn(opts, cb, ctx)
             return
         end
 
+        -- 不传 spec.stdin。fork process.lua 在 spawn 之后会显式 self:send /
+        -- self:close_stdin 把 self.input 推下去——走 handle.send/close_stdin。
+        -- 如果这里再传一份 spec.stdin，daemon 会写两遍（一次性快路径 + 增量
+        -- 通道），重复污染 commit message 等。
         local sid, err = cmd.stream(ctx.target, {
             argv = wrap_with_path(opts.cmd),
             cwd = cwd,
             env = env_to_pairs(opts.env),
-            stdin = opts.stdin,
             pty = opts.pty,
         }, {
             on_event = function(ev)
@@ -309,6 +347,10 @@ function M.spawn(opts, cb, ctx)
         end
 
         real_sid = sid
+        -- 把 spawn-before-real_sid 期间排队的 stdin write/close 一次性回放
+        if #stdin_queue > 0 then
+            flush_stdin_queue(real_sid)
+        end
     end
 
     if gate.running then

@@ -118,13 +118,25 @@ fn dispatch(
 
         "fetch_paths" => {
             let args = params.as_array().ok_or(anyhow::anyhow!("Invalid params"))?;
-            let user = args.get(0).and_then(|v| v.as_str()).ok_or(anyhow::anyhow!("Missing user"))?;
-            let host = args.get(1).and_then(|v| v.as_str()).ok_or(anyhow::anyhow!("Missing host"))?;
+            let user = args
+                .get(0)
+                .and_then(|v| v.as_str())
+                .ok_or(anyhow::anyhow!("Missing user"))?;
+            let host = args
+                .get(1)
+                .and_then(|v| v.as_str())
+                .ok_or(anyhow::anyhow!("Missing host"))?;
             let port = args.get(2).and_then(|v| v.as_u64()).unwrap_or(22) as u16;
-            
-            let paths_array = args.get(3).and_then(|v| v.as_array()).ok_or(anyhow::anyhow!("Missing paths array"))?;
-            let paths = paths_array.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect();
-            
+
+            let paths_array = args
+                .get(3)
+                .and_then(|v| v.as_array())
+                .ok_or(anyhow::anyhow!("Missing paths array"))?;
+            let paths = paths_array
+                .iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect();
+
             fs::handle_fetch_paths(user, host, port, paths, &state)
         }
 
@@ -204,13 +216,26 @@ fn dispatch(
 
         "cmd_cancel" => cmd::dispatch::handle_cmd_cancel(params, &state),
 
+        "cmd_stdin_write" => cmd::dispatch::handle_cmd_stdin_write(params, &state),
+
+        "cmd_stdin_close" => cmd::dispatch::handle_cmd_stdin_close(params, &state),
+
         // ── 远端命令执行 (legacy) ──
         "exec_remote" => {
             let args = params.as_array().ok_or(anyhow::anyhow!("Invalid params"))?;
-            let user = args.get(0).and_then(|v| v.as_str()).ok_or(anyhow::anyhow!("Missing user"))?;
-            let host = args.get(1).and_then(|v| v.as_str()).ok_or(anyhow::anyhow!("Missing host"))?;
+            let user = args
+                .get(0)
+                .and_then(|v| v.as_str())
+                .ok_or(anyhow::anyhow!("Missing user"))?;
+            let host = args
+                .get(1)
+                .and_then(|v| v.as_str())
+                .ok_or(anyhow::anyhow!("Missing host"))?;
             let port = args.get(2).and_then(|v| v.as_u64()).unwrap_or(22) as u16;
-            let cmd  = args.get(3).and_then(|v| v.as_str()).ok_or(anyhow::anyhow!("Missing cmd"))?;
+            let cmd = args
+                .get(3)
+                .and_then(|v| v.as_str())
+                .ok_or(anyhow::anyhow!("Missing cmd"))?;
             fs::handle_exec_remote(user, host, port, cmd, &state)
         }
 
@@ -226,20 +251,42 @@ fn dispatch(
                 .and_then(|v| v.as_str())
                 .ok_or(anyhow::anyhow!("Missing host"))?;
             let port = args.get(2).and_then(|v| v.as_u64()).unwrap_or(22) as u16;
-            let cmd = args
-                .get(3)
-                .and_then(|v| v.as_str())
-                .ok_or(anyhow::anyhow!("Missing cmd"))?;
+            let cmd = args.get(3).ok_or(anyhow::anyhow!("Missing cmd"))?;
+            let cmd_argv = extract_lsp_cmd_argv(cmd)?;
             let default_prefix = format!("zero://{}@{}:{}", user, host, port);
             let client_prefix = args
                 .get(4)
                 .and_then(|v| v.as_str())
                 .unwrap_or(&default_prefix);
-            lsp::handle_start_lsp(user, host, port, cmd, client_prefix, &state)
+            lsp::handle_start_lsp(user, host, port, cmd_argv, client_prefix, &state)
         }
 
         _ => Err(anyhow::anyhow!("Unknown method: {}", method)),
     }
+}
+
+fn extract_lsp_cmd_argv(value: &Value) -> Result<Vec<String>, anyhow::Error> {
+    if let Some(cmd) = value.as_str() {
+        // Backward compatibility for older Lua clients that sent a single shell
+        // string. New clients send argv directly so paths/args can be quoted
+        // safely in daemon/src/lsp.rs.
+        return Ok(vec!["sh".to_string(), "-c".to_string(), cmd.to_string()]);
+    }
+
+    let arr = value
+        .as_array()
+        .ok_or(anyhow::anyhow!("cmd must be string or string[]"))?;
+    let mut argv = Vec::with_capacity(arr.len());
+    for item in arr {
+        let s = item
+            .as_str()
+            .ok_or(anyhow::anyhow!("cmd argv item must be string"))?;
+        argv.push(s.to_string());
+    }
+    if argv.is_empty() {
+        return Err(anyhow::anyhow!("cmd argv is empty"));
+    }
+    Ok(argv)
 }
 
 // =============================================================================

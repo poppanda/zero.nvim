@@ -35,7 +35,10 @@ pub struct ConnSession {
 
 impl ConnSession {
     pub fn new(session: Session) -> Self {
-        Self { session, sftp: None }
+        Self {
+            session,
+            sftp: None,
+        }
     }
 
     /// 获取（或惰性创建）共享的 SFTP 通道
@@ -149,10 +152,7 @@ impl DaemonState {
             Err(e) => return Err(e),
         };
 
-        eprintln!(
-            "Daemon: {} 连接异常 ({})，尝试自动重连...",
-            key, first_err
-        );
+        eprintln!("Daemon: {} 连接异常 ({})，尝试自动重连...", key, first_err);
 
         // 把死会话从 state 里清掉，让 handle_connect 走完整握手
         {

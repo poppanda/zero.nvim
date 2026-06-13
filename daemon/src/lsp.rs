@@ -18,6 +18,7 @@
 // 注意：vim.uri_from_bufnr 对已带 scheme 的 buffer name（如 zero://...）原样返回，
 // 不会加 file:// 前缀，因此 client_prefix 不含 "file://" 前缀。
 
+use crate::cmd::spec::shell_quote;
 use crate::state::DaemonState;
 use anyhow::Context;
 use rmpv::Value;
@@ -31,7 +32,7 @@ pub fn handle_start_lsp(
     user: &str,
     host: &str,
     port: u16,
-    cmd: &str,
+    cmd_argv: Vec<String>,
     client_prefix: &str,
     state: &Arc<Mutex<DaemonState>>,
 ) -> Result<Value, anyhow::Error> {
@@ -50,13 +51,17 @@ pub fn handle_start_lsp(
 
     let user_s = user.to_string();
     let host_s = host.to_string();
-    let cmd_s = cmd.to_string();
+    let login_cmd = build_lsp_login_command(&cmd_argv)?;
+    let cmd_display = cmd_argv.join(" ");
 
     // Bind a random ephemeral port locally
     let listener = TcpListener::bind("127.0.0.1:0").context("Failed to bind random TCP port")?;
     let local_port = listener.local_addr()?.port();
 
-    eprintln!("Daemon: LSP proxy :{} → {}@{}:{} ({})", local_port, user, host, port, cmd);
+    eprintln!(
+        "Daemon: LSP proxy :{} → {}@{}:{} ({})",
+        local_port, user, host, port, cmd_display
+    );
 
     thread::spawn(move || {
         if let Ok((tcp_stream, _)) = listener.accept() {
@@ -70,7 +75,6 @@ pub fn handle_start_lsp(
             // single SSH connection. The first LSP pays the full TCP+key+auth cost;
             // subsequent ones (or restart-after-stop) attach in milliseconds.
             // %C hashes (local_user, host, port, remote_user) → unique per target.
-            let login_cmd = format!("PATH=$HOME/.local/share/nvim/mason/bin:$PATH {}", cmd_s);
             let ssh_result = Command::new("ssh")
                 .arg("-o")
                 .arg("StrictHostKeyChecking=no")
@@ -82,6 +86,15 @@ pub fn handle_start_lsp(
                 .arg("ControlPath=/tmp/zero-nvim-cm-%C")
                 .arg("-o")
                 .arg("ControlPersist=10m")
+                // SSH-layer keepalive：每 30s 发一个心跳；连续 3 次（90s）无应答
+                // 才判死。两个作用：(1) 让 NAT/防火墙的 idle flow timeout 永远归
+                // 零，避免 idle-disconnect；(2) 真正掉线时 90s 内 ssh 子进程退出，
+                // 触发 Lua 端的 on_exit 自动重启路径。否则一直 idle 又没人发包，
+                // 进程会僵在 read() 上几十分钟，直到 TCP RST 才感知。
+                .arg("-o")
+                .arg("ServerAliveInterval=30")
+                .arg("-o")
+                .arg("ServerAliveCountMax=3")
                 .arg("-p")
                 .arg(port.to_string())
                 .arg(format!("{}@{}", user_s, host_s))
@@ -144,6 +157,21 @@ pub fn handle_start_lsp(
     });
 
     Ok(Value::Integer(local_port.into()))
+}
+
+fn build_lsp_login_command(argv: &[String]) -> Result<String, anyhow::Error> {
+    if argv.is_empty() {
+        return Err(anyhow::anyhow!("LSP command argv is empty"));
+    }
+    let argv_quoted = argv
+        .iter()
+        .map(|arg| shell_quote(arg))
+        .collect::<Vec<_>>()
+        .join(" ");
+    Ok(format!(
+        "PATH=$HOME/.local/share/nvim/mason/bin:$PATH exec {}",
+        argv_quoted
+    ))
 }
 
 fn pump_and_translate<R: Read, W: Write>(
@@ -224,3 +252,31 @@ fn pump_and_translate<R: Read, W: Write>(
 
 // Removing unused shell_quote to keep lints happy
 // fn shell_quote(s: &str) -> String { ... }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lsp_login_command_quotes_argv_items() {
+        let argv = vec![
+            "/tmp/my language server".to_string(),
+            "--stdio".to_string(),
+            "--config=path with spaces.json".to_string(),
+            "it's-ok".to_string(),
+        ];
+
+        let cmd = build_lsp_login_command(&argv).expect("command");
+
+        assert_eq!(
+            cmd,
+            "PATH=$HOME/.local/share/nvim/mason/bin:$PATH exec '/tmp/my language server' '--stdio' '--config=path with spaces.json' 'it'\\''s-ok'"
+        );
+    }
+
+    #[test]
+    fn lsp_login_command_rejects_empty_argv() {
+        let err = build_lsp_login_command(&[]).expect_err("empty argv must fail");
+        assert!(err.to_string().contains("empty"));
+    }
+}

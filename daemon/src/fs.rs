@@ -10,6 +10,7 @@
 //
 // 所有 handler 通过 DaemonState::with_conn 走，自动应对会话断开后的重连。
 
+use crate::cmd::spec::shell_quote;
 use crate::state::{DaemonState, DirEntry};
 use rmpv::Value;
 use std::collections::HashMap;
@@ -117,15 +118,7 @@ pub fn handle_fetch_paths(
             .channel_session()
             .map_err(|e| anyhow::anyhow!("无法开启 SSH 通道: {}", e))?;
 
-        let mut script = String::new();
-        for p in &paths {
-            let escaped = p.replace('\'', "'\\''");
-            script.push_str(&format!(
-                "echo -n '<<<Z_FILE:{p}>>>'; if [ -f '{escaped}' ]; then cat '{escaped}'; fi; echo -n '<<<Z_END>>>'; ",
-                p = p,
-                escaped = escaped
-            ));
-        }
+        let script = build_fetch_paths_script(&paths);
 
         channel
             .exec(&script)
@@ -137,39 +130,142 @@ pub fn handle_fetch_paths(
             .map_err(|e| anyhow::anyhow!("读取数据失败: {}", e))?;
         channel.wait_close().ok();
 
-        let out_str = String::from_utf8_lossy(&out);
-
+        let records = parse_fetch_paths_payload(&out)?;
         let mut result_map = Vec::new();
-        let mut current_pos = 0;
-        while let Some(start_idx) = out_str[current_pos..].find("<<<Z_FILE:") {
-            let absolute_start = current_pos + start_idx;
-            let path_start = absolute_start + "<<<Z_FILE:".len();
-
-            if let Some(path_end_relative) = out_str[path_start..].find(">>>") {
-                let path_end = path_start + path_end_relative;
-                let path = &out_str[path_start..path_end];
-
-                let content_start = path_end + ">>>".len();
-                if let Some(content_end_relative) = out_str[content_start..].find("<<<Z_END>>>") {
-                    let content_end = content_start + content_end_relative;
-                    let content = &out_str[content_start..content_end];
-
-                    result_map.push((
-                        Value::String(path.into()),
-                        Value::String(content.into()),
-                    ));
-
-                    current_pos = content_end + "<<<Z_END>>>".len();
-                } else {
-                    break;
+        for record in records {
+            match record {
+                FetchPathRecord::File { path, content } => {
+                    result_map.push((Value::String(path.into()), Value::String(content.into())));
                 }
-            } else {
-                break;
+                FetchPathRecord::Missing { .. } => {}
+                FetchPathRecord::TooBig { path, size } => {
+                    return Err(anyhow::anyhow!(
+                        "文件过大无法打开 ({} 字节，上限 {} 字节): {}",
+                        size,
+                        MAX_FETCH_SIZE,
+                        path
+                    ));
+                }
             }
         }
 
         Ok(Value::Map(result_map))
     })
+}
+
+fn build_fetch_paths_script(paths: &[String]) -> String {
+    let mut script = String::new();
+    for path in paths {
+        let path_q = shell_quote(path);
+        script.push_str(&format!(
+            "printf 'ZP\\n{}\\n'; \
+             if [ -f {path_q} ]; then \
+               size=$(wc -c < {path_q} 2>/dev/null | tr -d ' '); \
+               if [ \"${{size:-0}}\" -gt {max} ]; then \
+                 printf 'TOOBIG\\n%s\\n' \"$size\"; \
+                 printf %s {path_q}; \
+               else \
+                 printf 'OK\\n%s\\n' \"$size\"; \
+                 printf %s {path_q}; \
+                 cat {path_q}; \
+               fi; \
+             else \
+               printf 'MISSING\\n0\\n'; \
+               printf %s {path_q}; \
+             fi; ",
+            path.as_bytes().len(),
+            path_q = path_q,
+            max = MAX_FETCH_SIZE
+        ));
+    }
+    script
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum FetchPathRecord {
+    File { path: String, content: String },
+    Missing { path: String },
+    TooBig { path: String, size: u64 },
+}
+
+fn parse_fetch_paths_payload(out: &[u8]) -> Result<Vec<FetchPathRecord>, anyhow::Error> {
+    let mut pos = 0;
+    let mut records = Vec::new();
+    while pos < out.len() {
+        let magic = read_payload_line(out, &mut pos)?;
+        if magic != b"ZP" {
+            return Err(anyhow::anyhow!(
+                "批量读取协议错误: expected ZP marker, got {:?}",
+                String::from_utf8_lossy(magic)
+            ));
+        }
+
+        let path_len = parse_usize_line(read_payload_line(out, &mut pos)?, "path length")?;
+        let status = std::str::from_utf8(read_payload_line(out, &mut pos)?)
+            .map_err(|_| anyhow::anyhow!("批量读取协议错误: status 非 UTF-8"))?;
+        let data_len = parse_usize_line(read_payload_line(out, &mut pos)?, "data length")?;
+
+        if pos + path_len > out.len() {
+            return Err(anyhow::anyhow!(
+                "批量读取协议错误: path length out of bounds"
+            ));
+        }
+        let path = std::str::from_utf8(&out[pos..pos + path_len])
+            .map_err(|_| anyhow::anyhow!("批量读取协议错误: path 非 UTF-8"))?
+            .to_string();
+        pos += path_len;
+
+        match status {
+            "OK" => {
+                if pos + data_len > out.len() {
+                    return Err(anyhow::anyhow!(
+                        "批量读取协议错误: content length out of bounds for {}",
+                        path
+                    ));
+                }
+                let content = std::str::from_utf8(&out[pos..pos + data_len])
+                    .map_err(|_| {
+                        anyhow::anyhow!(
+                            "文件含非 UTF-8 内容（可能是二进制文件），无法在 Neovim 中编辑: {}",
+                            path
+                        )
+                    })?
+                    .to_string();
+                pos += data_len;
+                records.push(FetchPathRecord::File { path, content });
+            }
+            "MISSING" => records.push(FetchPathRecord::Missing { path }),
+            "TOOBIG" => records.push(FetchPathRecord::TooBig {
+                path,
+                size: data_len as u64,
+            }),
+            other => {
+                return Err(anyhow::anyhow!(
+                    "批量读取协议错误: unknown status {}",
+                    other
+                ));
+            }
+        }
+    }
+    Ok(records)
+}
+
+fn read_payload_line<'a>(out: &'a [u8], pos: &mut usize) -> Result<&'a [u8], anyhow::Error> {
+    let start = *pos;
+    let rel_end = out[start..]
+        .iter()
+        .position(|b| *b == b'\n')
+        .ok_or(anyhow::anyhow!("批量读取协议错误: missing newline"))?;
+    let end = start + rel_end;
+    *pos = end + 1;
+    Ok(&out[start..end])
+}
+
+fn parse_usize_line(line: &[u8], label: &str) -> Result<usize, anyhow::Error> {
+    let s = std::str::from_utf8(line)
+        .map_err(|_| anyhow::anyhow!("批量读取协议错误: {} 非 UTF-8", label))?;
+    s.parse::<usize>()
+        .map_err(|_| anyhow::anyhow!("批量读取协议错误: invalid {}", label))
 }
 
 // =============================================================================
@@ -197,6 +293,44 @@ pub fn handle_fetch_file(
 
         Ok(Value::String(content.into()))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn record(path: &str, status: &str, len: usize, content: &[u8]) -> Vec<u8> {
+        let mut out = format!("ZP\n{}\n{}\n{}\n", path.as_bytes().len(), status, len).into_bytes();
+        out.extend_from_slice(path.as_bytes());
+        out.extend_from_slice(content);
+        out
+    }
+
+    #[test]
+    fn parse_fetch_paths_payload_preserves_marker_like_content() {
+        let content = b"hello <<<Z_END>>> still content\n";
+        let payload = record("/tmp/a.py", "OK", content.len(), content);
+
+        let records = parse_fetch_paths_payload(&payload).expect("payload parses");
+
+        assert_eq!(records.len(), 1);
+        match &records[0] {
+            FetchPathRecord::File { path, content } => {
+                assert_eq!(path, "/tmp/a.py");
+                assert_eq!(content, "hello <<<Z_END>>> still content\n");
+            }
+            other => panic!("unexpected record: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_fetch_paths_payload_rejects_non_utf8_content() {
+        let payload = record("/tmp/bin", "OK", 2, &[0xff, 0xfe]);
+
+        let err = parse_fetch_paths_payload(&payload).expect_err("binary content must fail");
+
+        assert!(err.to_string().contains("非 UTF-8"));
+    }
 }
 
 // =============================================================================

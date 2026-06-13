@@ -122,4 +122,35 @@ function M.cancel(sid)
     return exec.cancel(sid)
 end
 
+--- 往流式 session 的 stdin 写一段字节。daemon 端 worker 在 poll 循环里
+--- try_recv 排空后写到 ssh channel。
+---
+--- notify（不是 request）：避免主线程被远端慢写阻塞；写失败时 daemon 仅打日志。
+--- 典型用例：`git commit -F -` 在 spawn 后通过这个 API 把 message 推下去；
+--- `git push` pty 模式碰到 username/password prompt 时把用户输入推下去。
+---@param sid string
+---@param data string
+---@return boolean ok
+function M.write_stdin(sid, data)
+    if not sid or data == nil then return false end
+    local zero = require("zero-nvim")
+    local chan = zero._get_daemon_chan()
+    if not chan then return false end
+    local ok = pcall(vim.fn.rpcnotify, chan, "cmd_stdin_write", sid, data)
+    return ok
+end
+
+--- 通知 daemon 把 session 的 stdin 关掉（send_eof）。worker 写完 pending 队列
+--- 后才执行——保证最后一段 data 不会被丢。
+---@param sid string
+---@return boolean ok
+function M.close_stdin(sid)
+    if not sid then return false end
+    local zero = require("zero-nvim")
+    local chan = zero._get_daemon_chan()
+    if not chan then return false end
+    local ok = pcall(vim.fn.rpcnotify, chan, "cmd_stdin_close", sid)
+    return ok
+end
+
 return M

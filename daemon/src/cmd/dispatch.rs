@@ -38,8 +38,14 @@ pub fn handle_cmd_sync(
     state: &Arc<Mutex<DaemonState>>,
 ) -> Result<Value, anyhow::Error> {
     let args = params.as_array().ok_or(anyhow::anyhow!("Invalid params"))?;
-    let user = args.get(0).and_then(|v| v.as_str()).ok_or(anyhow::anyhow!("Missing user"))?;
-    let host = args.get(1).and_then(|v| v.as_str()).ok_or(anyhow::anyhow!("Missing host"))?;
+    let user = args
+        .get(0)
+        .and_then(|v| v.as_str())
+        .ok_or(anyhow::anyhow!("Missing user"))?;
+    let host = args
+        .get(1)
+        .and_then(|v| v.as_str())
+        .ok_or(anyhow::anyhow!("Missing host"))?;
     let port = args.get(2).and_then(|v| v.as_u64()).unwrap_or(22) as u16;
     let spec = args.get(3).ok_or(anyhow::anyhow!("Missing spec"))?;
 
@@ -76,9 +82,18 @@ pub fn handle_cmd_stream(
     tx: mpsc::Sender<Value>,
 ) -> Result<Value, anyhow::Error> {
     let args = params.as_array().ok_or(anyhow::anyhow!("Invalid params"))?;
-    let session_id = args.get(0).and_then(|v| v.as_str()).ok_or(anyhow::anyhow!("Missing session_id"))?;
-    let user = args.get(1).and_then(|v| v.as_str()).ok_or(anyhow::anyhow!("Missing user"))?;
-    let host = args.get(2).and_then(|v| v.as_str()).ok_or(anyhow::anyhow!("Missing host"))?;
+    let session_id = args
+        .get(0)
+        .and_then(|v| v.as_str())
+        .ok_or(anyhow::anyhow!("Missing session_id"))?;
+    let user = args
+        .get(1)
+        .and_then(|v| v.as_str())
+        .ok_or(anyhow::anyhow!("Missing user"))?;
+    let host = args
+        .get(2)
+        .and_then(|v| v.as_str())
+        .ok_or(anyhow::anyhow!("Missing host"))?;
     let port = args.get(3).and_then(|v| v.as_u64()).unwrap_or(22) as u16;
     let spec = args.get(4).ok_or(anyhow::anyhow!("Missing spec"))?;
 
@@ -106,18 +121,20 @@ pub fn handle_cmd_stream(
             // 触发 E976。git 输出 99% 是 UTF-8 文本，from_utf8_lossy 处理偶
             // 发非 UTF-8 字节（替换为 U+FFFD）。gitsigns 的 binary baseline
             // 走 NUL-byte 探测路径，对 lossy 转换不敏感。
-            CommandEvent::Stdout(b) => Value::String(
-                String::from_utf8_lossy(&b).into_owned().into(),
-            ),
-            CommandEvent::Stderr(b) => Value::String(
-                String::from_utf8_lossy(&b).into_owned().into(),
-            ),
+            CommandEvent::Stdout(b) => {
+                Value::String(String::from_utf8_lossy(&b).into_owned().into())
+            }
+            CommandEvent::Stderr(b) => {
+                Value::String(String::from_utf8_lossy(&b).into_owned().into())
+            }
             CommandEvent::Exit {
                 code,
                 signal,
                 duration_ms,
             } => {
-                let signal_v = signal.map(|s| Value::String(s.into())).unwrap_or(Value::Nil);
+                let signal_v = signal
+                    .map(|s| Value::String(s.into()))
+                    .unwrap_or(Value::Nil);
                 Value::Array(vec![
                     Value::Integer(code.into()),
                     signal_v,
@@ -170,16 +187,96 @@ pub fn handle_cmd_cancel(
         h.cancel.cancel();
         eprintln!("Daemon: cmd_cancel session={}", session_id);
     } else {
-        eprintln!("Daemon: cmd_cancel session={} 未找到（可能已结束）", session_id);
+        eprintln!(
+            "Daemon: cmd_cancel session={} 未找到（可能已结束）",
+            session_id
+        );
+    }
+    Ok(Value::Boolean(true))
+}
+
+/// cmd_stdin_write [session_id, data] —— 把 data 推到 worker 的 stdin 队列。
+/// data 接受 String（msgpack 字符串）或 Binary。
+/// 注意：这是 RPC notification 而不是 request——caller 用 rpcnotify 调用，
+/// 失败仅打日志。daemon 端不能阻塞，因为 nvim msgpack-rpc 单条 stream 串行。
+pub fn handle_cmd_stdin_write(
+    params: &Value,
+    state: &Arc<Mutex<DaemonState>>,
+) -> Result<Value, anyhow::Error> {
+    let args = params.as_array().ok_or(anyhow::anyhow!("Invalid params"))?;
+    let session_id = args
+        .get(0)
+        .and_then(|v| v.as_str())
+        .ok_or(anyhow::anyhow!("Missing session_id"))?;
+    let data_v = args.get(1).ok_or(anyhow::anyhow!("Missing data"))?;
+    let bytes: Vec<u8> = match data_v {
+        Value::String(s) => s.as_bytes().to_vec(),
+        Value::Binary(b) => b.clone(),
+        _ => return Err(anyhow::anyhow!("data must be string or binary")),
+    };
+
+    let reg_arc = {
+        let state_lock = state.lock().unwrap();
+        state_lock.running_commands.clone()
+    };
+    let handle_opt = {
+        let reg = reg_arc.lock().unwrap();
+        reg.get(session_id)
+    };
+    if let Some(h) = handle_opt {
+        if !h.send_stdin(bytes) {
+            eprintln!(
+                "Daemon: cmd_stdin_write session={} 写入失败（worker 已结束或 stdin 未就绪）",
+                session_id
+            );
+        }
+    } else {
+        eprintln!(
+            "Daemon: cmd_stdin_write session={} 未找到（可能已结束）",
+            session_id
+        );
+    }
+    Ok(Value::Boolean(true))
+}
+
+/// cmd_stdin_close [session_id] —— 让 worker 在写完队列后调 send_eof 关闭 stdin。
+pub fn handle_cmd_stdin_close(
+    params: &Value,
+    state: &Arc<Mutex<DaemonState>>,
+) -> Result<Value, anyhow::Error> {
+    let args = params.as_array().ok_or(anyhow::anyhow!("Invalid params"))?;
+    let session_id = args
+        .get(0)
+        .and_then(|v| v.as_str())
+        .ok_or(anyhow::anyhow!("Missing session_id"))?;
+
+    let reg_arc = {
+        let state_lock = state.lock().unwrap();
+        state_lock.running_commands.clone()
+    };
+    let handle_opt = {
+        let reg = reg_arc.lock().unwrap();
+        reg.get(session_id)
+    };
+    if let Some(h) = handle_opt {
+        if !h.close_stdin() {
+            eprintln!(
+                "Daemon: cmd_stdin_close session={} close 失败（worker 已结束）",
+                session_id
+            );
+        }
+    } else {
+        eprintln!(
+            "Daemon: cmd_stdin_close session={} 未找到（可能已结束）",
+            session_id
+        );
     }
     Ok(Value::Boolean(true))
 }
 
 /// 把 spec_map（rmpv Value） 解析为 RemoteCommand
 fn parse_spec(spec: &Value) -> Result<RemoteCommand, anyhow::Error> {
-    let map = spec
-        .as_map()
-        .ok_or(anyhow::anyhow!("spec must be a map"))?;
+    let map = spec.as_map().ok_or(anyhow::anyhow!("spec must be a map"))?;
 
     let mut argv: Vec<String> = Vec::new();
     let mut env: Vec<(String, String)> = Vec::new();

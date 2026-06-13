@@ -29,9 +29,11 @@ local state = {
     mason_bins = {}, -- key: "user@host:port" -> list of mason bin names
     python_paths = {}, -- key: "user@host:port" -> resolved python interpreter path
     remote_homes = {}, -- key: "user@host:port" -> remote $HOME (resolved on first probe)
+    password_hosts = {}, -- key: "user@host:port" -> true when initial auth used password
 }
 
 local options = {}
+local patches = {}
 
 local function logger(msg, level)
     level = level or vim.log.levels.INFO
@@ -76,6 +78,7 @@ local function get_daemon_chan()
             state.mason_bins = {}
             state.python_paths = {}
             state.remote_homes = {}
+            state.password_hosts = {}
         end,
         on_stderr = function(_, data)
             -- 调试模式：daemon stderr 同时 tee 到文件，方便 panic / SIGPIPE 死亡时
@@ -111,12 +114,20 @@ function M.ensure_connection(user, host, port, password)
             return nil, tostring(res)
         end
         state.connected_hosts[key] = true
+        if password then
+            state.password_hosts[key] = true
+        end
         -- Async: scan mason/bin on the remote server for LSP autocomplete
         vim.schedule(function()
             M.scan_mason_bins(user, host, port)
         end)
     end
     return chan
+end
+
+function M.uses_password_auth(user, host, port)
+    local key = string.format("%s@%s:%s", user, host, port)
+    return state.password_hosts[key] == true
 end
 
 --- Resolve and cache the remote user's $HOME. Used by anything that wants to
@@ -187,6 +198,61 @@ end
 function M.set_python_path(user, host, port, path)
     state.python_paths[string.format("%s@%s:%s", user, host, port)] = path
 end
+
+local function common_path_components(a, b)
+    local n, pa, pb = 0, 1, 1
+    while pa <= #a and pb <= #b do
+        local ea = a:find("/", pa, true) or (#a + 1)
+        local eb = b:find("/", pb, true) or (#b + 1)
+        if a:sub(pa, ea - 1) ~= b:sub(pb, eb - 1) then break end
+        n = n + 1
+        pa, pb = ea + 1, eb + 1
+    end
+    return n
+end
+
+local function select_lsp_clients_for_path(clients, target_self, fpath)
+    local best_by_name = {}
+    local best_root_len = {}
+    local fallback_by_name = {}
+    local fallback_score = {}
+
+    for _, client in ipairs(clients or {}) do
+        local cfg = client.config
+        if client.name
+            and client.name:match("^zero%-")
+            and cfg
+            and cfg._zero_target == target_self
+            and not (client.is_stopped and client.is_stopped()) then
+            local croot = cfg.root_dir
+            if croot then
+                croot = croot:gsub("/+$", "")
+                if fpath == croot or fpath:find(croot .. "/", 1, true) == 1 then
+                    if (best_root_len[client.name] or -1) < #croot then
+                        best_by_name[client.name] = client
+                        best_root_len[client.name] = #croot
+                    end
+                else
+                    local score = common_path_components(croot, fpath)
+                    if (fallback_score[client.name] or -1) < score then
+                        fallback_by_name[client.name] = client
+                        fallback_score[client.name] = score
+                    end
+                end
+            end
+        end
+    end
+
+    for cname, client in pairs(fallback_by_name) do
+        if not best_by_name[cname] then
+            best_by_name[cname] = client
+        end
+    end
+
+    return best_by_name
+end
+
+M._test_select_lsp_clients_for_path = select_lsp_clients_for_path
 
 function M.get_entries(user, host, port, path)
     local chan, err = M.ensure_connection(user, host, port)
@@ -645,7 +711,8 @@ function M.setup(opts)
                     if #existing == 0 then
                         state.lsp_starting = state.lsp_starting or {}
                         local root_dir = project_config.root and project_config.root:gsub("/+$", "") or vim.fs.dirname(path):gsub("/+$", "")
-                        local start_key = lsp_name .. ":" .. root_dir
+                        local target_id = string.format("%s@%s:%d", user, host, port)
+                        local start_key = lsp_name .. "@" .. target_id .. ":" .. root_dir
                         
                         if state.lsp_starting[start_key] then
                             logger(string.format("ZeroNvim: LSP %s for root %s is already starting, skipping duplicate trigger for buffer %d", lsp_name, root_dir, args.buf), vim.log.levels.DEBUG)
@@ -686,7 +753,8 @@ function M.setup(opts)
     -- Without this they error out with "cannot read file: zero://...".
     -- Patching at vim.fn.readfile catches Lua-side callers; Vimscript
     -- `:call readfile()` is unaffected (uses the C builtin directly).
-    do
+    if not patches.readfile then
+        patches.readfile = true
         local _orig_readfile = vim.fn.readfile
         vim.fn.readfile = function(path, ...)
             if type(path) == "string" and path:match("^zero://") then
@@ -717,7 +785,8 @@ function M.setup(opts)
     -- check for an already-loaded buffer with the same name first. By forcing
     -- bufadd+bufload before their handler runs, our BufReadCmd populates the
     -- buffer and they fall into that fast path.
-    do
+    if not patches.buf_request_all then
+        patches.buf_request_all = true
         local _orig_brall = vim.lsp.buf_request_all
         local jump_methods = {
             ["textDocument/definition"]     = true,
@@ -778,7 +847,8 @@ function M.setup(opts)
     -- (vim.schedule context = no textlock). Accessed via table field lookup
     -- (util.locations_to_items), so our patch IS visible even when keybindings
     -- captured vim.lsp.buf.definition by reference before this patch ran.
-    do
+    if not patches.locations_to_items then
+        patches.locations_to_items = true
         local _orig_lti = vim.lsp.util.locations_to_items
         vim.lsp.util.locations_to_items = function(locations, offset_encoding)
             -- Batch processing of missing remote files
@@ -807,25 +877,35 @@ function M.setup(opts)
                             table.insert(missing_files_by_host[host_key].bnums, bnum)
                         end
                         
-                        -- Auto-attach any running zero-* LSP client whose root_dir
+                        -- Auto-attach a running zero-* LSP client whose root_dir
                         -- covers this file. Clients started via start_lsp store the
                         -- project root in config.root_dir as a plain path.
+                        --
+                        -- Per server name we attach AT MOST ONE client: the most-
+                        -- specific (longest covering root_dir). If a client of the
+                        -- same name is already attached, we skip. Attaching every
+                        -- covering client would, on overlapping configs (e.g. one
+                        -- prewarm + one manual :ZeroLspStart for a sub-tree), leave
+                        -- the buffer with two zero-<server> clients and produce
+                        -- duplicate locations on later jumps from that buffer.
+                        --
+                        -- Same-host fallback: rust-analyzer / pyright / gopls 都把
+                        -- 自己的依赖（~/.cargo/...、site-packages、$GOPATH/pkg/mod）
+                        -- 加载到内部 vfs，但这些路径在文件系统上不在 project root
+                        -- 之下。严格按 root_dir 前缀过滤会让 gd 进 dep 的目标 buffer
+                        -- 没有任何 LSP 接住。如果同一台远程上正好有同名 server
+                        -- 在跑（_zero_target 匹配），就拿它兜底；多个时取与目标路径
+                        -- 公共目录组件最多的（"最近的项目"）。
                         logger("ZeroNvim: Checking auto-attach for buffer " .. bnum .. " (" .. fpath .. ")", vim.log.levels.DEBUG)
-                        for _, client in ipairs(vim.lsp.get_clients()) do
-                            if client.name:match("^zero%-") then
-                                local croot = client.config and client.config.root_dir
-                                if croot then
-                                    croot = croot:gsub("/+$", "")
-                                    if fpath == croot or fpath:find(croot .. "/", 1, true) == 1 then
-                                        local already = vim.lsp.get_clients({ bufnr = bnum, id = client.id })
-                                        if #already == 0 then
-                                            logger(string.format("ZeroNvim: Auto-attaching LSP %s to buffer %d", client.name, bnum), vim.log.levels.DEBUG)
-                                            vim.lsp.buf_attach_client(bnum, client.id)
-                                        else
-                                            logger(string.format("ZeroNvim: LSP %s already attached to buffer %d", client.name, bnum), vim.log.levels.DEBUG)
-                                        end
-                                    end
-                                end
+                        local target_self = string.format("%s@%s:%d", u, h, p)
+                        local best_by_name = select_lsp_clients_for_path(vim.lsp.get_clients(), target_self, fpath)
+                        for cname, client in pairs(best_by_name) do
+                            local same_name_attached = vim.lsp.get_clients({ bufnr = bnum, name = cname })
+                            if #same_name_attached == 0 then
+                                logger(string.format("ZeroNvim: Auto-attaching LSP %s to buffer %d", cname, bnum), vim.log.levels.DEBUG)
+                                vim.lsp.buf_attach_client(bnum, client.id)
+                            else
+                                logger(string.format("ZeroNvim: LSP %s already attached (%d) to buffer %d; skipping to avoid duplicate", cname, #same_name_attached, bnum), vim.log.levels.DEBUG)
                             end
                         end
                     end
@@ -1038,6 +1118,7 @@ function M.setup(opts)
             return
         end
         for _, client in ipairs(clients) do
+            require("zero-nvim.lsp").mark_intentional_stop(client.id)
             client.stop()
             vim.notify("ZeroNvim: stopped LSP " .. client.name, vim.log.levels.INFO)
         end
@@ -1055,6 +1136,39 @@ function M.setup(opts)
                 end
             end
             return completions
+        end,
+    })
+
+    -- :ZeroLspRestart — 立刻触发所有 dormant LSP（处于退避重试中的）一次重试，
+    -- 并把 30 分钟时窗复位。VimResume / FocusGained autocmd 也走这个入口。
+    vim.api.nvim_create_user_command("ZeroLspRestart", function()
+        local count = require("zero-nvim.lsp").revive_dormant_now()
+        if count > 0 then
+            vim.notify(string.format("ZeroNvim: kicked %d dormant LSP%s", count, count == 1 and "" or "s"),
+                vim.log.levels.INFO)
+        else
+            vim.notify("ZeroNvim: no dormant LSPs to revive", vim.log.levels.INFO)
+        end
+    end, {
+        nargs = 0,
+        desc = "Kick dormant zero-* LSP clients into an immediate retry",
+    })
+
+    -- Suspend/resume + focus regain: 用户合盖再开 / 切回 Neovim 时，网络多半
+    -- 已经恢复，没必要等退避计时器走完。VimResume 在 Neovim 0.10+ 才有，但
+    -- 用 pcall 兜底；旧版没这事件就走 FocusGained。
+    pcall(vim.api.nvim_create_autocmd, "VimResume", {
+        group = group,
+        callback = function()
+            local lsp = require("zero-nvim.lsp")
+            if lsp.dormant_count() > 0 then lsp.revive_dormant_now() end
+        end,
+    })
+    vim.api.nvim_create_autocmd("FocusGained", {
+        group = group,
+        callback = function()
+            local lsp = require("zero-nvim.lsp")
+            if lsp.dormant_count() > 0 then lsp.revive_dormant_now() end
         end,
     })
 

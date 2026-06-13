@@ -92,11 +92,7 @@ impl RemoteCommand {
             prefix.push_str(&format!("cd {} && ", shell_quote(cwd)));
         }
         for (k, v) in &self.env {
-            prefix.push_str(&format!(
-                "export {}={} && ",
-                shell_quote(k),
-                shell_quote(v)
-            ));
+            prefix.push_str(&format!("export {}={} && ", shell_quote(k), shell_quote(v)));
         }
 
         let argv_quoted: Vec<String> = self.argv.iter().map(|s| shell_quote(s)).collect();
