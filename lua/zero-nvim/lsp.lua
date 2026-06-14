@@ -7,6 +7,7 @@ local restart = require("zero-nvim.lsp.restart")
 -- In-flight start lock keyed by "lsp_name:root_dir". Prevents racing starts
 -- when prewarm and FileType-autostart both fire for the same root.
 local starting = {}
+local lsp_probe_unsupported_warned = false
 
 -- LSP restart bookkeeping is centralized in lsp.restart. Keep the restart
 -- callbacks here for now because they depend on ensure_lsp_client.
@@ -117,6 +118,16 @@ local function preflight_lsp(user, host, port, cmd_args)
 
     local ok, res = pcall(vim.fn.rpcrequest, chan, "lsp_probe", user, host, port, cmd_args)
     if not ok then
+        if tostring(res):find("Unknown method: lsp_probe", 1, true) then
+            if not lsp_probe_unsupported_warned then
+                lsp_probe_unsupported_warned = true
+                vim.notify(
+                    "ZeroNvim: daemon does not support lsp_probe; skipping LSP preflight. Rebuild the daemon and restart Neovim to enable preflight checks.",
+                    vim.log.levels.WARN
+                )
+            end
+            return true, nil, chan
+        end
         return false, "LSP preflight RPC failed: " .. tostring(res)
     end
     if type(res) == "table" and res.ok == true then
