@@ -292,15 +292,11 @@ function M.open()
             local extra = new_last - last
             vim.schedule(function()
                 if not session.active or not vim.api.nvim_buf_is_valid(input_buf) then return end
-                if extra > 0 then
-                    local count = vim.api.nvim_buf_line_count(input_buf)
-                    local expected = session.show_replace and 2 or 1
-                    if count > expected then
-                        local pasted = vim.api.nvim_buf_get_lines(input_buf, first, new_last, false)
-                        vim.api.nvim_buf_set_lines(input_buf, first, new_last, false, { table.concat(pasted, " ") })
-                    end
-                end
                 local expected = session.show_replace and 2 or 1
+                if extra > 0 and vim.api.nvim_buf_line_count(input_buf) > expected then
+                    local pasted = vim.api.nvim_buf_get_lines(input_buf, first, new_last, false)
+                    vim.api.nvim_buf_set_lines(input_buf, first, new_last, false, { table.concat(pasted, " ") })
+                end
                 local count = vim.api.nvim_buf_line_count(input_buf)
                 if count < expected then
                     vim.api.nvim_buf_set_lines(input_buf, count, count, false, { "" })
