@@ -17,12 +17,22 @@
   E2E。两条入口都通：
   - `:Neogit cwd=zero://u@h:p/path`（显式 cwd）
   - 在 `zero://` buffer 上直接 `:Neogit`（fallback 自动用 buffer 名）
-- **Phase 3B — 暂存 / commit / push / pull**：⛔ 未开工。原计划 §4.2
-  `cmd_stdin_write / cmd_stdin_close`、§4.3 `pty` 模式都推迟到这里
-  （Phase 3A 范围内只读路径用一次性 `opts.stdin` 就够了，不需要增量
-  写入或 pty）。
+- **Phase 3B — 暂存 / commit / push / pull**：✅ 落地（commit / merge /
+  tag / push / pull / fetch）。daemon 端补了 `cmd_stdin_write` /
+  `cmd_stdin_close` RPC + worker 在 poll 循环里做增量 stdin 写入；
+  Lua `cmd.write_stdin` / `cmd.close_stdin` 暴露给 backend。fork 端
+  `client.wrap_remote` 拦截 GIT_EDITOR 流：commit/merge/tag 用本地
+  `RemoteCommitEditor`（基于 EditorBuffer + 本地 temp 文件）收消息，
+  `git commit -F -` 走 stdin 推下去。push/pull/fetch 直接复用 pty 通路
+  + runner 现有 username/password handler 通过 `process:send` →
+  `handle.send` → `cmd_stdin_write` 把用户输入回写。
+  - **不支持**：`rebase -i`（需 GIT_EDITOR 桥，留给 Phase 3C）；
+    `commit --amend` 不带 `-m`（需要拉取现有消息预填，留给 3C）。
+    两者都在 wrap_remote 里给明确 notification 拦下，不会让远端 git
+    挂死等远端不存在的 editor。
 - **Phase 3C — watcher 实时化 + GIT_EDITOR 桥**：⛔ 未开工。当前 watcher
-  走 `BufWritePost / FocusGained` 触发，不连远端 inotify。
+  走 `BufWritePost / FocusGained` 触发，不连远端 inotify；rebase -i /
+  amend-edit 仍未通。
 - **底层 cmd 基座 perf 优化**：✅ daemon 端 per-target exec session 复用
   + 连接后台预热（commit `161e8e4`）。把 `:Neogit` 冷启动从 3s+ 压到
   ~1s 以内，不仅 neogit 受益，搜索 / gitsigns / docker 后续都共享。
@@ -199,38 +209,44 @@ function Backend.spawn(opts, cb)
 end
 ```
 
-### 4.2 stdin 增量写入：daemon 侧待补
+### 4.2 stdin 增量写入：daemon 侧已落地（Phase 3B）
 
 neogit 的 `Process:send(text)` 是 *jobstart 后* 任意时刻往 stdin 写字节，
 比如 runner.lua 的 interactive 处理（`process:send(value .. "\r\n")`）。
 gitsigns 没用到这个能力——它只 `opts.stdin` 一次性传 patch。
 
-**daemon 侧需要补的 RPC**：
-- `cmd_stdin_write { handle, data }` — 往 stream 的 stdin 写字节
-- `cmd_stdin_close { handle }` — 关闭 stdin（git apply 等期望 EOF）
+**daemon 侧 Phase 3B 落地的 RPC**：
+- `cmd_stdin_write [session_id, data]` — 往 stream 的 stdin 写字节
+- `cmd_stdin_close [session_id]` — 通知 worker 把 stdin 关掉（send_eof）
 
-实现：connect.rs 里给 dedicated session 暴露 `stdin_writer`；
-cmd_stream 启动时把 ssh channel 的 stdin 半端存起来，
-新 RPC 拿 handle 找到 channel 写字节即可。
+实现要点：
+- `CmdHandle` 增加 `stdin_tx: Mutex<Option<mpsc::Sender<StdinMsg>>>`，
+  worker 启动时填上 sender，rx 进 `run_inner`。
+- `exec_stream.rs` 主 poll 循环每次 iteration 排空 stdin queue，把
+  pending 字节按 chunk 写到 channel（non-blocking write，
+  EAGAIN 不阻塞 stdout 读取）；写完队列且收到 close 标志后才 send_eof。
+- spec.stdin 仍然作为快路径保留：caller 一次性传完会立刻
+  write_all + send_eof（`git apply --cached -p2 -` 等），不进 queue。
+- Lua 层：`cmd.write_stdin(sid, data)` / `cmd.close_stdin(sid)` 都是
+  rpcnotify（不阻塞主线程）。`backend.lua` 的 SpawnHandle.send /
+  close_stdin 直接转发；spawn 期间 real_sid 还没就绪时把消息缓存到
+  `stdin_queue`，real_sid 一出来就 flush。
 
-→ **Status: deferred to Phase 3B**。Phase 3A 范围只读，所有命令都用
-一次性 `opts.stdin` 就够（`paths` 走 `cmd.sync`，`status -z` / `log` /
-`branch -vv` 等都没有写流），所以这块基座推到写命令打开时再补。
-
-### 4.3 PTY 模式
+### 4.3 PTY 模式（Phase 3B 已通）
 
 neogit 用 `pty=true` 主要是为了 git 的 ANSI 颜色 + `Username for ...` /
 `Password for ...` 这类 prompt 走 stderr 的特殊缓冲。
 
-cmd.stream 当前是 raw 模式。daemon 侧需要：
-- `cmd_stream { ..., pty: true }` → libssh2 `request_pty` + 把 channel
-  设为 PTY。stdout/stderr 在 PTY 下合并成单流——neogit 已经习惯（jobstart
-  pty=true 时 stderr 是空的，全在 stdout）
-- 终端宽高：80×24，写死即可（neogit 也是写死的）
+实现：daemon 端 `RemoteCommand.pty` 字段早期就预留好了；exec_stream
+建 channel 后看到 `cmd.pty` 就 `channel.request_pty("xterm-256color",
+None, None)`。Phase 3B 验证 push / pull / fetch 的 username/password
+prompt：runner.lua 的 `handle_line_interactive` 走 `process:send`
+推回输入 → backend 的 `handle.send` → `cmd.write_stdin` →
+worker 排队写 channel。username + `\r\n` 入 stdin → git 继续 →
+push 完成。
 
-→ **Status: deferred to Phase 3B**。Phase 3A 的只读命令不会触发 username
-/ password prompt；pty 主要是为 `git push` / `git fetch` 的交互式
-credential 这条路径准备的。
+PTY 模式下 stdout/stderr 合并成单流（libssh2 行为，与 nvim jobstart
+pty=true 一致）；neogit on_partial_line 走的就是单流，无需额外适配。
 
 ### 4.4 watcher
 
@@ -679,6 +695,57 @@ exec git -C "$d" rev-parse ...
 ```
 file/dir 两种入口都自动落到正确的目录，单 SSH RTT 不变。
 
+### 12. process.lua 在 spawn 后立刻 `self:send(self.input)`，不能再传 spec.stdin
+
+fork 的 `process.lua:Process:spawn` 在拿到 SpawnHandle 后会显式跑：
+```lua
+if self.input then
+  self:send(self.input)
+  -- ...
+  self:close_stdin()
+end
+```
+也就是说 stdin 数据是通过 SpawnHandle.send/close_stdin 推下去的。
+
+我们在 backend.lua 里如果**同时**把 `stdin = opts.stdin` 也塞给
+`cmd.stream`，daemon 会先一次性 `write_all + send_eof` 把数据写下去
+（spec.stdin 快路径），然后 SpawnHandle.send 又通过 cmd_stdin_write
+推一遍——同一份 message 被 git 看两次，commit message 里出现重复内容。
+
+修复：backend.lua 的 `cmd.stream` 调用**不**传 `stdin = opts.stdin`，
+完全依赖 handle.send/close_stdin 这条增量路径。spec.stdin 仅留给不
+通过 SpawnHandle 走的 caller（如 cmd.sync 的 git apply --cached）。
+
+### 13. `cmd.to_process({})` 仅构造、不 spawn — 适合 inspect 只读 argv
+
+fork 的 `client.wrap_remote` 需要在 spawn 之前判断 cmd 的 subcommand
+（commit / merge / rebase 等）以及 argv 里有没有 `-m` / `--no-edit`
+这类 skip-editor 标志。cli builder 的 `state` 是 closure-bound 私有
+（key 是 local symbol `k_state`），外部拿不到。
+
+绕过：调 `cmd.to_process({on_error=fn, hidden=true, long=false})` 拿到
+新构造的 Process（不 spawn，纯构造）。Process.cmd 是完整 argv 数组，
+可直接扫描。后续真正调 `cmd.call(...)` 会再触发一次 to_process（state
+共享），不影响。
+
+注意：扫 argv 时遇到 `-c key=val` 这类要消耗两个 token 的全局选项，
+要把 `key=val` 一起跳过——否则 `core.preloadindex=true` 会被当成
+subcommand。`-C dir` 同理。
+
+### 14. EditorBuffer 默认 `load=true` 会 Path:readlines —— 远端路径炸
+
+`Buffer.create { name = filename, load = true }` 走 `Path:new(filename):
+readlines()` 加载**本地**文件内容。远端 commit-msg 直接传
+`/remote/.git/COMMIT_EDITMSG` 会让 plenary 报 ENOENT 然后 EditorBuffer
+卡住。
+
+修复（fork `buffers/remote_commit_editor.lua`）：用本地 cache 目录
+mktemp 一份 `.gitcommit` 文件，预先 `vim.fn.writefile(initial_lines)`
+把模板（注释行）落盘，让 `load=true` 顺利读到。用户保存（Submit）后
+EditorBuffer 内部 `buffer:write()` 把 message 写回同一文件，我们在
+`on_unload` 回调里 `vim.fn.readfile` 读出来 + 剥掉 `^#` 注释行 → 拿
+干净 message 喂 `cmd.args("-F","-").input(message)`。
+
 ---
 
 ## 7. 分阶段交付
@@ -866,6 +933,7 @@ neogit 一次 refresh 触发 6+ 条 git 命令，原 cmd.stream 实现每条都�
 
 ### 新增（fork ~/Code/Neovim/neogit/ 内）
 - `lua/neogit/backends.lua`
+- `lua/neogit/buffers/remote_commit_editor.lua`（Phase 3B：本地收消息走 -F -）
 
 ### 修改（fork 内）
 - `lua/neogit/process.lua`
