@@ -133,6 +133,9 @@ function M.open()
     if state.active then ui.close_ui(state) end
 
     local preserved_query = per_buf_queries[source_buf] or ""
+    if preserved_query == "" then
+        preserved_query = vim.fn.expand("<cword>")
+    end
 
     state = {
         active = true,
@@ -181,7 +184,7 @@ function M.open()
     end
 
     -- Normal mode specific behaviors
-    vim.keymap.set("n", "<CR>", function()
+    vim.keymap.set({ "i", "n" }, "<CR>", function()
         local cursor = vim.api.nvim_win_get_cursor(0)
         if cursor[1] == 1 then
             -- Find line: Advance selection
@@ -268,19 +271,51 @@ function M.open()
         vim.cmd("stopinsert")
     end, { buffer = input_buf, silent = true })
 
+    -- Keep the two fields separate when editing at their boundaries.
+    vim.keymap.set("i", "<BS>", function()
+        local pos = vim.api.nvim_win_get_cursor(state.input_win)
+        return pos[1] == 2 and pos[2] == 0 and "" or "<BS>"
+    end, { buffer = input_buf, expr = true, silent = true })
+    vim.keymap.set("i", "<Del>", function()
+        local pos = vim.api.nvim_win_get_cursor(state.input_win)
+        local line = vim.api.nvim_buf_get_lines(input_buf, pos[1] - 1, pos[1], false)[1] or ""
+        return pos[1] == 1 and pos[2] == #line and "" or "<Del>"
+    end, { buffer = input_buf, expr = true, silent = true })
+
     state.timer = vim.loop.new_timer()
+    local session = state
     vim.api.nvim_buf_attach(input_buf, false, {
-        on_lines = function(_, _, _, _, _, _)
-            state.timer:stop()
-            state.timer:start(150, 0, vim.schedule_wrap(function()
-                ui.render_input(state)
+        on_lines = function(_, _, _, first, last, new_last)
+            if not session.active or not session.timer then return true end
+            session.timer:stop()
+            -- on_lines runs under textlock: repair pasted line breaks later.
+            local extra = new_last - last
+            vim.schedule(function()
+                if not session.active or not vim.api.nvim_buf_is_valid(input_buf) then return end
+                if extra > 0 then
+                    local count = vim.api.nvim_buf_line_count(input_buf)
+                    local expected = session.show_replace and 2 or 1
+                    if count > expected then
+                        local pasted = vim.api.nvim_buf_get_lines(input_buf, first, new_last, false)
+                        vim.api.nvim_buf_set_lines(input_buf, first, new_last, false, { table.concat(pasted, " ") })
+                    end
+                end
+                local expected = session.show_replace and 2 or 1
+                local count = vim.api.nvim_buf_line_count(input_buf)
+                if count < expected then
+                    vim.api.nvim_buf_set_lines(input_buf, count, count, false, { "" })
+                end
+            end)
+            session.timer:start(150, 0, vim.schedule_wrap(function()
+                if not session.active then return end
+                ui.render_input(session)
                 execute_search()
             end))
         end
     })
 
     ui.render_input(state)
-    ui.render_results(state)
+    execute_search()
 
     vim.cmd("startinsert!")
 end
