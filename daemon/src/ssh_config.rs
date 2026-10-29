@@ -4,7 +4,7 @@
 // 提供 list_ssh_hosts 和 resolve_ssh_target 两个 RPC 方法，
 // 通过 ssh2-config 库实现完整 OpenSSH 语法支持。
 
-use crate::state::DaemonState;
+use crate::state::{DaemonState, LockExt};
 use rmpv::Value;
 use std::sync::{Arc, Mutex};
 
@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 ///
 /// 返回: [{ host, hostname, user, port, identity_file }]
 pub fn handle_list_ssh_hosts(state: &Arc<Mutex<DaemonState>>) -> Result<Value, anyhow::Error> {
-    let state_lock = state.lock().unwrap();
+    let state_lock = state.lock_ok();
     let config = state_lock
         .ssh_config
         .as_ref()
@@ -82,7 +82,7 @@ pub fn handle_resolve_ssh_target(
     target: &str,
     state: &Arc<Mutex<DaemonState>>,
 ) -> Result<Value, anyhow::Error> {
-    let state_lock = state.lock().unwrap();
+    let state_lock = state.lock_ok();
 
     // 先尝试从 SSH 配置中解析（处理纯 alias 场景）
     if let Some(ref config) = state_lock.ssh_config {

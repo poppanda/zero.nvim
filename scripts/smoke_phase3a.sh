@@ -4,21 +4,21 @@
 #
 # 用法: bash scripts/smoke_phase3a.sh
 #
-# 环境前提：
-#   * fork neogit 在 ~/Code/Neovim/neogit
-#   * plenary.nvim 在 ~/.local/share/nvim/lazy/plenary.nvim
+# 环境变量（可选）：
+#   ZERO_NEOGIT_ROOT  fork neogit 路径（默认 <repo>/../neogit）
+#   ZERO_PLENARY_ROOT plenary.nvim 路径（默认 ~/.local/share/nvim/lazy/plenary.nvim）
 set -e
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-NEOGIT_FORK="$HOME/Code/Neovim/neogit"
-PLENARY="$HOME/.local/share/nvim/lazy/plenary.nvim"
+NEOGIT_FORK="${ZERO_NEOGIT_ROOT:-$ROOT/../neogit}"
+PLENARY="${ZERO_PLENARY_ROOT:-$HOME/.local/share/nvim/lazy/plenary.nvim}"
 
 if [ ! -d "$NEOGIT_FORK" ]; then
-    echo "[FAIL] neogit fork not found at $NEOGIT_FORK"
-    exit 1
+    echo "[FAIL] neogit fork not found at $NEOGIT_FORK (set ZERO_NEOGIT_ROOT)" >&2
+    exit 2
 fi
 if [ ! -d "$PLENARY" ]; then
-    echo "[FAIL] plenary.nvim not found at $PLENARY"
-    exit 1
+    echo "[FAIL] plenary.nvim not found at $PLENARY (set ZERO_PLENARY_ROOT)" >&2
+    exit 2
 fi
 
 exec nvim --headless --clean -u NONE \

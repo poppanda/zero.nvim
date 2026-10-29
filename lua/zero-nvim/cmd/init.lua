@@ -111,7 +111,7 @@ function M.stream(target, spec, handlers)
     )
     if not ok then
         -- 启动失败：清掉刚注册的 session
-        exec._sessions[sid] = nil
+        exec.unregister(sid)
         return nil, tostring(res)
     end
     return sid

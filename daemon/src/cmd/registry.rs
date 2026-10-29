@@ -5,6 +5,7 @@
 // session_id 由 Lua 端生成（uuid 或 vim.loop.now() 字符串），daemon 不解析它的语义。
 
 use crate::cmd::cancel::CancelToken;
+use crate::state::LockExt;
 use std::collections::HashMap;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -39,7 +40,7 @@ impl CmdHandle {
 
     /// 推一段字节给 worker 写入 stdin。返回 false 表示通道已关闭/未就绪。
     pub fn send_stdin(&self, data: Vec<u8>) -> bool {
-        let g = self.stdin_tx.lock().unwrap();
+        let g = self.stdin_tx.lock_ok();
         if let Some(tx) = g.as_ref() {
             tx.send(StdinMsg::Write(data)).is_ok()
         } else {
@@ -49,7 +50,7 @@ impl CmdHandle {
 
     /// 通知 worker 把 stdin 关掉（send_eof）。返回 false 表示通道已关闭/未就绪。
     pub fn close_stdin(&self) -> bool {
-        let g = self.stdin_tx.lock().unwrap();
+        let g = self.stdin_tx.lock_ok();
         if let Some(tx) = g.as_ref() {
             tx.send(StdinMsg::Close).is_ok()
         } else {

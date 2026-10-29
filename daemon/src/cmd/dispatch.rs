@@ -29,7 +29,7 @@ use crate::cmd::exec_sync::run_sync;
 use crate::cmd::registry::CmdHandle;
 use crate::cmd::spec::{ConnTarget, RemoteCommand};
 use crate::cmd::CommandEvent;
-use crate::state::DaemonState;
+use crate::state::{DaemonState, LockExt};
 use rmpv::Value;
 use std::sync::{mpsc, Arc, Mutex};
 
@@ -39,7 +39,7 @@ pub fn handle_cmd_sync(
 ) -> Result<Value, anyhow::Error> {
     let args = params.as_array().ok_or(anyhow::anyhow!("Invalid params"))?;
     let user = args
-        .get(0)
+        .first()
         .and_then(|v| v.as_str())
         .ok_or(anyhow::anyhow!("Missing user"))?;
     let host = args
@@ -83,7 +83,7 @@ pub fn handle_cmd_stream(
 ) -> Result<Value, anyhow::Error> {
     let args = params.as_array().ok_or(anyhow::anyhow!("Invalid params"))?;
     let session_id = args
-        .get(0)
+        .first()
         .and_then(|v| v.as_str())
         .ok_or(anyhow::anyhow!("Missing session_id"))?;
     let user = args
@@ -103,10 +103,10 @@ pub fn handle_cmd_stream(
     // 注册句柄
     let handle = Arc::new(CmdHandle::new(session_id.to_string()));
     {
-        let state_lock = state.lock().unwrap();
+        let state_lock = state.lock_ok();
         let reg_arc = state_lock.running_commands.clone();
         drop(state_lock);
-        let mut reg = reg_arc.lock().unwrap();
+        let mut reg = reg_arc.lock_ok();
         reg.insert(handle.clone());
     }
 
@@ -171,23 +171,23 @@ pub fn handle_cmd_cancel(
 ) -> Result<Value, anyhow::Error> {
     let args = params.as_array().ok_or(anyhow::anyhow!("Invalid params"))?;
     let session_id = args
-        .get(0)
+        .first()
         .and_then(|v| v.as_str())
         .ok_or(anyhow::anyhow!("Missing session_id"))?;
 
     let reg_arc = {
-        let state_lock = state.lock().unwrap();
+        let state_lock = state.lock_ok();
         state_lock.running_commands.clone()
     };
     let handle_opt = {
-        let reg = reg_arc.lock().unwrap();
+        let reg = reg_arc.lock_ok();
         reg.get(session_id)
     };
     if let Some(h) = handle_opt {
         h.cancel.cancel();
-        eprintln!("Daemon: cmd_cancel session={}", session_id);
+        debug_log!("Daemon: cmd_cancel session={}", session_id);
     } else {
-        eprintln!(
+        debug_log!(
             "Daemon: cmd_cancel session={} 未找到（可能已结束）",
             session_id
         );
@@ -205,7 +205,7 @@ pub fn handle_cmd_stdin_write(
 ) -> Result<Value, anyhow::Error> {
     let args = params.as_array().ok_or(anyhow::anyhow!("Invalid params"))?;
     let session_id = args
-        .get(0)
+        .first()
         .and_then(|v| v.as_str())
         .ok_or(anyhow::anyhow!("Missing session_id"))?;
     let data_v = args.get(1).ok_or(anyhow::anyhow!("Missing data"))?;
@@ -216,22 +216,22 @@ pub fn handle_cmd_stdin_write(
     };
 
     let reg_arc = {
-        let state_lock = state.lock().unwrap();
+        let state_lock = state.lock_ok();
         state_lock.running_commands.clone()
     };
     let handle_opt = {
-        let reg = reg_arc.lock().unwrap();
+        let reg = reg_arc.lock_ok();
         reg.get(session_id)
     };
     if let Some(h) = handle_opt {
         if !h.send_stdin(bytes) {
-            eprintln!(
+            debug_log!(
                 "Daemon: cmd_stdin_write session={} 写入失败（worker 已结束或 stdin 未就绪）",
                 session_id
             );
         }
     } else {
-        eprintln!(
+        debug_log!(
             "Daemon: cmd_stdin_write session={} 未找到（可能已结束）",
             session_id
         );
@@ -246,27 +246,27 @@ pub fn handle_cmd_stdin_close(
 ) -> Result<Value, anyhow::Error> {
     let args = params.as_array().ok_or(anyhow::anyhow!("Invalid params"))?;
     let session_id = args
-        .get(0)
+        .first()
         .and_then(|v| v.as_str())
         .ok_or(anyhow::anyhow!("Missing session_id"))?;
 
     let reg_arc = {
-        let state_lock = state.lock().unwrap();
+        let state_lock = state.lock_ok();
         state_lock.running_commands.clone()
     };
     let handle_opt = {
-        let reg = reg_arc.lock().unwrap();
+        let reg = reg_arc.lock_ok();
         reg.get(session_id)
     };
     if let Some(h) = handle_opt {
         if !h.close_stdin() {
-            eprintln!(
+            debug_log!(
                 "Daemon: cmd_stdin_close session={} close 失败（worker 已结束）",
                 session_id
             );
         }
     } else {
-        eprintln!(
+        debug_log!(
             "Daemon: cmd_stdin_close session={} 未找到（可能已结束）",
             session_id
         );

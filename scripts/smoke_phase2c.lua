@@ -8,7 +8,8 @@
 -- 轮询 timer 行为。:Gitsigns refresh 用 monkey-patch 抓调用次数，不真的跑
 -- gitsigns（fork 不一定在 rtp 里）。
 
-local ZERO_ROOT = "/Users/smile./Code/Neovim/zero.nvim"
+-- 仓库根目录：从本脚本位置推导（scripts/ 的上一级），不硬编码
+local ZERO_ROOT = vim.fn.fnamemodify(debug.getinfo(1, "S").source:sub(2), ":p:h:h")
 vim.opt.rtp:prepend(ZERO_ROOT)
 
 local function out(s) io.stdout:write(s .. "\n"); io.stdout:flush() end

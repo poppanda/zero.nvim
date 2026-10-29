@@ -1,13 +1,15 @@
 -- =============================================================================
 -- scripts/smoke_phase2a.lua — Phase 2A 端到端烟雾测试
 -- =============================================================================
--- 用法:
+-- 用法（参数或环境变量二选一，参数优先）:
 --   nvim --headless -u NONE -l scripts/smoke_phase2a.lua \
 --     <user> <host> <port> <remote_path>
 --
--- 例:
---   nvim --headless -u NONE -l scripts/smoke_phase2a.lua \
---     home 47.117.104.181 22022 /home/home/Code/2025-code-craft-preliminary/code/disk.cpp
+--   ZERO_TEST_USER=me ZERO_TEST_HOST=dev.example.com ZERO_TEST_PORT=22 \
+--   ZERO_TEST_PATH=/home/me/repo/file.c \
+--     nvim --headless -u NONE -l scripts/smoke_phase2a.lua
+--
+-- 依赖 gitsigns fork：ZERO_GITSIGNS_ROOT（默认 ../gitsigns.nvim，相对仓库根）
 --
 -- 测试链路（自下而上 6 层）:
 --   L1: cmd.stream 直连 + echo  —— 验证 daemon notification 通路
@@ -20,19 +22,40 @@
 -- 每层只在前一层通过后才跑。任何一层卡住 / 报错都会立刻打 FAIL 并退出。
 
 local args = _G.arg or {}
-if #args < 4 then
-    io.stderr:write("usage: nvim --headless -u NONE -l smoke_phase2a.lua <user> <host> <port> <remote_path>\n")
-    os.exit(2)
+local function param(i, env)
+    local v = args[i]
+    if v == nil or v == "" then v = os.getenv(env) end
+    if v == "" then v = nil end
+    return v
 end
 
-local USER       = args[1]
-local HOST       = args[2]
-local PORT       = tonumber(args[3])
-local REMOTE_PATH = args[4]
+local USER        = param(1, "ZERO_TEST_USER")
+local HOST        = param(2, "ZERO_TEST_HOST")
+local PORT        = tonumber(param(3, "ZERO_TEST_PORT") or "22")
+local REMOTE_PATH = param(4, "ZERO_TEST_PATH")
+if not USER or not HOST or not PORT or not REMOTE_PATH then
+    io.stderr:write(table.concat({
+        "usage: nvim --headless -u NONE -l scripts/smoke_phase2a.lua <user> <host> <port> <remote_path>",
+        "   or: ZERO_TEST_USER=... ZERO_TEST_HOST=... [ZERO_TEST_PORT=22] ZERO_TEST_PATH=... \\",
+        "       nvim --headless -u NONE -l scripts/smoke_phase2a.lua",
+        "missing: " .. table.concat(vim.tbl_filter(function(x) return x ~= "" end, {
+            USER and "" or "user(ZERO_TEST_USER)",
+            HOST and "" or "host(ZERO_TEST_HOST)",
+            PORT and "" or "port(ZERO_TEST_PORT)",
+            REMOTE_PATH and "" or "remote_path(ZERO_TEST_PATH)",
+        }), ", "),
+    }, "\n") .. "\n")
+    os.exit(2)
+end
 local TARGET     = { user = USER, host = HOST, port = PORT }
 
-local ZERO_ROOT     = "/Users/smile./Code/Neovim/zero.nvim"
-local GITSIGNS_ROOT = "/Users/smile./Code/Neovim/gitsigns.nvim"
+-- 仓库根目录：从本脚本位置推导（scripts/ 的上一级），不硬编码
+local ZERO_ROOT = vim.fn.fnamemodify(debug.getinfo(1, "S").source:sub(2), ":p:h:h")
+local GITSIGNS_ROOT = os.getenv("ZERO_GITSIGNS_ROOT") or vim.fn.fnamemodify(ZERO_ROOT .. "/../gitsigns.nvim", ":p")
+if vim.fn.isdirectory(GITSIGNS_ROOT) == 0 then
+    io.stderr:write("gitsigns fork not found at " .. GITSIGNS_ROOT .. " (set ZERO_GITSIGNS_ROOT)\n")
+    os.exit(2)
+end
 
 -- -----------------------------------------------------------------------------
 -- 输出工具：直写 stdout 不被 :messages 吞

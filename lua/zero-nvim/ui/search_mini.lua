@@ -1,6 +1,16 @@
 local M = {}
 
+local ui_seq = 0
+
+--- 可重入 teardown：q/<Esc>/<CR> 或任一浮窗被外部关闭（WinClosed）都走这里。
 function M.close_ui(state)
+    if state.closed then return end
+    state.closed = true
+    -- 先删 augroup，下面主动关窗时不再回调
+    if state.augroup then
+        pcall(vim.api.nvim_del_augroup_by_id, state.augroup)
+        state.augroup = nil
+    end
     if state.input_win and vim.api.nvim_win_is_valid(state.input_win) then
         vim.api.nvim_win_close(state.input_win, true)
     end
@@ -19,8 +29,10 @@ function M.close_ui(state)
         end
     end
     if state.timer then
-        state.timer:stop()
-        state.timer:close()
+        pcall(function()
+            state.timer:stop()
+            if not state.timer:is_closing() then state.timer:close() end
+        end)
         state.timer = nil
     end
     vim.cmd("stopinsert")
@@ -282,6 +294,20 @@ function M.create_ui(state)
     state.input_win = input_win
     state.results_buf = results_buf
     state.results_win = results_win
+
+    -- 任一浮窗被关（:q / <C-w>o 等）→ 两个一起关并清理 timer / 高亮
+    ui_seq = ui_seq + 1
+    state.augroup = vim.api.nvim_create_augroup("ZeroSearchMiniUI_" .. ui_seq, { clear = true })
+    for _, win in ipairs({ input_win, results_win }) do
+        vim.api.nvim_create_autocmd("WinClosed", {
+            group = state.augroup,
+            pattern = tostring(win),
+            once = true,
+            callback = function()
+                vim.schedule(function() M.close_ui(state) end)
+            end,
+        })
+    end
 
     pcall(vim.api.nvim_set_option_value, "winhl", "NormalFloat:TelescopePromptNormal,FloatBorder:TelescopePromptBorder",
         { win = input_win })

@@ -19,7 +19,8 @@ function M.pick_host(hosts, on_select)
     for _, entry in ipairs(hosts) do
         local hostname = entry.hostname or entry.host
         local user = entry.user or vim.env.USER or "?"
-        local port_str = entry.port ~= 22 and (":" .. entry.port) or ""
+        local port = tonumber(entry.port) or 22
+        local port_str = port ~= 22 and (":" .. port) or ""
         local line = string.format("  %-16s  %s@%s%s", entry.host, user, hostname, port_str)
         max_width = math.max(max_width, #line + 4)
         table.insert(display_lines, line)

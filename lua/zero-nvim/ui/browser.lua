@@ -16,8 +16,16 @@ local M = {}
 function M.browse_path(user, hostname, port, on_confirm, opts)
     local zero = require("zero-nvim")
     opts = opts or {}
-    local default_home = "/home/" .. user
-    local current_path = opts.start_path or default_home
+    -- 起始目录：优先远端真实 $HOME（macOS 是 /Users/<u>，root 是 /root），
+    -- 拿不到（旧版 init.lua / RPC 失败）就退回 "/"，不再硬编码 /home/<user>。
+    local current_path = opts.start_path
+    if not current_path then
+        local ok, home = false, nil
+        if type(zero.get_remote_home) == "function" then
+            ok, home = pcall(zero.get_remote_home, user, hostname, port)
+        end
+        current_path = (ok and type(home) == "string" and home ~= "") and home or "/"
+    end
     local display_name = opts.display_name or string.format("%s@%s", user, hostname)
     local show_hidden = false
 

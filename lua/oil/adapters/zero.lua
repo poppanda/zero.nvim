@@ -5,13 +5,14 @@
 --- URL scheme: zero://user@host:port/remote/path
 --- (port defaults to 22 if omitted)
 
-local cache = require("oil.cache")
-local constants = require("oil.constants")
-local loading = require("oil.loading")
-local pathutil = require("oil.pathutil")
-local util = require("oil.util")
+-- oil modules are required lazily so that merely requiring this file (e.g.
+-- a health check or test without oil installed) doesn't error out.
+local function oil(mod)
+  return require("oil." .. mod)
+end
 
-local FIELD_META = constants.FIELD_META
+local uri = require("zero-nvim.uri")
+local buffer_io = require("zero-nvim.buffer_io")
 
 local M = {}
 
@@ -28,7 +29,13 @@ local M = {}
 ---@param oil_url string
 ---@return oil.zeroUrl
 M.parse_url = function(oil_url)
-  local scheme, url = util.parse_url(oil_url)
+  -- Fast path: the shared parser (handles IPv6 [addr] hosts, default port).
+  local u, h, p, path = uri.parse(oil_url)
+  if u then
+    return { scheme = "zero://", user = u, host = h, port = p, path = uri.normalize_path(path) }
+  end
+
+  local scheme, url = oil("util").parse_url(oil_url)
   assert(scheme and url, string.format("Malformed zero url: '%s'", oil_url))
 
   local ret = { scheme = scheme }
@@ -64,6 +71,9 @@ end
 ---@param url oil.zeroUrl
 ---@return string
 local function url_to_str(url)
+  if url.user and url.user ~= "" and url.port then
+    return uri.format(url.user, url.host, url.port, uri.normalize_path(url.path))
+  end
   local pieces = { url.scheme }
   if url.user and url.user ~= "" then
     table.insert(pieces, url.user)
@@ -96,7 +106,7 @@ end
 ---@return string
 M.get_parent = function(bufname)
   local res = M.parse_url(bufname)
-  res.path = pathutil.parent(res.path)
+  res.path = uri.parent_dir(res.path)
   return url_to_str(res)
 end
 
@@ -105,15 +115,12 @@ end
 M.normalize_url = function(url, callback)
   local res = M.parse_url(url)
   -- Ensure directory paths end with /
-  if not vim.endswith(res.path, "/") then
+  -- (prefetched URIs are known files: skip the stat round-trip)
+  if not vim.endswith(res.path, "/") and not get_zero()._has_prefetched(url_to_str(res)) then
     -- We need to stat to know if it's a directory
-    local zero = get_zero()
-    local chan, err = zero.ensure_connection(res.user, res.host, res.port)
-    if chan then
-      local ok, ftype = pcall(vim.fn.rpcrequest, chan, "stat", res.user, res.host, res.port, res.path)
-      if ok and ftype == "directory" then
-        res.path = res.path .. "/"
-      end
+    local ok, ftype = get_zero().request(res.user, res.host, res.port, "stat", res.path)
+    if ok and ftype == "directory" then
+      res.path = res.path .. "/"
     end
   end
   callback(url_to_str(res))
@@ -133,6 +140,8 @@ M.list = function(url, column_defs, callback)
       return
     end
 
+    local cache = oil("cache")
+    local FIELD_META = oil("constants").FIELD_META
     local cache_entries = {}
     for _, entry in ipairs(entries_data) do
       local entry_type = entry.type == "directory" and "directory" or "file"
@@ -154,35 +163,17 @@ end
 
 ---@param bufnr integer
 M.write_file = function(bufnr)
+  -- Synchronous on purpose: oil's BufWriteCmd returns right after this, and
+  -- :wq / :x need 'modified' cleared by then. Shared with the builtin
+  -- BufWriteCmd (load-failure guard, eol/fileformat handling, reconnect).
+  local loading = oil("loading")
   loading.set_loading(bufnr, true)
-  local bufname = vim.api.nvim_buf_get_name(bufnr)
-  local res = M.parse_url(bufname)
-  local zero = get_zero()
-
-  local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
-  local content = table.concat(lines, "\n")
-  -- Ensure trailing newline if file is not empty
-  if #content > 0 and content:sub(-1) ~= "\n" then
-    content = content .. "\n"
+  local ok, err = pcall(get_zero().write_buffer, bufnr, vim.api.nvim_buf_get_name(bufnr),
+    { bang = vim.v.cmdbang == 1 })
+  loading.set_loading(bufnr, false)
+  if not ok then
+    vim.notify("Save failed: " .. tostring(err), vim.log.levels.ERROR)
   end
-
-  vim.schedule(function()
-    local chan = zero._get_daemon_chan and zero._get_daemon_chan()
-    if not chan then
-      loading.set_loading(bufnr, false)
-      vim.notify("Daemon not connected", vim.log.levels.ERROR)
-      return
-    end
-
-    local ok, ret = pcall(vim.fn.rpcrequest, chan, "write_file", res.user, res.host, res.port, res.path, content)
-    loading.set_loading(bufnr, false)
-
-    if ok and ret == true then
-      vim.bo[bufnr].modified = false
-    else
-      vim.notify("Save failed: " .. tostring(ret), vim.log.levels.ERROR)
-    end
-  end)
 end
 
 ---@param url string
@@ -191,8 +182,6 @@ end
 M.create_entry = function(url, type, callback)
   local res = M.parse_url(url)
   local zero = get_zero()
-  local chan = zero._get_daemon_chan and zero._get_daemon_chan()
-  if not chan then return callback("Daemon not connected") end
 
   -- Prevent creating files ending with / (Oil handles normalization but just in case)
   if type == "file" and vim.endswith(res.path, "/") then
@@ -200,14 +189,14 @@ M.create_entry = function(url, type, callback)
   end
 
   vim.schedule(function()
+    local ok, ret
     if type == "directory" then
-      local ok, ret = pcall(vim.fn.rpcrequest, chan, "mkdir", res.user, res.host, res.port, res.path)
-      if ok and ret == true then callback() else callback(ret or "RPC failed") end
+      ok, ret = zero.request_interactive(res.user, res.host, res.port, "mkdir", res.path)
     else
       -- Create empty file
-      local ok, ret = pcall(vim.fn.rpcrequest, chan, "write_file", res.user, res.host, res.port, res.path, "")
-      if ok and ret == true then callback() else callback(ret or "RPC failed") end
+      ok, ret = zero.request_interactive(res.user, res.host, res.port, "write_file", res.path, "")
     end
+    if ok and ret == true then callback() else callback(tostring(ret or "RPC failed")) end
   end)
 end
 
@@ -216,44 +205,27 @@ end
 M.delete_entry = function(url, callback)
   local res = M.parse_url(url)
   local zero = get_zero()
-  local chan = zero._get_daemon_chan and zero._get_daemon_chan()
-  if not chan then return callback("Daemon not connected") end
 
   vim.schedule(function()
-    -- Try remove_file first, if it fails maybe it's a dir?
-    -- Actually we should probably know the type, but delete_entry signature doesn't pass it.
-    -- However, we can guess or try both. Or use `stat`?
-    -- Optimization: Just try remove_file, if fail try remove_dir?
-    -- Better: Check trailing slash? Oil urls for dirs usually end in /
+    local function rm(method)
+      local ok, ret = zero.request_interactive(res.user, res.host, res.port, method, res.path)
+      if ok and ret == true then return nil end
+      if ok then return "Delete failed: unexpected reply " .. tostring(ret) end
+      return tostring(ret)
+    end
 
-    local method = "remove_file"
+    -- Oil passes directory URLs with a trailing "/": go straight to rmdir.
     if vim.endswith(url, "/") then
-      method = "remove_dir"
-    else
-      -- If no trailing slash, it COULD be a dir, but usually Oil adds slash for dirs in list.
-      -- Let's try remove_file first.
+      return callback(rm("remove_dir"))
     end
 
-    -- To be safe, let's stat it first? No, that's slow.
-    -- Let's assume Oil passes us the URL as it knows it.
-    -- If we look at `list`, we cache entries.
-
-    -- Let's try remove_file, if it fails with specific error?
-    -- The daemon `remove_file` uses `unlink`, `remove_dir` uses `rmdir`.
-
-    local ok, ret = pcall(vim.fn.rpcrequest, chan, "remove_file", res.user, res.host, res.port, res.path)
-    if ok and ret == true then
-      callback()
-      return
-    end
-
-    -- If remove_file failed, try remove_dir (maybe it was a dir)
-    local ok2, ret2 = pcall(vim.fn.rpcrequest, chan, "remove_dir", res.user, res.host, res.port, res.path)
-    if ok2 and ret2 == true then
-      callback()
-    else
-      callback(ret or ret2 or "Delete failed")
-    end
+    -- Otherwise assume a file; fall back to rmdir in case it's a directory
+    -- whose URL lost its slash. Report the file error if both fail — that is
+    -- the operation the user actually asked for.
+    local file_err = rm("remove_file")
+    if not file_err then return callback() end
+    if not rm("remove_dir") then return callback() end
+    callback(file_err)
   end)
 end
 
@@ -264,18 +236,19 @@ M.rename_entry = function(src_url, dst_url, callback)
   local res_src = M.parse_url(src_url)
   local res_dst = M.parse_url(dst_url)
   local zero = get_zero()
-  local chan = zero._get_daemon_chan and zero._get_daemon_chan()
-  if not chan then return callback("Daemon not connected") end
 
-  -- Basic check: user/host/port should match
-  if res_src.user ~= res_dst.user or res_src.host ~= res_dst.host then
-    return callback("Cannot rename across different hosts")
+  -- rename is a single SFTP op on one connection: src and dst must share it.
+  if res_src.user ~= res_dst.user or res_src.host ~= res_dst.host
+      or tonumber(res_src.port) ~= tonumber(res_dst.port) then
+    return callback(string.format(
+      "Cannot move across different remotes (%s@%s:%s -> %s@%s:%s); copy + delete instead",
+      res_src.user, res_src.host, tostring(res_src.port), res_dst.user, res_dst.host, tostring(res_dst.port)))
   end
 
   vim.schedule(function()
-    local ok, ret = pcall(vim.fn.rpcrequest, chan, "rename", res_src.user, res_src.host, res_src.port, res_src.path,
-      res_dst.path)
-    if ok and ret == true then callback() else callback(ret or "Rename failed") end
+    local ok, ret = zero.request_interactive(res_src.user, res_src.host, res_src.port, "rename",
+      res_src.path, res_dst.path)
+    if ok and ret == true then callback() else callback(tostring(ret or "Rename failed")) end
   end)
 end
 
@@ -315,60 +288,74 @@ M.get_column = function(name)
   return nil
 end
 
+local function detect_filetype(bufnr, bufname)
+  if vim.bo[bufnr].filetype == "" or vim.bo[bufnr].filetype == "oil" then
+    local basename = oil("pathutil").basename(bufname)
+    local filetype = vim.filetype.match({ buf = bufnr, filename = basename })
+    if filetype then
+      vim.bo[bufnr].filetype = filetype
+    end
+  end
+end
+
 ---@param bufnr integer
 M.read_file = function(bufnr)
+  local loading = oil("loading")
   local bufname = vim.api.nvim_buf_get_name(bufnr)
+  local zero = get_zero()
 
-  -- Fast path: if the buffer was already populated by zero-nvim's
-  -- locations_to_items batch fetch (LSP-jump preload), DON'T re-fetch
-  -- and DON'T re-set lines. nvim_buf_set_lines(0, -1, ...) replacing
-  -- ALL lines causes Neovim to reset the cursor in any window
+  -- Fast path: if the buffer was already populated (e.g. by an earlier load),
+  -- DON'T re-fetch and DON'T re-set lines. nvim_buf_set_lines(0, -1, ...)
+  -- replacing ALL lines causes Neovim to reset the cursor in any window
   -- displaying the buffer to (1,0) — clobbering the LSP target.
   local lc = vim.api.nvim_buf_line_count(bufnr)
-  local already_loaded = lc > 1 or
-    (lc == 1 and vim.api.nvim_buf_get_lines(bufnr, 0, 1, false)[1] ~= "")
-  if already_loaded then
+  local already_loaded = vim.b[bufnr].zero_loaded and (lc > 1 or
+    (lc == 1 and vim.api.nvim_buf_get_lines(bufnr, 0, 1, false)[1] ~= ""))
+  -- Content prefetched by zero-nvim's LSP-location preload: apply it
+  -- synchronously (no extra round-trip, cursor stays where LSP puts it).
+  local prefetched = not already_loaded and zero._take_prefetched(bufname) or nil
+  if already_loaded or prefetched then
     loading.set_loading(bufnr, false)
-    vim.bo[bufnr].modifiable = true
-    vim.bo[bufnr].modified = false
-    if vim.bo[bufnr].filetype == "" or vim.bo[bufnr].filetype == "oil" then
-      local basename = pathutil.basename(bufname)
-      local filetype = vim.filetype.match({ buf = bufnr, filename = basename })
-      if filetype then
-        vim.bo[bufnr].filetype = filetype
-      end
+    if prefetched then
+      vim.cmd.doautocmd({ args = { "BufReadPre", bufname }, mods = { silent = true } })
+      buffer_io.apply(bufnr, prefetched)
+    else
+      vim.bo[bufnr].modifiable = true
+      vim.bo[bufnr].modified = false
     end
+    detect_filetype(bufnr, bufname)
     vim.cmd.doautocmd({ args = { "BufReadPost", bufname }, mods = { silent = true } })
     return
   end
 
   loading.set_loading(bufnr, true)
   local res = M.parse_url(bufname)
-  local zero = get_zero()
 
   vim.schedule(function()
-    local content, err = zero.get_file_content(res.user, res.host, res.port, res.path)
+    if not vim.api.nvim_buf_is_valid(bufnr) then return end
+    local ok, fetched = zero.request(res.user, res.host, res.port, "fetch_path", res.path)
     loading.set_loading(bufnr, false)
 
-    vim.bo[bufnr].modifiable = true
     vim.cmd.doautocmd({ args = { "BufReadPre", bufname }, mods = { silent = true } })
 
-    if not content then
-      vim.api.nvim_buf_set_lines(bufnr, 0, -1, true, { "Error: " .. (err or "unknown error") })
+    if ok and type(fetched) == "table" and fetched[1] == "file" then
+      buffer_io.apply(bufnr, buffer_io.to_bytes(fetched[2]) or "")
+    elseif not ok and buffer_io.is_missing_error(fetched) then
+      -- New file: empty, writable
+      buffer_io.apply(bufnr, "")
+      vim.b[bufnr].zero_new_file = true
     else
-      local lines = vim.split(content, "\n")
-      if #lines > 0 and lines[#lines] == "" then
-        table.remove(lines)
-      end
-      vim.api.nvim_buf_set_lines(bufnr, 0, -1, true, lines)
+      -- Never put the error text into the buffer: a later :w would write it
+      -- over the real file. Leave it empty + non-modifiable; BufWriteCmd
+      -- refuses to save it (unless :w!).
+      buffer_io.mark_failed(bufnr)
+      local msg = ok and ("not a regular file: " .. res.path) or tostring(fetched)
+      vim.notify("ZeroNvim: Failed to read " .. res.path .. ": " .. msg
+        .. " (buffer is read-only; :e to retry)", vim.log.levels.ERROR)
+      return
     end
 
-    vim.bo[bufnr].modified = false
-    local basename = pathutil.basename(bufname)
-    local filetype = vim.filetype.match({ buf = bufnr, filename = basename })
-    if filetype then
-      vim.bo[bufnr].filetype = filetype
-    end
+    detect_filetype(bufnr, bufname)
     vim.cmd.doautocmd({ args = { "BufReadPost", bufname }, mods = { silent = true } })
   end)
 end

@@ -5,7 +5,10 @@
 -- + zero-nvim + plenary 全挂上来，user 在里面手动跑 :Neogit cwd=zero://...
 --
 -- 用法：
---   nvim -u /Users/smile./Code/Neovim/zero.nvim/scripts/e2e_phase3a_init.lua
+--   nvim -u <repo>/scripts/e2e_phase3a_init.lua
+--
+-- 可选环境变量：ZERO_NEOGIT_ROOT（默认 <repo>/../neogit）、ZERO_PLENARY_ROOT、
+-- ZERO_DEVICONS_ROOT（默认 lazy.nvim 安装位置）
 --
 -- 然后在 nvim 里：
 --   :Neogit cwd=zero://USER@HOST:PORT/path/to/remote/repo
@@ -25,15 +28,22 @@ vim.env.ZERO_NVIM_DEBUG = "1"
 -- 起个干净 log（保留上次会话内容会让排查更乱）
 vim.fn.delete("/tmp/zero-daemon.log")
 
--- 2) 把三个插件挂到 rtp。如果你 lazy 把 plenary / nvim-web-devicons 装在别处，
---    改下面两个路径即可；fork 路径写死在 ~/Code/Neovim/neogit。
+-- 2) 把三个插件挂到 rtp。路径可用环境变量覆盖；zero-nvim 根目录从本脚本位置推导。
 local HOME = os.getenv("HOME")
+local ZERO_ROOT = vim.fn.fnamemodify(debug.getinfo(1, "S").source:sub(2), ":p:h:h")
+local NEOGIT_ROOT = os.getenv("ZERO_NEOGIT_ROOT") or vim.fn.fnamemodify(ZERO_ROOT .. "/../neogit", ":p")
 local PATHS = {
-    HOME .. "/Code/Neovim/zero.nvim",                    -- zero-nvim 主体
-    HOME .. "/Code/Neovim/neogit",                       -- fork neogit (zero-nvim-backend 分支)
-    HOME .. "/.local/share/nvim/lazy/plenary.nvim",      -- neogit 强依赖
-    HOME .. "/.local/share/nvim/lazy/nvim-web-devicons", -- neogit 软依赖（没装也能跑）
+    ZERO_ROOT,                                                                       -- zero-nvim 主体
+    NEOGIT_ROOT,                                                                     -- fork neogit (zero-nvim-backend 分支)
+    os.getenv("ZERO_PLENARY_ROOT") or (HOME .. "/.local/share/nvim/lazy/plenary.nvim"),      -- neogit 强依赖
+    os.getenv("ZERO_DEVICONS_ROOT") or (HOME .. "/.local/share/nvim/lazy/nvim-web-devicons"), -- 软依赖（没装也能跑）
 }
+if vim.fn.isdirectory(NEOGIT_ROOT) == 0 then
+    vim.schedule(function()
+        vim.notify("e2e_phase3a_init: neogit fork not found at " .. NEOGIT_ROOT .. " (set ZERO_NEOGIT_ROOT)",
+            vim.log.levels.ERROR)
+    end)
+end
 for _, p in ipairs(PATHS) do
     if vim.fn.isdirectory(p) == 1 then
         vim.opt.runtimepath:prepend(p)

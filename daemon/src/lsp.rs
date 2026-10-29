@@ -12,21 +12,118 @@
 //
 // URI 转换（TCP→SSH and SSH→TCP）:
 //   zero://user@host:port/path  ↔  file:///path
-//   TCP→SSH: 替换 "zero://user@host:port" → "file://"
-//   SSH→TCP: 替换 "file://"               → "zero://user@host:port"
+//   TCP→SSH: 替换 `"zero://user@host:port/` → `"file:///`
+//   SSH→TCP: 替换 `"file:///`               → `"zero://user@host:port/`
+//   只改 JSON 字符串值开头的 URI（前面紧跟 `"`，前缀后紧跟 `/`）：
+//   避免 `:22` 误匹配 `:2222`，也不改 hover 文本里出现的 file:// 字样。
 //
 // 注意：vim.uri_from_bufnr 对已带 scheme 的 buffer name（如 zero://...）原样返回，
 // 不会加 file:// 前缀，因此 client_prefix 不含 "file://" 前缀。
 
 use crate::cmd::spec::shell_quote;
-use crate::state::DaemonState;
+use crate::state::{DaemonState, LockExt};
 use anyhow::Context;
 use rmpv::Value;
 use std::io::{Read, Write};
-use std::net::TcpListener;
-use std::process::{Command, Stdio};
+use std::net::{Shutdown, TcpListener, TcpStream};
+use std::path::PathBuf;
+use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
+
+/// Neovim 拿到端口后应在这段时间内连上来；超时则关掉 listener，避免线程泄漏
+const ACCEPT_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// 校验交给系统 ssh 的 user / host，防止参数注入（如 host = "-oProxyCommand=..."）。
+fn validate_ssh_target(user: &str, host: &str) -> Result<(), anyhow::Error> {
+    fn bad(s: &str) -> bool {
+        s.starts_with('-') || s.chars().any(|c| c.is_whitespace() || c.is_control())
+    }
+    if host.is_empty() || bad(host) || host.contains('@') {
+        return Err(anyhow::anyhow!("Invalid SSH host: {:?}", host));
+    }
+    if bad(user) || user.contains('@') {
+        return Err(anyhow::anyhow!("Invalid SSH user: {:?}", user));
+    }
+    Ok(())
+}
+
+/// ControlMaster socket 目录：放在用户私有目录（0700），而不是全局可写的 /tmp。
+/// 优先 $XDG_RUNTIME_DIR/zero-nvim，否则 ~/.cache/zero-nvim/ssh。
+/// 返回 None 表示目录不可用或路径过长（unix socket 路径上限 ~104 字节），此时
+/// 不启用连接复用。
+fn control_dir() -> Option<PathBuf> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    let dir = match std::env::var_os("XDG_RUNTIME_DIR").filter(|v| !v.is_empty()) {
+        Some(rt) => PathBuf::from(rt).join("zero-nvim"),
+        None => dirs::home_dir()?.join(".cache").join("zero-nvim").join("ssh"),
+    };
+    // "cm-" + %C（40 位十六进制）+ ssh 临时后缀（约 17 字节）
+    if dir.as_os_str().len() + 1 + 3 + 40 + 17 > 104 {
+        return None;
+    }
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&dir)
+        .ok()?;
+    // 目录若早已存在（权限更宽），收紧到 0700
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).ok()?;
+    Some(dir)
+}
+
+/// 系统 ssh 的公共参数（不含目的地和远端命令）
+fn base_ssh_args(port: u16) -> Vec<String> {
+    let mut args: Vec<String> = vec![
+        "-o".into(),
+        // 首次连接自动接受 host key，但 key 变化时拒绝（防中间人）
+        "StrictHostKeyChecking=accept-new".into(),
+        "-o".into(),
+        "BatchMode=yes".into(), // non-interactive (uses Agent)
+        "-o".into(),
+        // 压掉 "Permanently added ... to known hosts" 之类的提示（否则会显示成 WARN）
+        "LogLevel=ERROR".into(),
+    ];
+    // ControlMaster=auto + ControlPersist multiplexes LSP launches over a
+    // single SSH connection. The first LSP pays the full TCP+key+auth cost;
+    // subsequent ones (or restart-after-stop) attach in milliseconds.
+    // %C hashes (local_user, host, port, remote_user) → unique per target.
+    if let Some(dir) = control_dir() {
+        args.push("-o".into());
+        args.push("ControlMaster=auto".into());
+        args.push("-o".into());
+        args.push(format!("ControlPath={}/cm-%C", dir.display()));
+        args.push("-o".into());
+        args.push("ControlPersist=10m".into());
+    }
+    args.push("-p".into());
+    args.push(port.to_string());
+    args
+}
+
+/// 完整的 ssh 参数：公共参数 + `--` + user@host + 远端命令
+fn ssh_command_args(
+    user: &str,
+    host: &str,
+    port: u16,
+    extra_opts: &[&str],
+    remote_cmd: &str,
+) -> Result<Vec<String>, anyhow::Error> {
+    validate_ssh_target(user, host)?;
+    let mut args = base_ssh_args(port);
+    args.extend(extra_opts.iter().map(|s| s.to_string()));
+    let dest = if user.is_empty() {
+        host.to_string()
+    } else {
+        format!("{}@{}", user, host)
+    };
+    // `--` 之后的参数不会再被当作选项解析
+    args.push("--".into());
+    args.push(dest);
+    args.push(remote_cmd.to_string());
+    Ok(args)
+}
 
 pub fn handle_start_lsp(
     user: &str,
@@ -40,123 +137,184 @@ pub fn handle_start_lsp(
 
     // Verify the connection exists in state
     {
-        let state_lock = state.lock().unwrap();
+        let state_lock = state.lock_ok();
         if !state_lock.sessions.contains_key(&key) {
             return Err(anyhow::anyhow!("NOT_CONNECTED: {}", key));
         }
     }
 
     let file_prefix = "file://".to_string();
-    let client_prefix_s = client_prefix.to_string();
+    let client_prefix_s = client_prefix.trim_end_matches('/').to_string();
 
-    let user_s = user.to_string();
-    let host_s = host.to_string();
     let login_cmd = build_lsp_login_command(&cmd_argv)?;
+    let ssh_args = ssh_command_args(
+        user,
+        host,
+        port,
+        // SSH-layer keepalive：每 30s 发一个心跳；连续 3 次（90s）无应答
+        // 才判死。两个作用：(1) 让 NAT/防火墙的 idle flow timeout 永远归
+        // 零，避免 idle-disconnect；(2) 真正掉线时 90s 内 ssh 子进程退出，
+        // 触发 Lua 端的 on_exit 自动重启路径。否则一直 idle 又没人发包，
+        // 进程会僵在 read() 上几十分钟，直到 TCP RST 才感知。
+        &[
+            "-o",
+            "ServerAliveInterval=30",
+            "-o",
+            "ServerAliveCountMax=3",
+        ],
+        &login_cmd,
+    )?;
     let cmd_display = cmd_argv.join(" ");
 
     // Bind a random ephemeral port locally
     let listener = TcpListener::bind("127.0.0.1:0").context("Failed to bind random TCP port")?;
     let local_port = listener.local_addr()?.port();
+    listener
+        .set_nonblocking(true)
+        .context("Failed to set listener non-blocking")?;
 
-    eprintln!(
+    debug_log!(
         "Daemon: LSP proxy :{} → {}@{}:{} ({})",
-        local_port, user, host, port, cmd_display
+        local_port,
+        user,
+        host,
+        port,
+        cmd_display
     );
 
     thread::spawn(move || {
-        if let Ok((tcp_stream, _)) = listener.accept() {
-            drop(listener);
-
-            // Spawn ssh as a child process. It reuses ~/.ssh/config + SSH Agent.
-            // Prepend mason/bin to PATH so tools installed via Mason are found
-            // without needing a login shell or modifying ~/.profile.
-            //
-            // ControlMaster=auto + ControlPersist multiplexes LSP launches over a
-            // single SSH connection. The first LSP pays the full TCP+key+auth cost;
-            // subsequent ones (or restart-after-stop) attach in milliseconds.
-            // %C hashes (local_user, host, port, remote_user) → unique per target.
-            let ssh_result = Command::new("ssh")
-                .arg("-o")
-                .arg("StrictHostKeyChecking=no")
-                .arg("-o")
-                .arg("BatchMode=yes") // non-interactive (uses Agent)
-                .arg("-o")
-                .arg("ControlMaster=auto")
-                .arg("-o")
-                .arg("ControlPath=/tmp/zero-nvim-cm-%C")
-                .arg("-o")
-                .arg("ControlPersist=10m")
-                // SSH-layer keepalive：每 30s 发一个心跳；连续 3 次（90s）无应答
-                // 才判死。两个作用：(1) 让 NAT/防火墙的 idle flow timeout 永远归
-                // 零，避免 idle-disconnect；(2) 真正掉线时 90s 内 ssh 子进程退出，
-                // 触发 Lua 端的 on_exit 自动重启路径。否则一直 idle 又没人发包，
-                // 进程会僵在 read() 上几十分钟，直到 TCP RST 才感知。
-                .arg("-o")
-                .arg("ServerAliveInterval=30")
-                .arg("-o")
-                .arg("ServerAliveCountMax=3")
-                .arg("-p")
-                .arg(port.to_string())
-                .arg(format!("{}@{}", user_s, host_s))
-                .arg(&login_cmd)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped()) // Pipe stderr to prevent blocking if parent doesn't read fast enough
-                .spawn();
-
-            match ssh_result {
-                Ok(mut child) => {
-                    let child_stdin = child.stdin.take().expect("child stdin");
-                    let child_stdout = child.stdout.take().expect("child stdout");
-                    let child_stderr = child.stderr.take().expect("child stderr");
-
-                    // Thread 0: Consume SSH stderr to prevent blocking
-                    // We also log it to daemon stderr so Neovim can see it (optionally filtered)
-                    thread::spawn(move || {
-                        use std::io::{BufRead, BufReader};
-                        let reader = BufReader::new(child_stderr);
-                        for line in reader.lines() {
-                            if let Ok(l) = line {
-                                eprintln!("[SSH-ERR] {}", l);
-                            }
-                        }
-                    });
-
-                    let tcp_writer = tcp_stream.try_clone().expect("Failed to clone TCP stream");
-
-                    let tcp_reader = tcp_stream;
-                    let from1 = client_prefix_s.clone();
-                    let to1 = file_prefix.clone();
-                    thread::spawn(move || {
-                        let mut r = tcp_reader;
-                        let mut w = child_stdin;
-                        let _ = pump_and_translate(&mut r, &mut w, &from1, &to1, "TCP->SSH");
-                    });
-
-                    // Thread 2: SSH stdout → TCP (Neovim)
-                    // Translate: file:// → zero://user@host:port
-                    let from2 = file_prefix;
-                    let to2 = client_prefix_s;
-                    thread::spawn(move || {
-                        let mut r = child_stdout;
-                        let mut w = tcp_writer;
-                        let _ = pump_and_translate(&mut r, &mut w, &from2, &to2, "SSH->TCP");
-                        // Wait for child process to finish
-                        if let Ok(status) = child.wait() {
-                            if !status.success() {
-                                eprintln!("Daemon: LSP process exited abnormally: {:?}", status);
-                            }
-                        }
-                    });
-                }
-                Err(e) => {
-                    eprintln!("Failed to spawn ssh for LSP: {:?}", e);
-                }
+        let tcp_stream = match accept_with_timeout(&listener, ACCEPT_TIMEOUT) {
+            Some(s) => s,
+            None => {
+                eprintln!(
+                    "Daemon: LSP proxy :{} 在 {:?} 内无客户端连接，已关闭",
+                    local_port, ACCEPT_TIMEOUT
+                );
+                return;
             }
+        };
+        drop(listener);
+        if let Err(e) = run_lsp_proxy(tcp_stream, &ssh_args, client_prefix_s, file_prefix) {
+            eprintln!("Daemon: LSP proxy :{} 失败: {:#}", local_port, e);
         }
     });
 
     Ok(Value::Integer(local_port.into()))
+}
+
+/// 非阻塞 accept 轮询，带超时。返回的 stream 已切回 blocking。
+fn accept_with_timeout(listener: &TcpListener, timeout: Duration) -> Option<TcpStream> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                stream.set_nonblocking(false).ok()?;
+                return Some(stream);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                if Instant::now() >= deadline {
+                    return None;
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => {
+                eprintln!("Daemon: LSP proxy accept 失败: {}", e);
+                return None;
+            }
+        }
+    }
+}
+
+/// 起 ssh 子进程并在 TCP ↔ ssh stdio 之间双向转发。
+///
+/// 生命周期：任一方向结束都对 TCP 做 shutdown(Both)——另一线程持有的 clone fd
+/// 不会阻止对端看到 EOF；并确保 ssh 子进程被回收（宽限后 kill），不会无限挂在
+/// child.wait() 上。
+fn run_lsp_proxy(
+    tcp_stream: TcpStream,
+    ssh_args: &[String],
+    client_prefix: String,
+    file_prefix: String,
+) -> Result<(), anyhow::Error> {
+    // Spawn ssh as a child process. It reuses ~/.ssh/config + SSH Agent.
+    // Prepend mason/bin to PATH so tools installed via Mason are found
+    // without needing a login shell or modifying ~/.profile.
+    let mut child = Command::new("ssh")
+        .args(ssh_args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped()) // Pipe stderr to prevent blocking if parent doesn't read fast enough
+        .spawn()
+        .context("Failed to spawn ssh for LSP")?;
+
+    let child_stdin = child.stdin.take().context("child stdin")?;
+    let child_stdout = child.stdout.take().context("child stdout")?;
+    let child_stderr = child.stderr.take().context("child stderr")?;
+    let child = Arc::new(Mutex::new(child));
+
+    // Thread 0: Consume SSH stderr to prevent blocking
+    // We also log it to daemon stderr so Neovim can see it
+    thread::spawn(move || {
+        use std::io::{BufRead, BufReader};
+        let reader = BufReader::new(child_stderr);
+        for l in reader.lines().map_while(Result::ok) {
+            eprintln!("[SSH-ERR] {}", l);
+        }
+    });
+
+    let tcp_writer = tcp_stream.try_clone().context("Failed to clone TCP stream")?;
+    let tcp_ctl_a = tcp_stream.try_clone().context("Failed to clone TCP stream")?;
+    let tcp_ctl_b = tcp_stream.try_clone().context("Failed to clone TCP stream")?;
+
+    // Thread 1: TCP (Neovim) → SSH stdin
+    // Translate: zero://user@host:port/ → file:///
+    let from1 = client_prefix.clone();
+    let to1 = file_prefix.clone();
+    let child_a = child.clone();
+    thread::spawn(move || {
+        let mut r = tcp_stream;
+        let mut w = child_stdin;
+        let _ = pump_and_translate(&mut r, &mut w, &from1, &to1, "TCP->SSH");
+        // Neovim 断开：关 ssh stdin（远端 LSP 读到 EOF），关 TCP，宽限后杀 ssh
+        drop(w);
+        let _ = tcp_ctl_a.shutdown(Shutdown::Both);
+        reap_child(&child_a, Duration::from_secs(2));
+    });
+
+    // Thread 2 (当前线程): SSH stdout → TCP (Neovim)
+    // Translate: file:/// → zero://user@host:port/
+    let mut r = child_stdout;
+    let mut w = tcp_writer;
+    let _ = pump_and_translate(&mut r, &mut w, &file_prefix, &client_prefix, "SSH->TCP");
+    // 远端 LSP / ssh 退出：shutdown 让 Neovim 立刻看到 EOF，并让 Thread 1 的 read 返回
+    let _ = tcp_ctl_b.shutdown(Shutdown::Both);
+    if let Some(status) = reap_child(&child, Duration::from_secs(5)) {
+        if !status.success() {
+            eprintln!("Daemon: LSP process exited abnormally: {:?}", status);
+        }
+    }
+    Ok(())
+}
+
+/// 等子进程退出，最多 grace；超时则 kill。返回退出状态（若此次回收到）。
+/// 用 try_wait 轮询而不是 wait()，避免持锁阻塞导致另一线程无法 kill。
+fn reap_child(child: &Mutex<Child>, grace: Duration) -> Option<std::process::ExitStatus> {
+    let deadline = Instant::now() + grace;
+    loop {
+        {
+            let mut c = child.lock_ok();
+            match c.try_wait() {
+                Ok(Some(status)) => return Some(status),
+                Ok(None) if Instant::now() >= deadline => {
+                    let _ = c.kill();
+                    return c.wait().ok();
+                }
+                Ok(None) => {}
+                Err(_) => return None,
+            }
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
 }
 
 pub fn handle_probe_lsp(
@@ -168,31 +326,15 @@ pub fn handle_probe_lsp(
 ) -> Result<Value, anyhow::Error> {
     let key = DaemonState::connection_key(user, host, port);
     {
-        let state_lock = state.lock().unwrap();
+        let state_lock = state.lock_ok();
         if !state_lock.sessions.contains_key(&key) {
             return Err(anyhow::anyhow!("NOT_CONNECTED: {}", key));
         }
     }
 
     let probe_cmd = build_lsp_probe_command(&cmd_argv)?;
-    let output = Command::new("ssh")
-        .arg("-o")
-        .arg("StrictHostKeyChecking=no")
-        .arg("-o")
-        .arg("BatchMode=yes")
-        .arg("-o")
-        .arg("ControlMaster=auto")
-        .arg("-o")
-        .arg("ControlPath=/tmp/zero-nvim-cm-%C")
-        .arg("-o")
-        .arg("ControlPersist=10m")
-        .arg("-o")
-        .arg("ConnectTimeout=5")
-        .arg("-p")
-        .arg(port.to_string())
-        .arg(format!("{}@{}", user, host))
-        .arg(&probe_cmd)
-        .output();
+    let ssh_args = ssh_command_args(user, host, port, &["-o", "ConnectTimeout=5"], &probe_cmd)?;
+    let output = Command::new("ssh").args(&ssh_args).output();
 
     match output {
         Ok(out) if out.status.success() => Ok(lsp_probe_result(true, "")),
@@ -289,9 +431,8 @@ fn pump_and_translate<R: Read, W: Write>(
 
         // 2. Parse Content-Length header
         for line in headers.lines() {
-            let lower = line.to_lowercase();
-            if lower.starts_with("content-length:") {
-                if let Some(val) = line.splitn(2, ':').nth(1) {
+            if let Some((name, val)) = line.split_once(':') {
+                if name.trim().eq_ignore_ascii_case("content-length") {
                     if let Ok(n) = val.trim().parse::<usize>() {
                         content_length = Some(n);
                     }
@@ -308,10 +449,10 @@ fn pump_and_translate<R: Read, W: Write>(
         reader.read_exact(&mut body)?;
 
         // 4. Translate URI in JSON body
-        // tcp->ssh: "zero://user@host:port" → "file://"   (zero://user@host:22/path → file:///path)
-        // ssh->tcp: "file://"               → "zero://user@host:port" (file:///path → zero://user@host:22/path)
+        // tcp->ssh: "zero://user@host:port/path" → "file:///path"
+        // ssh->tcp: "file:///path"               → "zero://user@host:port/path"
         let new_body = match String::from_utf8(body) {
-            Ok(s) => s.replace(from, to).into_bytes(),
+            Ok(s) => rewrite_uri_prefix(&s, from, to).into_bytes(),
             Err(e) => e.into_bytes(),
         };
 
@@ -326,8 +467,21 @@ fn pump_and_translate<R: Read, W: Write>(
     }
 }
 
-// Removing unused shell_quote to keep lints happy
-// fn shell_quote(s: &str) -> String { ... }
+/// 把 JSON 字符串值开头的 `from/` 换成 `to/`。
+///
+/// 只匹配 `"` + from + `/`：
+///   - 要求前缀后紧跟 `/`，`zero://u@h:22` 不会误伤 `zero://u@h:2222/...`；
+///   - 要求前面紧跟 `"`，即 URI 是整个 JSON 字符串值的开头，hover / 诊断文本
+///     中间出现的 file:// 不会被改写。
+///
+/// from / to 均不带结尾 `/`（如 "zero://u@h:22"、"file://"）。
+fn rewrite_uri_prefix(body: &str, from: &str, to: &str) -> String {
+    let pat = format!("\"{}/", from);
+    if !body.contains(&pat) {
+        return body.to_string();
+    }
+    body.replace(&pat, &format!("\"{}/", to))
+}
 
 #[cfg(test)]
 mod tests {
@@ -366,6 +520,50 @@ mod tests {
             cmd,
             "PATH=$HOME/.local/share/nvim/mason/bin:$PATH command -v -- 'based pyright' >/dev/null 2>&1"
         );
+    }
+
+    #[test]
+    fn uri_rewrite_tcp_to_ssh() {
+        let body = r#"{"uri":"zero://u@h:22/src/main.rs","rootUri":"zero://u@h:22/"}"#;
+        assert_eq!(
+            rewrite_uri_prefix(body, "zero://u@h:22", "file://"),
+            r#"{"uri":"file:///src/main.rs","rootUri":"file:///"}"#
+        );
+    }
+
+    #[test]
+    fn uri_rewrite_does_not_match_longer_port() {
+        let body = r#"{"uri":"zero://u@h:2222/x"}"#;
+        assert_eq!(rewrite_uri_prefix(body, "zero://u@h:22", "file://"), body);
+    }
+
+    #[test]
+    fn uri_rewrite_ssh_to_tcp_only_uri_values() {
+        let body = r#"{"uri":"file:///a/b.rs","contents":"see file:///a/b.rs for details"}"#;
+        assert_eq!(
+            rewrite_uri_prefix(body, "file://", "zero://u@h:22"),
+            r#"{"uri":"zero://u@h:22/a/b.rs","contents":"see file:///a/b.rs for details"}"#
+        );
+    }
+
+    #[test]
+    fn ssh_target_validation_blocks_option_injection() {
+        assert!(validate_ssh_target("root", "example.com").is_ok());
+        assert!(validate_ssh_target("", "example.com").is_ok());
+        assert!(validate_ssh_target("root", "-oProxyCommand=touch /tmp/x").is_err());
+        assert!(validate_ssh_target("-oProxyCommand=x", "h").is_err());
+        assert!(validate_ssh_target("root", "h st").is_err());
+        assert!(validate_ssh_target("root", "").is_err());
+    }
+
+    #[test]
+    fn ssh_args_put_double_dash_before_destination() {
+        let args = ssh_command_args("u", "h", 2200, &[], "cmd").unwrap();
+        let n = args.len();
+        assert_eq!(&args[n - 3..], &["--", "u@h", "cmd"]);
+        assert!(args.contains(&"StrictHostKeyChecking=accept-new".to_string()));
+        assert!(!args.iter().any(|a| a.contains("StrictHostKeyChecking=no")));
+        assert!(!args.iter().any(|a| a.contains("ControlPath=/tmp/")));
     }
 
     #[test]

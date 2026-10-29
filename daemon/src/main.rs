@@ -8,6 +8,16 @@
 //   - connect:    SSH 连接管理
 //   - fs:         远程文件系统操作（读/写/目录/扫描）
 
+// 路由日志：stderr 在 Neovim 侧会显示成 WARN 通知，所以常规信息只在设置了
+// ZERO_NVIM_DEBUG 环境变量时输出；真正的错误仍直接 eprintln!。
+macro_rules! debug_log {
+    ($($arg:tt)*) => {
+        if $crate::debug_enabled() {
+            eprintln!($($arg)*);
+        }
+    };
+}
+
 mod cmd;
 mod connect;
 mod fs;
@@ -18,7 +28,17 @@ mod state;
 use rmpv::{decode, encode, Value};
 use state::DaemonState;
 use std::io::Write;
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex, OnceLock};
+
+/// 是否输出调试日志（ZERO_NVIM_DEBUG 非空且不为 "0"）
+pub(crate) fn debug_enabled() -> bool {
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| {
+        std::env::var("ZERO_NVIM_DEBUG")
+            .map(|v| !v.is_empty() && v != "0")
+            .unwrap_or(false)
+    })
+}
 
 // =============================================================================
 // 主循环
@@ -42,42 +62,88 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    loop {
-        // 从 stdin 读取一条 Msgpack 消息
-        let msg = match decode::read_value(&mut reader) {
-            Ok(v) => v,
-            Err(_) => break, // stdin 关闭 = Neovim 退出
-        };
-
-        // Msgpack-RPC request: [type=0, msgid, method, params]
-        if let Value::Array(ref args) = msg {
-            if args.len() == 4 {
-                let msg_type = args[0].as_u64();
-                let msg_id = args[1].as_u64();
-                let method_val = &args[2];
-                let params = &args[3];
-
-                if let (Some(0), Some(id)) = (msg_type, msg_id) {
-                    if let Some(method) = method_val.as_str() {
-                        let result = dispatch(method, params, state.clone(), tx.clone());
-                        let (err, res) = match result {
-                            Ok(val) => (Value::Nil, val),
-                            Err(e) => (Value::String(format!("{}", e).into()), Value::Nil),
-                        };
-                        // Msgpack-RPC response: [type=1, msgid, error, result]
-                        let response = Value::Array(vec![
-                            Value::Integer(1.into()),
-                            Value::Integer(id.into()),
-                            err,
-                            res,
-                        ]);
-                        let _ = tx.send(response);
-                    }
+    // 从 stdin 逐条读取 Msgpack 消息；stdin 关闭 = Neovim 退出
+    while let Ok(msg) = decode::read_value(&mut reader) {
+        let Value::Array(args) = msg else { continue };
+        match args.first().and_then(|v| v.as_u64()) {
+            // Msgpack-RPC request: [type=0, msgid, method, params]
+            Some(0) if args.len() == 4 => {
+                let Some(id) = args[1].as_u64() else { continue };
+                let Some(method) = args[2].as_str().map(|s| s.to_string()) else {
+                    let _ = tx.send(response(id, Err(anyhow::anyhow!("Invalid method name"))));
+                    continue;
+                };
+                let params = args[3].clone();
+                if is_inline_method(&method) {
+                    let result = dispatch(&method, &params, state.clone(), tx.clone());
+                    let _ = tx.send(response(id, result));
+                } else {
+                    // 慢请求（建连 / 扫描 / 命令执行）各起一条线程，避免队头阻塞。
+                    // 同一连接上的操作仍由 ConnSession 的 Mutex 串行化。
+                    let state = state.clone();
+                    let tx = tx.clone();
+                    std::thread::spawn(move || {
+                        let result = dispatch(&method, &params, state, tx.clone());
+                        let _ = tx.send(response(id, result));
+                    });
                 }
             }
+            // Msgpack-RPC notification: [type=2, method, params]（rpcnotify）
+            // 无需回复；错误只打到 stderr。
+            Some(2) if args.len() == 3 => {
+                let Some(method) = args[1].as_str().map(|s| s.to_string()) else {
+                    continue;
+                };
+                let params = args[2].clone();
+                if is_inline_method(&method) {
+                    if let Err(e) = dispatch(&method, &params, state.clone(), tx.clone()) {
+                        eprintln!("Daemon: notification {} 失败: {}", method, e);
+                    }
+                } else {
+                    let state = state.clone();
+                    let tx = tx.clone();
+                    std::thread::spawn(move || {
+                        if let Err(e) = dispatch(&method, &params, state, tx) {
+                            eprintln!("Daemon: notification {} 失败: {}", method, e);
+                        }
+                    });
+                }
+            }
+            _ => {}
         }
     }
     Ok(())
+}
+
+/// 在主线程上同步处理的方法：都是不阻塞的快操作（查注册表、推 mpsc、读内存配置）。
+///
+/// cmd_stdin_write 必须同步处理以保证多条写入的顺序；cmd_cancel 同步处理保证
+/// 不会排在任何长请求后面；cmd_stream 同步注册句柄，保证随后到达的
+/// cancel / stdin 通知一定能找到它（真正的执行在它自己的 worker 线程里）。
+fn is_inline_method(method: &str) -> bool {
+    matches!(
+        method,
+        "cmd_cancel"
+            | "cmd_stdin_write"
+            | "cmd_stdin_close"
+            | "cmd_stream"
+            | "list_ssh_hosts"
+            | "resolve_ssh_target"
+    )
+}
+
+/// Msgpack-RPC response: [type=1, msgid, error, result]
+fn response(id: u64, result: Result<Value, anyhow::Error>) -> Value {
+    let (err, res) = match result {
+        Ok(val) => (Value::Nil, val),
+        Err(e) => (Value::String(format!("{}", e).into()), Value::Nil),
+    };
+    Value::Array(vec![
+        Value::Integer(1.into()),
+        Value::Integer(id.into()),
+        err,
+        res,
+    ])
 }
 
 // =============================================================================
@@ -96,11 +162,8 @@ fn dispatch(
         "list_ssh_hosts" => ssh_config::handle_list_ssh_hosts(&state),
 
         "resolve_ssh_target" => {
-            let args = params.as_array().ok_or(anyhow::anyhow!("Invalid params"))?;
-            let target = args
-                .get(0)
-                .and_then(|v| v.as_str())
-                .ok_or(anyhow::anyhow!("Missing target"))?;
+            let args = params_array(params)?;
+            let target = arg_str(args, 0, "target")?;
             ssh_config::handle_resolve_ssh_target(target, &state)
         }
 
@@ -117,17 +180,8 @@ fn dispatch(
         }
 
         "fetch_paths" => {
-            let args = params.as_array().ok_or(anyhow::anyhow!("Invalid params"))?;
-            let user = args
-                .get(0)
-                .and_then(|v| v.as_str())
-                .ok_or(anyhow::anyhow!("Missing user"))?;
-            let host = args
-                .get(1)
-                .and_then(|v| v.as_str())
-                .ok_or(anyhow::anyhow!("Missing host"))?;
-            let port = args.get(2).and_then(|v| v.as_u64()).unwrap_or(22) as u16;
-
+            let args = params_array(params)?;
+            let (user, host, port) = extract_target(args)?;
             let paths_array = args
                 .get(3)
                 .and_then(|v| v.as_array())
@@ -146,12 +200,10 @@ fn dispatch(
         }
 
         "write_file" => {
-            let args = params.as_array().ok_or(anyhow::anyhow!("Invalid params"))?;
+            let args = params_array(params)?;
             let (user, host, port, path) = extract_path_params(params)?;
-            let content = args
-                .get(4)
-                .and_then(|v| v.as_str())
-                .ok_or(anyhow::anyhow!("Missing content"))?;
+            // 内容可能不是合法 UTF-8（Latin-1 源码、二进制）：按原始字节接收
+            let content = arg_bytes(args, 4, "content")?;
             fs::handle_write_file(user, host, port, path, content, &state)
         }
 
@@ -188,24 +240,10 @@ fn dispatch(
         }
 
         "rename" => {
-            let args = params.as_array().ok_or(anyhow::anyhow!("Invalid params"))?;
-            let user = args
-                .get(0)
-                .and_then(|v| v.as_str())
-                .ok_or(anyhow::anyhow!("Missing user"))?;
-            let host = args
-                .get(1)
-                .and_then(|v| v.as_str())
-                .ok_or(anyhow::anyhow!("Missing host"))?;
-            let port = args.get(2).and_then(|v| v.as_u64()).unwrap_or(22) as u16;
-            let src = args
-                .get(3)
-                .and_then(|v| v.as_str())
-                .ok_or(anyhow::anyhow!("Missing src"))?;
-            let dst = args
-                .get(4)
-                .and_then(|v| v.as_str())
-                .ok_or(anyhow::anyhow!("Missing dst"))?;
+            let args = params_array(params)?;
+            let (user, host, port) = extract_target(args)?;
+            let src = arg_str(args, 3, "src")?;
+            let dst = arg_str(args, 4, "dst")?;
             fs::handle_rename(user, host, port, src, dst, &state)
         }
 
@@ -222,51 +260,24 @@ fn dispatch(
 
         // ── 远端命令执行 (legacy) ──
         "exec_remote" => {
-            let args = params.as_array().ok_or(anyhow::anyhow!("Invalid params"))?;
-            let user = args
-                .get(0)
-                .and_then(|v| v.as_str())
-                .ok_or(anyhow::anyhow!("Missing user"))?;
-            let host = args
-                .get(1)
-                .and_then(|v| v.as_str())
-                .ok_or(anyhow::anyhow!("Missing host"))?;
-            let port = args.get(2).and_then(|v| v.as_u64()).unwrap_or(22) as u16;
-            let cmd = args
-                .get(3)
-                .and_then(|v| v.as_str())
-                .ok_or(anyhow::anyhow!("Missing cmd"))?;
+            let args = params_array(params)?;
+            let (user, host, port) = extract_target(args)?;
+            let cmd = arg_str(args, 3, "cmd")?;
             fs::handle_exec_remote(user, host, port, cmd, &state)
         }
 
         // ── LSP 代理 ──
         "lsp_probe" => {
-            let args = params.as_array().ok_or(anyhow::anyhow!("Invalid params"))?;
-            let user = args
-                .get(0)
-                .and_then(|v| v.as_str())
-                .ok_or(anyhow::anyhow!("Missing user"))?;
-            let host = args
-                .get(1)
-                .and_then(|v| v.as_str())
-                .ok_or(anyhow::anyhow!("Missing host"))?;
-            let port = args.get(2).and_then(|v| v.as_u64()).unwrap_or(22) as u16;
+            let args = params_array(params)?;
+            let (user, host, port) = extract_target(args)?;
             let cmd = args.get(3).ok_or(anyhow::anyhow!("Missing cmd"))?;
             let cmd_argv = extract_lsp_cmd_argv(cmd)?;
             lsp::handle_probe_lsp(user, host, port, cmd_argv, &state)
         }
 
         "lsp_start" => {
-            let args = params.as_array().ok_or(anyhow::anyhow!("Invalid params"))?;
-            let user = args
-                .get(0)
-                .and_then(|v| v.as_str())
-                .ok_or(anyhow::anyhow!("Missing user"))?;
-            let host = args
-                .get(1)
-                .and_then(|v| v.as_str())
-                .ok_or(anyhow::anyhow!("Missing host"))?;
-            let port = args.get(2).and_then(|v| v.as_u64()).unwrap_or(22) as u16;
+            let args = params_array(params)?;
+            let (user, host, port) = extract_target(args)?;
             let cmd = args.get(3).ok_or(anyhow::anyhow!("Missing cmd"))?;
             let cmd_argv = extract_lsp_cmd_argv(cmd)?;
             let default_prefix = format!("zero://{}@{}:{}", user, host, port);
@@ -309,22 +320,57 @@ fn extract_lsp_cmd_argv(value: &Value) -> Result<Vec<String>, anyhow::Error> {
 // 参数提取辅助函数
 // =============================================================================
 
+fn params_array(params: &Value) -> Result<&[Value], anyhow::Error> {
+    params
+        .as_array()
+        .map(|v| v.as_slice())
+        .ok_or(anyhow::anyhow!("Invalid params"))
+}
+
+/// 取第 idx 个字符串参数；区分"缺失"与"不是合法 UTF-8 字符串"两种错误
+fn arg_str<'a>(args: &'a [Value], idx: usize, name: &str) -> Result<&'a str, anyhow::Error> {
+    match args.get(idx) {
+        None | Some(Value::Nil) => Err(anyhow::anyhow!("Missing {}", name)),
+        Some(Value::String(s)) => s
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("Invalid {}: not valid UTF-8", name)),
+        Some(Value::Binary(b)) => std::str::from_utf8(b)
+            .map_err(|_| anyhow::anyhow!("Invalid {}: not valid UTF-8", name)),
+        Some(_) => Err(anyhow::anyhow!("Invalid {}: expected string", name)),
+    }
+}
+
+/// 取第 idx 个参数的原始字节：接受 msgpack String（含非 UTF-8 内容）或 Binary
+fn arg_bytes<'a>(args: &'a [Value], idx: usize, name: &str) -> Result<&'a [u8], anyhow::Error> {
+    match args.get(idx) {
+        None | Some(Value::Nil) => Err(anyhow::anyhow!("Missing {}", name)),
+        Some(Value::String(s)) => Ok(s.as_bytes()),
+        Some(Value::Binary(b)) => Ok(b.as_slice()),
+        Some(_) => Err(anyhow::anyhow!("Invalid {}: expected string or binary", name)),
+    }
+}
+
+/// 从 [user, host, port, ...] 提取连接目标
+fn extract_target(args: &[Value]) -> Result<(&str, &str, u16), anyhow::Error> {
+    let user = arg_str(args, 0, "user")?;
+    let host = arg_str(args, 1, "host")?;
+    let port = match args.get(2) {
+        None | Some(Value::Nil) => 22,
+        Some(v) => {
+            let p = v
+                .as_u64()
+                .ok_or(anyhow::anyhow!("Invalid port: expected integer"))?;
+            u16::try_from(p).map_err(|_| anyhow::anyhow!("Invalid port: {}", p))?
+        }
+    };
+    Ok((user, host, port))
+}
+
 /// 从 [user, host, port, path] 提取通用路径参数
 fn extract_path_params(params: &Value) -> Result<(&str, &str, u16, &str), anyhow::Error> {
-    let args = params.as_array().ok_or(anyhow::anyhow!("Invalid params"))?;
-    let user = args
-        .get(0)
-        .and_then(|v| v.as_str())
-        .ok_or(anyhow::anyhow!("Missing user"))?;
-    let host = args
-        .get(1)
-        .and_then(|v| v.as_str())
-        .ok_or(anyhow::anyhow!("Missing host"))?;
-    let port = args.get(2).and_then(|v| v.as_u64()).unwrap_or(22) as u16;
-    let path = args
-        .get(3)
-        .and_then(|v| v.as_str())
-        .ok_or(anyhow::anyhow!("Missing path"))?;
+    let args = params_array(params)?;
+    let (user, host, port) = extract_target(args)?;
+    let path = arg_str(args, 3, "path")?;
     Ok((user, host, port, path))
 }
 
@@ -332,16 +378,37 @@ fn extract_path_params(params: &Value) -> Result<(&str, &str, u16, &str), anyhow
 fn extract_connect_params(
     params: &Value,
 ) -> Result<(&str, &str, u16, Option<&str>), anyhow::Error> {
-    let args = params.as_array().ok_or(anyhow::anyhow!("Invalid params"))?;
-    let user = args
-        .get(0)
-        .and_then(|v| v.as_str())
-        .ok_or(anyhow::anyhow!("Missing user"))?;
-    let host = args
-        .get(1)
-        .and_then(|v| v.as_str())
-        .ok_or(anyhow::anyhow!("Missing host"))?;
-    let port = args.get(2).and_then(|v| v.as_u64()).unwrap_or(22) as u16;
-    let password = args.get(3).and_then(|v| v.as_str());
+    let args = params_array(params)?;
+    let (user, host, port) = extract_target(args)?;
+    let password = match args.get(3) {
+        None | Some(Value::Nil) => None,
+        Some(_) => Some(arg_str(args, 3, "password")?),
+    };
     Ok((user, host, port, password))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn arg_helpers_report_accurate_errors() {
+        let args = vec![
+            Value::String("u".into()),
+            Value::Binary(vec![0xff, 0xfe]),
+            Value::Integer(22.into()),
+        ];
+        assert_eq!(arg_str(&args, 0, "user").unwrap(), "u");
+        let e = arg_str(&args, 1, "host").unwrap_err().to_string();
+        assert!(e.contains("not valid UTF-8"), "{}", e);
+        let e = arg_str(&args, 5, "path").unwrap_err().to_string();
+        assert_eq!(e, "Missing path");
+        assert_eq!(arg_bytes(&args, 1, "content").unwrap(), &[0xff, 0xfe]);
+    }
+
+    #[test]
+    fn extract_target_defaults_port() {
+        let args = vec![Value::String("u".into()), Value::String("h".into())];
+        assert_eq!(extract_target(&args).unwrap(), ("u", "h", 22));
+    }
 }

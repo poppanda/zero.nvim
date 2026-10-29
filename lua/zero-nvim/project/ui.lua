@@ -62,8 +62,13 @@ function M.add_current_project(bufnr, on_complete)
         return
     end
 
+    -- Project root is always a directory: for a file buffer use its parent.
+    local uri = require("zero-nvim.uri")
+    local is_dir = path:sub(-1) == "/" or vim.b[bufnr].zero_is_dir == true
+    local root = is_dir and uri.as_dir(path) or uri.parent_dir(path)
+
     -- Default project name is the folder name
-    local clean_path = path:gsub("/+$", "")
+    local clean_path = root:gsub("/+$", "")
     if clean_path == "" then clean_path = "/" end
     local default_name = vim.fs.basename(clean_path)
 
@@ -73,7 +78,7 @@ function M.add_current_project(bufnr, on_complete)
             host = host,
             user = user,
             port = port,
-            root = path,
+            root = root,
             created_at = os.time(),
         }
         manager.add(name, config)
@@ -150,7 +155,7 @@ function M.show_project_picker()
         for _, name in ipairs(names) do
             local config = projects[name]
             -- Format: [name] host:root
-            local line = string.format(" %-20s  %s:%s", name, config.host, config.root)
+            local line = string.format(" %-20s  %s:%s", name, tostring(config.host), tostring(config.root))
             table.insert(display_lines, line)
             max_width = math.max(max_width, #line + 4)
         end
@@ -196,7 +201,12 @@ function M.show_project_picker()
         if name then
             local config = projects[name]
             close()
-            zero.open_remote(config.user, config.host, config.port, config.root)
+            if type(config.root) ~= "string" then
+                vim.notify("Project '" .. name .. "' has no root directory configured.", vim.log.levels.ERROR)
+                return
+            end
+            -- 老配置可能没存 user/port：回落到 $USER / 22
+            zero.open_remote(config.user or vim.env.USER or "root", config.host, config.port or 22, config.root)
         end
     end, { buffer = buf, silent = true })
 
@@ -306,11 +316,13 @@ function M.check_health(project_name_or_args)
         vim.notify("Project not found: " .. name, vim.log.levels.ERROR)
         return
     end
+    -- 老配置可能没存 user/port
+    config = vim.tbl_extend("keep", config, { user = vim.env.USER or "root", port = 22 })
 
     -- Prepare initial checklist
     local checklist = {
         { label = "SSH Connection (" .. config.host .. ")", key = "ssh" },
-        { label = "Root Directory (" .. config.root .. ")", key = "root" },
+        { label = "Root Directory (" .. tostring(config.root) .. ")", key = "root" },
     }
 
     if config.lsp then
@@ -357,7 +369,7 @@ function M.check_health(project_name_or_args)
         idx = 2
         update_line(idx, "[●] " .. checklist[idx].label .. " (Checking...)")
         vim.cmd("redraw")
-        local ok, ftype = pcall(vim.fn.rpcrequest, chan, "stat", config.user, config.host, config.port, config.root)
+        local ok, ftype = zero.request(config.user, config.host, config.port, "stat", config.root)
         if ok and ftype == "directory" then
             update_line(idx, "[✓] " .. checklist[idx].label)
         else

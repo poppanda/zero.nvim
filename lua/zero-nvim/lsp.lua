@@ -9,6 +9,33 @@ local restart = require("zero-nvim.lsp.restart")
 local starting = {}
 local lsp_probe_unsupported_warned = false
 
+--- Neovim LSP client name for a server. ALWAYS keyed by the project-config
+--- key (e.g. "pyright"), never by the binary in cmd[1] — autostart, prewarm,
+--- :ZeroLspStart and restart must agree or duplicate clients get started.
+---@param server_key string
+---@return string
+function M.client_name(server_key)
+    return "zero-" .. server_key
+end
+
+--- Map a binary / user-supplied server name to its project-config key.
+--- :ZeroLspStart pyright-langserver --stdio → "pyright" when the project
+--- declares lsp.pyright.cmd = { "pyright-langserver", ... }.
+---@param project_config? table
+---@param name string
+---@return string
+function M.resolve_server_key(project_config, name)
+    local lsp = project_config and project_config.lsp
+    if type(lsp) ~= "table" or not name then return name end
+    if lsp[name] then return name end
+    for key, cfg in pairs(lsp) do
+        if type(cfg) == "table" and type(cfg.cmd) == "table" and cfg.cmd[1] == name then
+            return key
+        end
+    end
+    return name
+end
+
 -- LSP restart bookkeeping is centralized in lsp.restart. Keep the restart
 -- callbacks here for now because they depend on ensure_lsp_client.
 
@@ -81,12 +108,12 @@ end
 --- The first probe round-trips to the remote `which python3`; later calls
 --- hit the in-memory cache on init.lua state.
 local function maybe_inject_python_path(chan, user, host, port, server_name, settings)
-    if not server_name:match("pyright") then return settings end
+    if not tostring(server_name):match("pyright") then return settings end
     if settings and settings.python and settings.python.pythonPath then return settings end
 
     local cached = zero.get_python_path(user, host, port)
     if not cached then
-        local ok, py = pcall(vim.fn.rpcrequest, chan, "exec_remote", user, host, port,
+        local ok, py = zero.request(user, host, port, "exec_remote",
             "which python3 2>/dev/null || which python 2>/dev/null || echo ''")
         if ok and type(py) == "string" and #vim.trim(py) > 0 then
             cached = vim.trim(py)
@@ -116,7 +143,7 @@ local function preflight_lsp(user, host, port, cmd_args)
             "Remote LSP requires SSH key/agent auth; current connection used password auth, but the LSP transport runs through non-interactive system ssh"
     end
 
-    local ok, res = pcall(vim.fn.rpcrequest, chan, "lsp_probe", user, host, port, cmd_args)
+    local ok, res = zero.request(user, host, port, "lsp_probe", cmd_args)
     if not ok then
         if tostring(res):find("Unknown method: lsp_probe", 1, true) then
             if not lsp_probe_unsupported_warned then
@@ -156,7 +183,7 @@ end
 ensure_lsp_client = function(user, host, port, root_dir, server_name, cmd_args, settings, opts)
     opts = opts or {}
     root_dir = client_select.norm_root(root_dir)
-    local lsp_name = "zero-" .. server_name
+    local lsp_name = M.client_name(server_name)
     local tkey = client_select.target_key(user, host, port)
     local lock_key = lsp_name .. "@" .. tkey .. ":" .. root_dir
 
@@ -192,10 +219,11 @@ ensure_lsp_client = function(user, host, port, root_dir, server_name, cmd_args, 
         return nil, preflight_err
     end
 
-    settings = maybe_inject_python_path(chan, user, host, port, server_name, settings)
+    settings = maybe_inject_python_path(chan, user, host, port,
+        server_name .. " " .. tostring(cmd_args[1] or ""), settings)
 
     local client_prefix = string.format("zero://%s@%s:%d", user, host, port)
-    local ok, local_port = pcall(vim.fn.rpcrequest, chan, "lsp_start", user, host, port, cmd_args, client_prefix)
+    local ok, local_port = zero.request(user, host, port, "lsp_start", cmd_args, client_prefix)
     if not ok or type(local_port) ~= "number" then
         clear_lock()
         return nil, "Failed to start LSP proxy: " .. tostring(local_port)
@@ -390,9 +418,10 @@ end
 ---@param bufnr? integer Buffer number (defaults to current buffer)
 ---@param cmd_args string[] Language server command and args (e.g. {"basedpyright", "--stdio"})
 ---@param settings? table Optional settings for the language server
----@param opts? { project_config?: table, root_dir?: string }
+---@param opts? { project_config?: table, root_dir?: string, server_key?: string }
 ---       Optional precomputed values from the caller (e.g. FileType handler) so
----       we don't redo project lookup. Both must come together if provided.
+---       we don't redo project lookup. `server_key` is the project-config key
+---       (defaults to the key whose name or cmd[1] matches cmd_args[1]).
 function M.start_lsp(bufnr, cmd_args, settings, opts)
     bufnr = bufnr or vim.api.nvim_get_current_buf()
     opts = opts or {}
@@ -405,22 +434,26 @@ function M.start_lsp(bufnr, cmd_args, settings, opts)
         return
     end
 
-    local server_name = cmd_args[1]
+    if type(cmd_args) ~= "table" or not cmd_args[1] then
+        vim.notify("ZeroNvim: missing LSP command", vim.log.levels.ERROR)
+        return
+    end
     local project_config = opts.project_config
     if project_config == nil then
-        local _, pc = manager.match_project(host, path)
+        local _, pc = manager.match_project(host, path, user, port)
         project_config = pc
     end
+    local server_name = opts.server_key or M.resolve_server_key(project_config, cmd_args[1])
 
     local root_dir = opts.root_dir
     if not root_dir then
-        if project_config and project_config.root then
-            root_dir = project_config.root:gsub("/+$", "")
+        if project_config and type(project_config.root) == "string" then
+            root_dir = client_select.norm_root(project_config.root)
         else
             local is_dir = (path:sub(-1) == "/")
-            root_dir = is_dir and path or vim.fs.dirname(path)
-            root_dir = root_dir:gsub("/$", "")
+            root_dir = client_select.norm_root(is_dir and path or vim.fs.dirname(path))
         end
+        if root_dir == "" then root_dir = "/" end
     end
 
     if project_config and project_config.lsp and project_config.lsp[server_name] then
@@ -442,7 +475,7 @@ function M.start_lsp(bufnr, cmd_args, settings, opts)
             -- caller will register the client; we just need to attach this buffer
             -- once it shows up. Retry twice (covers fast and slow `initialize`).
             local _bufnr, _root = bufnr, root_dir
-            local lsp_name = "zero-" .. server_name
+            local lsp_name = M.client_name(server_name)
             local _tkey = client_select.target_key(user, host, port)
             local function try_attach()
                 if not vim.api.nvim_buf_is_valid(_bufnr) then return true end
@@ -473,7 +506,7 @@ function M.start_lsp(bufnr, cmd_args, settings, opts)
         if #already == 0 then
             vim.lsp.buf_attach_client(bufnr, client_id)
             vim.notify(
-                string.format("ZeroNvim: LSP zero-%s attached to buffer %d", server_name, bufnr),
+                string.format("ZeroNvim: LSP %s attached to buffer %d", M.client_name(server_name), bufnr),
                 vim.log.levels.DEBUG
             )
         end
@@ -490,8 +523,8 @@ end
 ---@param project_config table
 function M.prewarm_lsps(user, host, port, project_config)
     if not project_config or type(project_config.lsp) ~= "table" then return end
-    if not project_config.root then return end
-    local root_dir = project_config.root:gsub("/+$", "")
+    if type(project_config.root) ~= "string" then return end
+    local root_dir = client_select.norm_root(project_config.root)
 
     for server_name, server_cfg in pairs(project_config.lsp) do
         local cmd_args = (server_cfg.cmd and #server_cfg.cmd > 0) and server_cfg.cmd or { server_name, "--stdio" }
@@ -512,7 +545,7 @@ end
 --     保证旧 timer 即便已经进入回调也能在头部检查时早返回。
 
 local function do_revive_attempt(entry, attached, prior_attempts)
-    local lsp_name = "zero-" .. entry.server_name
+    local lsp_name = M.client_name(entry.server_name)
     local new_id = ensure_lsp_client(
         entry.user, entry.host, entry.port,
         entry.root_dir, entry.server_name,

@@ -1,5 +1,7 @@
 local M = {}
 
+local ui_seq = 0
+
 --- Create and open the multi-window search UI
 ---@param title_prefix string
 ---@param initial_path string
@@ -370,12 +372,16 @@ function M.open_search_ui(title_prefix, initial_path, callbacks)
     end
 
     -- Attach debounce listeners
+    -- timer 由调用方（search.lua close_ui）在 teardown 时 stop + close；
+    -- 关闭后 on_lines 返回 true 自动 detach，防抖回调也不再触发。
     local function setup_on_lines(buf, cb)
         local timer = vim.loop.new_timer()
         vim.api.nvim_buf_attach(buf, false, {
             on_lines = function(_, _, _, _, _, _)
+                if timer:is_closing() then return true end
                 timer:stop()
                 timer:start(350, 0, vim.schedule_wrap(function()
+                    if timer:is_closing() then return end
                     notify_change(cb)
                 end))
             end
@@ -463,6 +469,23 @@ function M.open_search_ui(title_prefix, initial_path, callbacks)
     vim.keymap.set("n", "<Left>", callbacks.on_toggle_fold, { buffer = results_buf, silent = true })
     vim.keymap.set("n", "<Right>", callbacks.on_toggle_fold, { buffer = results_buf, silent = true })
 
+    -- 任一浮窗被关闭（:q / <C-w>o / :only 等非 q/<Esc> 路径）→ 整个 UI 一起关，
+    -- 由 on_close 负责 cancel 远端 stream、关 timer、清 current_session。
+    -- 每个 UI 实例一个 augroup，teardown 时由调用方删除。
+    ui_seq = ui_seq + 1
+    local augroup = vim.api.nvim_create_augroup("ZeroSearchUI_" .. ui_seq, { clear = true })
+    for _, win in ipairs({ path_win, input_win, results_win, preview_win }) do
+        vim.api.nvim_create_autocmd("WinClosed", {
+            group = augroup,
+            pattern = tostring(win),
+            once = true,
+            callback = function()
+                -- WinClosed 期间不能关别的窗口，延到下一 tick
+                vim.schedule(callbacks.on_close)
+            end,
+        })
+    end
+
     -- Default: start in query window, insert mode
     -- Caller can override by setting has_previous_state
     focus_window("query")
@@ -478,6 +501,7 @@ function M.open_search_ui(title_prefix, initial_path, callbacks)
         results_buf = results_buf,
         preview_buf = preview_buf,
         ns = ns,
+        augroup = augroup,
         timer1 = timer1,
         timer2 = timer2,
         toggle_state = toggle_state,

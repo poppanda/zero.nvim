@@ -64,34 +64,67 @@ function M.upsert_lsp(project_name, server_name, server_cfg)
     return true
 end
 
+---Does a stored project config target the given connection?
+---Missing user/port in the stored config act as wildcards (configs written
+---before user/port were recorded keep matching).
+---@param config ZeroProjectConfig
+---@param host string
+---@param user? string
+---@param port? integer
+---@return boolean matched
+---@return integer specificity 0-2: how many of user/port matched explicitly
+local function target_matches(config, host, user, port)
+    if config.host ~= host then return false, 0 end
+    local score = 0
+    if config.user and config.user ~= "" and user then
+        if config.user ~= user then return false, 0 end
+        score = score + 1
+    end
+    if config.port and port then
+        if tonumber(config.port) ~= tonumber(port) then return false, 0 end
+        score = score + 1
+    end
+    return true, score
+end
+
 ---Find the best matching project for a given remote path
----Uses Longest Prefix Match strategy on the root path
+---Uses Longest Prefix Match strategy on the root path, scoped to the
+---connection (user@host:port).
 ---@param host string The remote host
 ---@param path string The absolute remote path
+---@param user? string The remote user (nil = don't filter on user)
+---@param port? integer The remote port (nil = don't filter on port)
 ---@return string? project_name
 ---@return ZeroProjectConfig? config
-function M.match_project(host, path)
+function M.match_project(host, path, user, port)
+    if type(host) ~= "string" or type(path) ~= "string" then return nil, nil end
     local projects = store.load()
     local best_match_name = nil
-    local best_match_len = 0
+    local best_match_len = -1
+    local best_score = -1
+
+    local clean_path = path:gsub("/+$", "")
 
     for name, config in pairs(projects) do
-        -- 1. Host must match (exact match for now)
-        -- TODO: Handle aliases resolution if needed in future
-        if config.host == host then
-            -- 2. Path must start with project root
-            -- Ensure root has trailing slash for correct prefix matching if needed,
-            -- but simple string.find is usually enough for "is subdirectory" check if we handle boundaries.
-
-            -- Simple normalization: remove trailing slashes for comparison
-            local clean_root = config.root:gsub("/+$", "")
-            local clean_path = path:gsub("/+$", "")
-
-            if clean_path == clean_root or clean_path:find(clean_root .. "/", 1, true) == 1 then
-                local len = #clean_root
-                if len > best_match_len then
-                    best_match_len = len
-                    best_match_name = name
+        -- 坏配置（root 缺失 / 类型不对）直接跳过，避免 gsub 崩溃
+        if type(config) == "table" and type(config.root) == "string" then
+            local ok, score = target_matches(config, host, user, port)
+            if ok then
+                -- Simple normalization: remove trailing slashes for comparison
+                local clean_root = config.root:gsub("/+$", "")
+                local covers = clean_root == ""                      -- root "/" covers everything
+                    or clean_path == clean_root
+                    or clean_path:find(clean_root .. "/", 1, true) == 1
+                if covers then
+                    local len = #clean_root
+                    local better = len > best_match_len
+                        or (len == best_match_len and score > best_score)
+                        or (len == best_match_len and score == best_score and name < best_match_name)
+                    if better then
+                        best_match_len = len
+                        best_score = score
+                        best_match_name = name
+                    end
                 end
             end
         end

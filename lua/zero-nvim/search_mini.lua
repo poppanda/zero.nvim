@@ -8,6 +8,61 @@ local state = {
 
 local per_buf_queries = {}
 
+M.MAX_MATCHES = 2000
+
+--- 把用户输入转成 vim 正则：very-nomagic（\V）下只有 `\` 是特殊字符，
+--- `[` `.` `*` `~` `/` 全部按字面匹配。
+---@param query string
+---@param opts { case_sensitive?: boolean, whole_word?: boolean }
+---@param min_col? integer  0-based 字节列：要求匹配起点 >= min_col
+---@return string
+function M._build_pattern(query, opts, min_col)
+    local body = (query:gsub("\\", "\\\\"))
+    if opts.whole_word then
+        body = "\\<" .. body .. "\\>"
+    end
+    local col = ""
+    if min_col and min_col > 0 then
+        -- \%>Nc：1-based 列 > N ⇔ 0-based 起点 >= N
+        col = "\\%>" .. min_col .. "c"
+    end
+    return "\\V" .. (opts.case_sensitive and "\\C" or "\\c") .. col .. body
+end
+
+--- 在 buf 中查找 query 的全部字面匹配。
+--- 注意：regex:match_line(buf, lnum, start) 的 start 会把行首截掉再匹配，
+--- `\<` 在截断点上会误判成词边界（"foofoo" 第二个 foo 被当成整词）。
+--- 所以同一行的后续匹配改为整行匹配 + `\%>Nc` 列约束。
+---@return table[]? matches  { lnum, col, end_col, text }；pattern 非法返回 nil
+function M._find_matches(buf, query, opts, max)
+    max = max or M.MAX_MATCHES
+    local ok, base = pcall(vim.regex, M._build_pattern(query, opts))
+    if not ok then return nil end
+
+    local matches = {}
+    local line_count = vim.api.nvim_buf_line_count(buf)
+    for i = 1, line_count do
+        local start_idx = 0
+        local line_text = nil
+        local regex = base
+        while true do
+            local s, e = regex:match_line(buf, i - 1)
+            if not (s and e and e > s) then break end
+            if not line_text then
+                line_text = vim.api.nvim_buf_get_lines(buf, i - 1, i, false)[1]
+            end
+            table.insert(matches, { lnum = i, col = s, end_col = e, text = line_text })
+            if #matches >= max then return matches end
+            start_idx = e
+            if start_idx >= #line_text then break end
+            local ok2, next_re = pcall(vim.regex, M._build_pattern(query, opts, start_idx))
+            if not ok2 then break end
+            regex = next_re
+        end
+    end
+    return matches
+end
+
 local function execute_search()
     if not state.active then return end
     if not vim.api.nvim_buf_is_valid(state.input_buf) then return end
@@ -26,57 +81,15 @@ local function execute_search()
     end
 
     if not vim.api.nvim_buf_is_valid(state.source_buf) then return end
-    local matches = {}
-
-    -- basic escaping for vim regex
-    local vim_pattern = query:gsub("\\", "\\\\"):gsub("/", "\\/")
-    if not state.case_sensitive then
-        vim_pattern = "\\c" .. vim_pattern
-    else
-        vim_pattern = "\\C" .. vim_pattern
-    end
-    if state.whole_word then
-        vim_pattern = "\\<" .. vim_pattern .. "\\>"
-    end
-
-    local ok, regex = pcall(vim.regex, vim_pattern)
-    if not ok then
+    local matches = M._find_matches(state.source_buf, query, {
+        case_sensitive = state.case_sensitive,
+        whole_word = state.whole_word,
+    })
+    if not matches then
         state.matches = {}
         state.selected_index = 0
         ui.render_results(state)
         return
-    end
-
-    local line_count = vim.api.nvim_buf_line_count(state.source_buf)
-    local MAX_MATCHES = 2000
-
-    for i = 1, line_count do
-        local start_idx = 0
-        local line_text = nil
-        while true do
-            local s, e = regex:match_line(state.source_buf, i - 1, start_idx)
-            if s and e and e > s then
-                if not line_text then
-                    line_text = vim.api.nvim_buf_get_lines(state.source_buf, i - 1, i, false)[1]
-                end
-                table.insert(matches, {
-                    lnum = i,
-                    col = start_idx + s,
-                    end_col = start_idx + e,
-                    text = line_text
-                })
-                start_idx = start_idx + e
-
-                if #matches >= MAX_MATCHES then
-                    break
-                end
-            else
-                break
-            end
-        end
-        if #matches >= MAX_MATCHES then
-            break
-        end
     end
 
     state.matches = matches

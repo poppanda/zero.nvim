@@ -7,6 +7,8 @@
 --   end      {data.path.text, stats={...}}
 --   summary  忽略（最后一行总结）
 --
+-- 非 UTF-8 的路径/行内容 rg 会给 {bytes=<base64>}，这里解码成原始字节串。
+--
 -- 输出事件：
 --   {kind="file_begin", file=path}
 --   {kind="match", file, lnum, col, text, match_len, submatches=[{start,end,match}]}
@@ -18,20 +20,24 @@
 
 local M = {}
 
-local function path_text(p)
-    if type(p) == "table" then
-        if type(p.text) == "string" then return p.text end
-        -- 极少见：非 utf-8 路径，rg 用 base64 包成 {bytes=...}；这里简单丢弃，
-        -- 因为我们的 UI/zero URI 也无法处理非 utf-8。
+--- rg 的 "arbitrary data" 对象：{text=...}（合法 UTF-8）或 {bytes=<base64>}
+--- （非 UTF-8 路径 / 行内容）。bytes 解码成原始字节串，而不是丢弃整条结果。
+local function data_text(d)
+    if type(d) ~= "table" then return nil end
+    if type(d.text) == "string" then return d.text end
+    if type(d.bytes) == "string" and vim.base64 and vim.base64.decode then
+        local ok, raw = pcall(vim.base64.decode, d.bytes)
+        if ok and type(raw) == "string" then return raw end
     end
     return nil
 end
 
+local function path_text(p)
+    return data_text(p)
+end
+
 local function line_text(l)
-    if type(l) == "table" and type(l.text) == "string" then
-        return l.text
-    end
-    return ""
+    return data_text(l) or ""
 end
 
 function M.new()

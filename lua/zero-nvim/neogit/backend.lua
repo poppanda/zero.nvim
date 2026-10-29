@@ -201,6 +201,13 @@ local function gate_for(target)
     return target_gates[key]
 end
 
+-- gate 看门狗：单条 gated 命令跑超过这个时长就强制放行后续命令（只 warn，
+-- 不杀进程）——防止某条挂死的命令（等 credential prompt / 网络卡死）把该主机
+-- 的 neogit 永久锁住。
+M._gate_timeout_ms = 5 * 60 * 1000
+
+local uv = vim.uv or vim.loop
+
 local function gate_release(gate)
     gate.running = false
     local next_fn = table.remove(gate.queue, 1)
@@ -302,11 +309,26 @@ function M.spawn(opts, cb, ctx)
         end,
     }
 
+    -- 每条命令只释放一次 gate：on_exit 回调抛错 / 看门狗超时 / 启动失败任一路径
+    -- 先到先放，后到的 no-op。
+    local released = false
+    local watchdog = nil
+    local function release_once()
+        if released then return end
+        released = true
+        if watchdog then
+            watchdog:stop()
+            if not watchdog:is_closing() then watchdog:close() end
+            watchdog = nil
+        end
+        gate_release(gate)
+    end
+
     local function actually_spawn()
         if cancelled then
             -- caller 已经放弃；直接给 on_exit 一个 aborted 通知
             vim.schedule(function() cb.on_exit(nil, -1, 0) end)
-            gate_release(gate)
+            release_once()
             return
         end
 
@@ -329,8 +351,10 @@ function M.spawn(opts, cb, ctx)
             end,
             on_exit = function(code, signal, reason, _dur)
                 local exit_code = (reason and -1) or (code or 0)
-                cb.on_exit(nil, exit_code, signal or 0)
-                gate_release(gate)
+                -- 无论 cb.on_exit 是否抛错，gate 都必须释放，否则该主机 neogit 永久卡死
+                local ok, cb_err = pcall(cb.on_exit, nil, exit_code, signal or 0)
+                release_once()
+                if not ok then error(cb_err, 0) end
             end,
         })
 
@@ -342,22 +366,41 @@ function M.spawn(opts, cb, ctx)
                     vim.log.levels.ERROR)
                 cb.on_exit(nil, -1, 0)
             end)
-            gate_release(gate)
+            release_once()
             return
         end
 
         real_sid = sid
+        if not released and M._gate_timeout_ms and M._gate_timeout_ms > 0 then
+            watchdog = uv.new_timer()
+            watchdog:start(M._gate_timeout_ms, 0, vim.schedule_wrap(function()
+                if released then return end
+                vim.notify(("[zero-nvim/neogit] git command still running after %ds, releasing queue: %s")
+                    :format(math.floor(M._gate_timeout_ms / 1000), table.concat(opts.cmd or {}, " ")),
+                    vim.log.levels.WARN)
+                release_once()
+            end))
+        end
         -- 把 spawn-before-real_sid 期间排队的 stdin write/close 一次性回放
         if #stdin_queue > 0 then
             flush_stdin_queue(real_sid)
         end
     end
 
+    -- actually_spawn 自身抛错也要释放 gate
+    local function guarded_spawn()
+        local ok, spawn_err = pcall(actually_spawn)
+        if not ok then
+            vim.notify(("[zero-nvim/neogit] spawn failed: %s"):format(tostring(spawn_err)), vim.log.levels.ERROR)
+            release_once()
+        end
+    end
+
     if gate.running then
-        table.insert(gate.queue, actually_spawn)
+        table.insert(gate.queue, guarded_spawn)
     else
         gate.running = true
-        actually_spawn()
+        guarded_spawn()
     end
 
     return handle
