@@ -14,6 +14,8 @@ package.loaded["zero-nvim.cmd"] = {
     cancel = function() end,
     write_stdin = function() end,
     close_stdin = function() end,
+    with_remote_path = function(argv) return argv end,
+    env_pairs = function() return nil end,
 }
 local notes = {}
 vim.notify = function(msg, level) table.insert(notes, { msg = msg, level = level }) end

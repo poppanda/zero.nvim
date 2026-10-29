@@ -1,6 +1,6 @@
 package.path = package.path .. ";./lua/?.lua;./lua/?/init.lua"
 
-local zero = require("zero-nvim")
+local client_select = require("zero-nvim.lsp.client_select")
 
 local clients = {
     {
@@ -17,7 +17,7 @@ local clients = {
     },
 }
 
-local selected = zero._test_select_lsp_clients_for_path(clients, "bob@dev-b:22", "/repo/pkg/main.py")
+local selected = client_select.select_attach_clients_for_path(clients, "bob@dev-b:22", "/repo/pkg/main.py")
 
 if not selected["zero-pyright"] then
     error("expected zero-pyright to be selected")

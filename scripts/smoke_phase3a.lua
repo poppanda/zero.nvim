@@ -44,7 +44,7 @@ header("L2: zero-nvim/neogit/backend.lua require 不报错")
 -- -----------------------------------------------------------------------------
 local ok_b, zb = pcall(require, "zero-nvim.neogit.backend")
 if not ok_b then fail("require zero-nvim.neogit.backend: " .. tostring(zb)) end
-for _, name in ipairs({ "detect", "paths", "spawn", "watch", "setup", "id_for" }) do
+for _, name in ipairs({ "detect", "paths", "spawn", "watch", "setup" }) do
     if type(zb[name]) ~= "function" then
         fail("zero backend 缺函数: " .. name)
     end

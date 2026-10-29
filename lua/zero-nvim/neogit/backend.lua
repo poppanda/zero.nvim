@@ -11,78 +11,25 @@ local M = {}
 
 local uri = require("zero-nvim.uri")
 local cmd = require("zero-nvim.cmd")
+local log = require("zero-nvim.log")
+local util = require("zero-nvim.util")
+local buffer_io = require("zero-nvim.buffer_io")
 
--- 远端二进制 PATH 前缀：ssh 非交互 shell 的默认 PATH 经常不含这些。
--- 与 gitsigns/backend.lua 用同一份；docker 适配后续也会复用。
-local REMOTE_PATH_PREFIX =
-    "/usr/local/bin:/opt/homebrew/bin:$HOME/.cargo/bin:/home/linuxbrew/.linuxbrew/bin"
-
---- 把 argv 包成 sh -c 'PATH=... exec "$@"' --，远端 git 才能找到。
----@param argv string[]
----@return string[]
-local function wrap_with_path(argv)
-    local wrapped = {
-        "sh", "-c",
-        ('PATH="%s:$PATH" exec "$@"'):format(REMOTE_PATH_PREFIX),
-        "--",
-    }
-    for _, a in ipairs(argv) do wrapped[#wrapped + 1] = a end
-    return wrapped
-end
-
---- 把 lua dict 形式的 env 转成 daemon 期望的 [[k,v], ...]。空 dict → nil。
----@param env table?
----@return string[][]?
-local function env_to_pairs(env)
-    if not env then return nil end
-    local out = {}
-    for k, v in pairs(env) do
-        out[#out + 1] = { tostring(k), tostring(v) }
-    end
-    if #out == 0 then return nil end
-    return out
-end
-
---- daemon 走 msgpack-rpc 把 stdout 字节传过来：rust 侧改成 Value::String 后
---- 应当是 Lua string；但旧 daemon 二进制 / 极端情况仍可能解成 vim.Blob (userdata)。
---- 这里做最后一道保险：任何非 string 输入都按字节重建成 Lua string。
+--- 非 string（旧 daemon 的 vim.Blob 等）一律按字节转成 Lua string。
 --- Blob 直接喂 vim.split 会得到 Blob 切片，传给 fnamemodify 触发 E976。
-local function coerce_to_string(text)
-    if text == nil then return "" end
-    if type(text) == "string" then return text end
-    -- vim.Blob → Lua string：blob2list 拿字节数组，按 200 字节分块以避开
-    -- string.char(unpack(...)) 的 Lua 栈上限（默认 ~250 args）
-    local ok, list = pcall(vim.fn.blob2list, text)
-    if not ok or type(list) ~= "table" then
-        return tostring(text)
-    end
-    local n = #list
-    if n == 0 then return "" end
-    local parts = {}
-    for i = 1, n, 200 do
-        parts[#parts + 1] = string.char(unpack(list, i, math.min(i + 199, n)))
-    end
-    return table.concat(parts)
+local function to_str(text)
+    return buffer_io.to_bytes(text) or ""
 end
 
---- 远端 backend id：包含 user/host/port，确保不同主机的同名 worktree 不
---- 撞 Repo.cache_key / Watcher.cache_key。
----@param target table { user, host, port? }
----@return string
-function M.id_for(target)
-    return ("zero://%s@%s:%d"):format(target.user, target.host, target.port or 22)
-end
+--- ctx = { target, path, id }；id 含 user/host/port，确保不同主机的同名
+--- worktree 不撞 Repo.cache_key / Watcher.cache_key。
+M.detect = uri.backend_ctx
 
----@param cwd string
----@return table? ctx
-function M.detect(cwd)
-    local user, host, port, path = uri.parse(cwd)
-    if not user then return nil end
-    return {
-        target = { user = user, host = host, port = port },
-        path = path,
-        id = M.id_for({ user = user, host = host, port = port }),
-    }
+--- dir 可能是 zero:// URI（来自 Repo.instance(opts.cwd)）也可能是远端绝对路径；
+--- 远端 git -C / cwd 只接受远端路径。
+local function remote_path(dir)
+    local _, _, _, path = uri.parse(dir)
+    return path or dir
 end
 
 --- 一次 SSH RTT 拿全部 4 个路径——比本地的 4×vim.system 还少。
@@ -92,16 +39,6 @@ end
 ---@param dir string  zero:// URI 或 ctx.path 同义
 ---@return table?, string?
 function M.paths(ctx, dir)
-    -- dir 可能是 zero:// URI（来自 Repo.instance(opts.cwd)）也可能是远端绝对路径。
-    -- 远端 git -C 只接受远端路径——如果是 URI，转成 ctx.path。
-    local remote_dir
-    local u = uri.parse(dir)
-    if u then
-        remote_dir = select(4, uri.parse(dir))
-    else
-        remote_dir = dir
-    end
-
     -- 15s timeout：首次连接 SSH 握手 + ssh agent prompt 可能花几秒；过短的
     -- timeout 会让 paths 探测在 :Neogit 启动时就 hang 整个 nvim（cmd.sync 是
     -- blocking rpcrequest）
@@ -112,29 +49,23 @@ function M.paths(ctx, dir)
     -- 探测，多 1 个 [ -d ] 测试，单 SSH RTT 不变。
     local res, err = cmd.sync(ctx.target, {
         "sh", "-c",
-        ('d="$1"; [ -d "$d" ] || d="$(dirname "$d")"; PATH="%s:$PATH" exec git -C "$d" rev-parse --show-toplevel --git-common-dir --git-dir --is-inside-work-tree'):format(REMOTE_PATH_PREFIX),
+        ('d="$1"; [ -d "$d" ] || d="$(dirname "$d")"; PATH="%s:$PATH" exec git -C "$d" rev-parse --show-toplevel --git-common-dir --git-dir --is-inside-work-tree'):format(cmd.REMOTE_PATH_PREFIX),
         "--",
-        remote_dir,
+        remote_path(dir),
     }, { timeout_ms = 15000 })
     if not res then
         -- 报 notification 让用户看到卡点，否则只是空 status 摸不着头脑
-        vim.schedule(function()
-            vim.notify(("[zero-nvim/neogit] paths probe failed: %s"):format(err or "unknown"),
-                vim.log.levels.ERROR)
-        end)
+        vim.schedule(function() log.error("neogit paths probe failed: " .. tostring(err or "unknown")) end)
         return nil, err
     end
     -- daemon 旧版本 cmd_sync 仍可能用 Value::Binary 发 stdout → vim.Blob。
-    -- 用 coerce_to_string 兜底确保是 Lua string，避免 vim.split 切出 Blob 列表
-    -- 让后续 state.worktree_root 也变 Blob 喂 fnamemodify。
-    res.stdout = coerce_to_string(res.stdout)
-    res.stderr = coerce_to_string(res.stderr)
+    res.stdout = to_str(res.stdout)
+    res.stderr = to_str(res.stderr)
 
     if res.code ~= 0 then
         -- 不是 git repo：返回空 worktree_root，让 neogit 走 "not in worktree" 分支
         vim.schedule(function()
-            vim.notify(("[zero-nvim/neogit] not a git repo (rev-parse exit %d): %s"):format(
-                res.code, vim.trim(res.stderr or "")), vim.log.levels.WARN)
+            log.warn(("neogit: not a git repo (rev-parse exit %d): %s"):format(res.code, vim.trim(res.stderr)))
         end)
         return {
             worktree_root = "",
@@ -175,9 +106,7 @@ end
 --- 必须用 `%z` 才能匹配 NUL 字节。否则每个字符前都被插入 \n，split 出字符级
 --- 而不是 record 级——这是个非常隐蔽的坑（用 `%z` 才正确）。
 local function split_lines(text)
-    local s = coerce_to_string(text)
-    s = s:gsub("%z", "\n")
-    return vim.split(s, "\n", { plain = true })
+    return vim.split((to_str(text):gsub("%z", "\n")), "\n", { plain = true })
 end
 
 --- per-target 序列化闸门：每个远端同时最多 1 条 cmd.stream 在跑。
@@ -194,7 +123,7 @@ end
 local target_gates = {}
 
 local function gate_for(target)
-    local key = ("%s@%s:%d"):format(target.user, target.host, target.port or 22)
+    local key = uri.target_key(target.user, target.host, target.port)
     if not target_gates[key] then
         target_gates[key] = { running = false, queue = {} }
     end
@@ -250,10 +179,7 @@ function M.spawn(opts, cb, ctx)
     -- cwd 兜底：fork 的 to_process 会把 git.repo.worktree_root 当 cwd 传进来，
     -- 那已经是远端绝对路径（M.paths 返回的）；但万一 caller 直接传了 zero:// URI，
     -- 这里也能解析成远端绝对路径。
-    local cwd = opts.cwd or ctx.path or "/"
-    if uri.parse(cwd) then
-        cwd = select(4, uri.parse(cwd))
-    end
+    local cwd = remote_path(opts.cwd or ctx.path or "/")
 
     local gate = gate_for(ctx.target)
 
@@ -316,11 +242,8 @@ function M.spawn(opts, cb, ctx)
     local function release_once()
         if released then return end
         released = true
-        if watchdog then
-            watchdog:stop()
-            if not watchdog:is_closing() then watchdog:close() end
-            watchdog = nil
-        end
+        util.close_timer(watchdog)
+        watchdog = nil
         gate_release(gate)
     end
 
@@ -337,9 +260,9 @@ function M.spawn(opts, cb, ctx)
         -- 如果这里再传一份 spec.stdin，daemon 会写两遍（一次性快路径 + 增量
         -- 通道），重复污染 commit message 等。
         local sid, err = cmd.stream(ctx.target, {
-            argv = wrap_with_path(opts.cmd),
+            argv = cmd.with_remote_path(opts.cmd),
             cwd = cwd,
-            env = env_to_pairs(opts.env),
+            env = cmd.env_pairs(opts.env),
             pty = opts.pty,
         }, {
             on_event = function(ev)
@@ -362,8 +285,7 @@ function M.spawn(opts, cb, ctx)
             -- daemon RPC 失败（chan dead / connect 失败等）：合成 on_exit 通知，
             -- 释放 gate，把错误 notify 出来让用户看到根因。
             vim.schedule(function()
-                vim.notify(("[zero-nvim/neogit] cmd.stream failed: %s"):format(err or "unknown"),
-                    vim.log.levels.ERROR)
+                log.error("neogit cmd.stream failed: " .. tostring(err or "unknown"))
                 cb.on_exit(nil, -1, 0)
             end)
             release_once()
@@ -375,9 +297,8 @@ function M.spawn(opts, cb, ctx)
             watchdog = uv.new_timer()
             watchdog:start(M._gate_timeout_ms, 0, vim.schedule_wrap(function()
                 if released then return end
-                vim.notify(("[zero-nvim/neogit] git command still running after %ds, releasing queue: %s")
-                    :format(math.floor(M._gate_timeout_ms / 1000), table.concat(opts.cmd or {}, " ")),
-                    vim.log.levels.WARN)
+                log.warn(("neogit: git command still running after %ds, releasing queue: %s")
+                    :format(math.floor(M._gate_timeout_ms / 1000), table.concat(opts.cmd or {}, " ")))
                 release_once()
             end))
         end
@@ -391,7 +312,7 @@ function M.spawn(opts, cb, ctx)
     local function guarded_spawn()
         local ok, spawn_err = pcall(actually_spawn)
         if not ok then
-            vim.notify(("[zero-nvim/neogit] spawn failed: %s"):format(tostring(spawn_err)), vim.log.levels.ERROR)
+            log.error("neogit spawn failed: " .. tostring(spawn_err))
             release_once()
         end
     end

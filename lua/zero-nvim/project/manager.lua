@@ -1,5 +1,6 @@
 local M = {}
 local store = require("zero-nvim.project.store")
+local log = require("zero-nvim.log")
 
 ---@class ZeroProject
 ---@field name string
@@ -14,7 +15,7 @@ function M.add(name, config)
     -- Update timestamp
     projects[name].created_at = os.time()
     store.save(projects)
-    vim.notify(string.format("Project '%s' saved.", name), vim.log.levels.INFO)
+    log.info(string.format("project '%s' saved", name))
 end
 
 ---Remove a project by name
@@ -24,9 +25,9 @@ function M.remove(name)
     if projects[name] then
         projects[name] = nil
         store.save(projects)
-        vim.notify(string.format("Project '%s' removed.", name), vim.log.levels.INFO)
+        log.info(string.format("project '%s' removed", name))
     else
-        vim.notify(string.format("Project '%s' not found.", name), vim.log.levels.WARN)
+        log.warn(string.format("project '%s' not found", name))
     end
 end
 
@@ -40,8 +41,7 @@ end
 ---@param name string
 ---@return ZeroProjectConfig?
 function M.get(name)
-    local projects = store.load()
-    return projects[name]
+    return store.load()[name]
 end
 
 ---Insert or merge a single LSP server entry into a project.
@@ -55,13 +55,20 @@ function M.upsert_lsp(project_name, server_name, server_cfg)
     local projects = store.load()
     local proj = projects[project_name]
     if not proj then
-        vim.notify(string.format("ZeroNvim: project '%s' not found", project_name), vim.log.levels.ERROR)
+        log.error(string.format("project '%s' not found", project_name))
         return false
     end
     proj.lsp = proj.lsp or {}
     proj.lsp[server_name] = vim.tbl_deep_extend("force", proj.lsp[server_name] or {}, server_cfg)
     store.save(projects)
     return true
+end
+
+--- 去掉末尾的 "/"（"/" 本身 -> ""），用于 root 比较。
+---@param path? string
+---@return string
+function M.norm_root(path)
+    return ((path or ""):gsub("/+$", ""))
 end
 
 ---Does a stored project config target the given connection?
@@ -103,15 +110,14 @@ function M.match_project(host, path, user, port)
     local best_match_len = -1
     local best_score = -1
 
-    local clean_path = path:gsub("/+$", "")
+    local clean_path = M.norm_root(path)
 
     for name, config in pairs(projects) do
         -- 坏配置（root 缺失 / 类型不对）直接跳过，避免 gsub 崩溃
         if type(config) == "table" and type(config.root) == "string" then
             local ok, score = target_matches(config, host, user, port)
             if ok then
-                -- Simple normalization: remove trailing slashes for comparison
-                local clean_root = config.root:gsub("/+$", "")
+                local clean_root = M.norm_root(config.root)
                 local covers = clean_root == ""                      -- root "/" covers everything
                     or clean_path == clean_root
                     or clean_path:find(clean_root .. "/", 1, true) == 1

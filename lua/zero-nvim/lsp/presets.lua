@@ -1,5 +1,5 @@
 -- =============================================================================
--- lsp_servers.lua — built-in preset table for `:ZeroLspAdd`
+-- lsp/presets.lua — built-in preset table for `:ZeroLspAdd`
 -- =============================================================================
 -- Maps a server binary name (or common alias) to the minimum config the wizard
 -- needs to write into a project: filetypes (required for auto-start matching),

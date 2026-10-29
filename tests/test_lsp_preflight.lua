@@ -1,15 +1,15 @@
 package.path = package.path .. ";./lua/?.lua;./lua/?/init.lua"
 
-local zero = require("zero-nvim")
+local remote = require("zero-nvim.remote")
 local lsp = require("zero-nvim.lsp")
 
 local calls = {}
 local notifications = {}
-zero.ensure_connection = function(user, host, port)
+remote.ensure_connection = function(user, host, port)
     table.insert(calls, { kind = "ensure", user = user, host = host, port = port })
     return 42
 end
-zero.uses_password_auth = function(_, host, _)
+remote.uses_password_auth = function(_, host, _)
     return host == "password-host"
 end
 vim.fn.rpcrequest = function(chan, method, ...)

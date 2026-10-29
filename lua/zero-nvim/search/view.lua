@@ -1,513 +1,208 @@
+--- :ZeroSearch 的四窗口浮窗布局（path / query / results / preview）+ 按键。
+--- 状态与搜索逻辑都在 search/init.lua；这里只建窗口、绑键、改 footer。
+local float = require("zero-nvim.ui.float")
+local util = require("zero-nvim.util")
+local type_picker = require("zero-nvim.search.type_picker")
+
 local M = {}
 
 local ui_seq = 0
+local DEBOUNCE_MS = 350
 
---- Create and open the multi-window search UI
----@param title_prefix string
----@param initial_path string
----@param callbacks table { on_query_change, on_path_change, on_close, on_enter, on_select_next, on_select_prev, on_toggle_fold }
----@return table session_ui { path_win, input_win, results_win, preview_win, path_buf, input_buf, results_buf, preview_buf, ns }
-function M.open_search_ui(title_prefix, initial_path, callbacks)
-    local nvim_ui = vim.api.nvim_list_uis()[1] or { width = 80, height = 24 }
-    local w = math.floor(nvim_ui.width * 0.85)
-    local h = math.floor(nvim_ui.height * 0.85)
-    local r = math.floor((nvim_ui.height - h) / 2)
-    local c = math.floor((nvim_ui.width - w) / 2)
+local WINHL = {
+    prompt = "NormalFloat:TelescopePromptNormal,FloatBorder:TelescopePromptBorder",
+    results = "NormalFloat:TelescopeResultsNormal,FloatBorder:TelescopeResultsBorder",
+    preview = "NormalFloat:TelescopePreviewNormal,FloatBorder:TelescopePreviewBorder",
+}
 
-    local ih = 1
+local WIN_FIELD = { path = "path_win", query = "input_win", results = "results_win" }
+
+--- 聚焦某个输入/结果窗口并记录到 session.focus
+---@param name "path"|"query"|"results"
+function M.focus(session, name)
+    local win = session[WIN_FIELD[name]]
+    if win and vim.api.nvim_win_is_valid(win) then
+        vim.api.nvim_set_current_win(win)
+        session.focus = name
+    end
+end
+
+--- 按 session.toggle_state 刷新 path（类型）和 query（Aa / word）两个 footer
+function M.update_footers(session)
+    local ts = session.toggle_state
+    if vim.api.nvim_win_is_valid(session.input_win) then
+        vim.api.nvim_win_set_config(session.input_win,
+            { footer = float.toggle_footer(ts.case_sensitive, ts.whole_word), footer_pos = "right" })
+    end
+    if vim.api.nvim_win_is_valid(session.path_win) then
+        local label = #ts.file_types == 0 and "*" or table.concat(ts.file_types, ",")
+        vim.api.nvim_win_set_config(session.path_win,
+            { footer = string.format("  [%s] C-t:Type  ", label), footer_pos = "right" })
+    end
+end
+
+local function open_win(buf, enter, cfg, winhl)
+    local win = vim.api.nvim_open_win(buf, enter, vim.tbl_extend("force", {
+        relative = "editor",
+        style = "minimal",
+        border = "rounded",
+        title_pos = "center",
+    }, cfg))
+    vim.wo[win].winhl = winhl
+    return win
+end
+
+--- 输入 buffer 改动后防抖回调。timer 由 search.close_ui teardown 时关闭；
+--- 关闭后 on_lines 返回 true 自动 detach。
+local function debounce_on_lines(buf, cb)
+    local timer = (vim.uv or vim.loop).new_timer()
+    vim.api.nvim_buf_attach(buf, false, {
+        on_lines = function()
+            if timer:is_closing() then return true end
+            timer:stop()
+            timer:start(DEBOUNCE_MS, 0, vim.schedule_wrap(function()
+                if not timer:is_closing() then cb() end
+            end))
+        end,
+    })
+    return timer
+end
+
+--- 创建并打开搜索 UI，窗口 / buffer / timer / augroup 字段直接写进 session。
+---@param session table 需已含 toggle_state = { case_sensitive, whole_word, file_types }
+---@param opts { title: string, path: string, query: string }
+---@param cb table { on_change, on_close, on_enter, on_select_next, on_select_prev, on_toggle_fold }
+function M.open(session, opts, cb)
+    local ew, eh = util.editor_size()
+    local w, h = math.floor(ew * 0.85), math.floor(eh * 0.85)
+    local r, c = math.floor((eh - h) / 2), math.floor((ew - w) / 2)
     local rw = math.floor(w * 0.4)
-    local pw = w - rw - 1
+    local body_h = h - 6
 
-    local path_buf = vim.api.nvim_create_buf(false, true)
-    local path_win = vim.api.nvim_open_win(path_buf, true, {
-        relative = "editor",
-        row = r,
-        col = c,
-        width = w,
-        height = ih,
-        style = "minimal",
-        border = "rounded",
-        title = string.format(" 📂 Search Path (%s) ", title_prefix),
-        title_pos = "center",
-        footer = "  [*] C-t:Type  ",
-        footer_pos = "right"
-    })
+    session.path_buf = vim.api.nvim_create_buf(false, true)
+    session.input_buf = vim.api.nvim_create_buf(false, true)
+    session.results_buf = vim.api.nvim_create_buf(false, true)
+    session.preview_buf = vim.api.nvim_create_buf(false, true)
 
-    local input_buf = vim.api.nvim_create_buf(false, true)
-    local input_win = vim.api.nvim_open_win(input_buf, false, {
-        relative = "editor",
-        row = r + ih + 2,
-        col = c,
-        width = w,
-        height = ih,
-        style = "minimal",
-        border = "rounded",
+    session.path_win = open_win(session.path_buf, true, {
+        row = r, col = c, width = w, height = 1,
+        title = string.format(" 📂 Search Path (%s) ", opts.title),
+    }, WINHL.prompt)
+    session.input_win = open_win(session.input_buf, false, {
+        row = r + 3, col = c, width = w, height = 1,
         title = " 🔍 Keywords ",
-        title_pos = "center",
-        footer = "  [ ]Aa  [ ]word  ",
-        footer_pos = "right"
-    })
-
-    local results_buf = vim.api.nvim_create_buf(false, true)
-    local results_win = vim.api.nvim_open_win(results_buf, false, {
-        relative = "editor",
-        row = r + 2 * ih + 4,
-        col = c,
-        width = rw,
-        height = h - 2 * ih - 4,
-        style = "minimal",
-        border = "rounded",
+    }, WINHL.prompt)
+    session.results_win = open_win(session.results_buf, false, {
+        row = r + 6, col = c, width = rw, height = body_h,
         title = " Results ",
-        title_pos = "center",
-        footer = " j/k/h/l:Nav | C-w:Word | C-c:Case ",
-        footer_pos = "left"
-    })
-    vim.api.nvim_set_option_value("cursorline", false, { win = results_win })
-
-    local preview_buf = vim.api.nvim_create_buf(false, true)
-    local preview_win = vim.api.nvim_open_win(preview_buf, false, {
-        relative = "editor",
-        row = r + 2 * ih + 4,
-        col = c + rw + 2,
-        width = pw - 1,
-        height = h - 2 * ih - 4,
-        style = "minimal",
-        border = "rounded",
+        footer = " j/k/h/l:Nav | C-w:Word | C-c:Case ", footer_pos = "left",
+    }, WINHL.results)
+    vim.wo[session.results_win].cursorline = false
+    session.preview_win = open_win(session.preview_buf, false, {
+        row = r + 6, col = c + rw + 2, width = w - rw - 2, height = body_h,
         title = " Preview ",
-        title_pos = "center",
-        footer = " CR:Open | i:Insert | q/Esc:Quit ",
-        footer_pos = "right"
-    })
+        footer = " CR:Open | i:Insert | q/Esc:Quit ", footer_pos = "right",
+    }, WINHL.preview)
 
-    pcall(vim.api.nvim_set_option_value, "winhl", "NormalFloat:TelescopePromptNormal,FloatBorder:TelescopePromptBorder",
-        { win = path_win })
-    pcall(vim.api.nvim_set_option_value, "winhl", "NormalFloat:TelescopePromptNormal,FloatBorder:TelescopePromptBorder",
-        { win = input_win })
-    pcall(vim.api.nvim_set_option_value, "winhl", "NormalFloat:TelescopeResultsNormal,FloatBorder:TelescopeResultsBorder",
-        { win = results_win })
-    pcall(vim.api.nvim_set_option_value, "winhl", "NormalFloat:TelescopePreviewNormal,FloatBorder:TelescopePreviewBorder",
-        { win = preview_win })
+    vim.bo[session.results_buf].modifiable = false
+    vim.bo[session.preview_buf].modifiable = false
+    session.ns = vim.api.nvim_create_namespace("ZeroSearchUI")
+    vim.api.nvim_buf_set_lines(session.path_buf, 0, -1, false, { opts.path })
+    vim.api.nvim_buf_set_lines(session.input_buf, 0, -1, false, { opts.query })
+    vim.api.nvim_win_set_cursor(session.input_win, { 1, #opts.query })
+    M.update_footers(session)
 
-    local ns = vim.api.nvim_create_namespace("ZeroSearchUI")
+    -- 先写入初始内容再 attach，避免恢复上次 query 时触发一次防抖搜索
+    session.timer1 = debounce_on_lines(session.path_buf, cb.on_change)
+    session.timer2 = debounce_on_lines(session.input_buf, cb.on_change)
 
-    vim.api.nvim_buf_set_lines(path_buf, 0, -1, false, { initial_path or "/" })
-    vim.api.nvim_buf_set_lines(input_buf, 0, -1, false, { "" })
-
-    local toggle_state = { case_sensitive = false, whole_word = false, file_types = {} }
-
-    -- Common file types supported by ripgrep (sorted)
-    local builtin_types = {
-        "c", "cpp", "css", "go", "h", "html", "java", "js", "json",
-        "lua", "md", "py", "rust", "sh", "sql", "toml", "ts", "txt", "xml", "yaml",
-    }
-
-    local function update_input_footer()
-        if not vim.api.nvim_win_is_valid(input_win) then return end
-        local cs_box = toggle_state.case_sensitive and "[x]" or "[ ]"
-        local ww_box = toggle_state.whole_word and "[x]" or "[ ]"
-
-        local new_footer = string.format("  %sAa  %sword  ", cs_box, ww_box)
-        vim.api.nvim_win_set_config(input_win, { footer = new_footer, footer_pos = "right" })
-    end
-
-    local function update_path_footer()
-        if not vim.api.nvim_win_is_valid(path_win) then return end
-        local type_label
-        if #toggle_state.file_types == 0 then
-            type_label = "*"
-        else
-            type_label = table.concat(toggle_state.file_types, ",")
-        end
-        local new_footer = string.format("  [%s] C-t:Type  ", type_label)
-        vim.api.nvim_win_set_config(path_win, { footer = new_footer, footer_pos = "right" })
-    end
-
-    local function focus_window(name)
-        if name == "path" and vim.api.nvim_win_is_valid(path_win) then
-            vim.api.nvim_set_current_win(path_win)
-        elseif name == "query" and vim.api.nvim_win_is_valid(input_win) then
-            vim.api.nvim_set_current_win(input_win)
-        elseif name == "results" and vim.api.nvim_win_is_valid(results_win) then
-            vim.api.nvim_set_current_win(results_win)
+    local ts = session.toggle_state
+    local function toggle(field)
+        return function()
+            ts[field] = not ts[field]
+            M.update_footers(session)
+            cb.on_change()
         end
     end
-
     local function open_type_picker()
-        local picker_width = 28
-        local max_list_height = 15
-        local picker_row = r + ih + 2
-        local picker_col = c + w - picker_width - 2
-
-        local selected_set = {}
-        for _, t in ipairs(toggle_state.file_types) do selected_set[t] = true end
-
-        local builtin_set = {}
-        for _, t in ipairs(builtin_types) do builtin_set[t] = true end
-        local custom_types = {}
-        for _, t in ipairs(toggle_state.file_types) do
-            if not builtin_set[t] then table.insert(custom_types, t) end
-        end
-
-        local filter_query = ""
-        local searching = false
-        local filtered_items = {}
-
-        local function rebuild_filtered()
-            filtered_items = {}
-            local all = {}
-            for _, t in ipairs(builtin_types) do table.insert(all, t) end
-            for _, t in ipairs(custom_types) do table.insert(all, t) end
-            table.sort(all)
-            local seen = {}
-            for _, t in ipairs(all) do
-                if not seen[t] then
-                    seen[t] = true
-                    if filter_query == "" or t:find(filter_query, 1, true) then
-                        table.insert(filtered_items, t)
-                    end
-                end
-            end
-        end
-        rebuild_filtered()
-
-        -- Single list window
-        local list_buf = vim.api.nvim_create_buf(false, true)
-        local list_height = math.min(max_list_height, math.max(1, #filtered_items))
-        local list_win = vim.api.nvim_open_win(list_buf, true, {
-            relative = "editor",
-            row = picker_row,
-            col = picker_col,
-            width = picker_width,
-            height = list_height,
-            style = "minimal",
-            border = "rounded",
-            title = { { " File Type ", "FloatTitle" } },
-            title_pos = "left",
-            footer = " Space:Toggle /:Search Tab:Add ",
-            footer_pos = "center",
-            zindex = 100,
-        })
-        pcall(vim.api.nvim_set_option_value, "winhl",
-            "NormalFloat:TelescopeResultsNormal,FloatBorder:TelescopeResultsBorder", { win = list_win })
-        pcall(vim.api.nvim_set_option_value, "cursorline", true, { win = list_win })
-
-        local picker_ns = vim.api.nvim_create_namespace("ZeroSearchTypePicker")
-
-        local function update_title()
-            if not vim.api.nvim_win_is_valid(list_win) then return end
-            local title
-            if searching or filter_query ~= "" then
-                title = {
-                    { " File Type ", "FloatTitle" },
-                    { " Search: ", "Comment" },
-                    { filter_query .. (searching and "│" or ""), "String" },
-                    { " ", "FloatBorder" },
-                }
-            else
-                title = { { " File Type ", "FloatTitle" } }
-            end
-            vim.api.nvim_win_set_config(list_win, { title = title, title_pos = "left" })
-        end
-
-        local function render_list()
-            local lines = {}
-            for _, t in ipairs(filtered_items) do
-                local box = selected_set[t] and "[x]" or "[ ]"
-                table.insert(lines, string.format(" %s %s", box, t))
-            end
-            if #lines == 0 then
-                lines = { "  (no match)" }
-            end
-            vim.api.nvim_set_option_value("modifiable", true, { buf = list_buf })
-            vim.api.nvim_buf_set_lines(list_buf, 0, -1, false, lines)
-            vim.api.nvim_set_option_value("modifiable", false, { buf = list_buf })
-            local new_h = math.min(max_list_height, math.max(1, #lines))
-            if vim.api.nvim_win_is_valid(list_win) then
-                vim.api.nvim_win_set_height(list_win, new_h)
-            end
-            vim.api.nvim_buf_clear_namespace(list_buf, picker_ns, 0, -1)
-            for i, t in ipairs(filtered_items) do
-                if selected_set[t] then
-                    vim.api.nvim_buf_add_highlight(list_buf, picker_ns, "String", i - 1, 0, -1)
-                end
-            end
-            update_title()
-        end
-
-        render_list()
-
-        local function close_picker()
-            if vim.api.nvim_win_is_valid(list_win) then vim.api.nvim_win_close(list_win, true) end
-            if vim.api.nvim_buf_is_valid(list_buf) then vim.api.nvim_buf_delete(list_buf, { force = true }) end
-            toggle_state.file_types = {}
-            for t, _ in pairs(selected_set) do
-                table.insert(toggle_state.file_types, t)
-            end
-            table.sort(toggle_state.file_types)
-            update_path_footer()
-            focus_window("query")
-            callbacks.on_query_change(toggle_state.case_sensitive, toggle_state.whole_word)
-        end
-
-        local function stop_search()
-            searching = false
-            -- Keep filter_query and filtered results as-is
-            update_title()
-            if vim.api.nvim_win_is_valid(list_win) then
-                vim.api.nvim_set_current_win(list_win)
-            end
-        end
-
-        local function add_custom_type()
-            local input = vim.trim(filter_query)
-            if input == "" then return end
-            input = input:gsub("^%*?%.?", "")
-            if input == "" then return end
-            if not builtin_set[input] then
-                local already = false
-                for _, t in ipairs(custom_types) do
-                    if t == input then already = true; break end
-                end
-                if not already then table.insert(custom_types, input) end
-            end
-            selected_set[input] = true
-            -- Clear search and refresh
-            filter_query = ""
-            searching = false
-            rebuild_filtered()
-            render_list()
-            if vim.api.nvim_win_is_valid(list_win) then
-                vim.api.nvim_set_current_win(list_win)
-            end
-        end
-
-        local function start_search()
-            if searching then return end
-            searching = true
-            filter_query = ""
-            rebuild_filtered()
-            render_list()
-
-            local function search_loop()
-                while true do
-                    vim.cmd("redraw")
-                    local ok, ch = pcall(vim.fn.getcharstr)
-                    if not ok then break end
-
-                    local byte = string.byte(ch)
-                    if ch == "\27" or ch == "\r" then
-                        -- Esc or Enter: stop search, keep results
-                        break
-                    elseif ch == "\t" then
-                        -- Tab: add custom type
-                        add_custom_type()
-                        return
-                    elseif byte == 20 then
-                        -- Ctrl-T: close picker
-                        close_picker()
-                        return
-                    elseif byte == 127 or byte == 8 or ch == vim.api.nvim_replace_termcodes("<BS>", true, false, true) then
-                        -- Backspace
-                        if #filter_query > 0 then
-                            -- Remove last UTF-8 char
-                            local chars = vim.fn.split(filter_query, "\\zs")
-                            table.remove(chars)
-                            filter_query = table.concat(chars)
-                        else
-                            -- Empty backspace: exit search
-                            break
-                        end
-                    elseif byte >= 32 then
-                        -- Printable character
-                        filter_query = filter_query .. ch
-                    else
-                        break
-                    end
-                    rebuild_filtered()
-                    render_list()
-                end
-                stop_search()
-            end
-
-            search_loop()
-        end
-
-        -- List keymaps
-        local list_opts = { buffer = list_buf, silent = true, nowait = true }
-
-        vim.keymap.set("n", "<Space>", function()
-            local row = vim.api.nvim_win_get_cursor(list_win)[1]
-            local t = filtered_items[row]
-            if t then
-                if selected_set[t] then selected_set[t] = nil else selected_set[t] = true end
-                render_list()
-            end
-        end, list_opts)
-
-        vim.keymap.set("n", "/", start_search, list_opts)
-
-        vim.keymap.set("n", "<Tab>", function()
-            if filter_query ~= "" then
-                add_custom_type()
-            end
-        end, list_opts)
-
-        -- Clear search filter
-        vim.keymap.set("n", "<BS>", function()
-            if filter_query ~= "" then
-                filter_query = ""
-                rebuild_filtered()
-                render_list()
-            end
-        end, list_opts)
-
-        vim.keymap.set("n", "<CR>", close_picker, list_opts)
-        vim.keymap.set("n", "<Esc>", close_picker, list_opts)
-        vim.keymap.set("n", "q", close_picker, list_opts)
-        vim.keymap.set("n", "<C-t>", close_picker, list_opts)
-    end
-
-    local function notify_change(cb)
-        cb(toggle_state.case_sensitive, toggle_state.whole_word)
-    end
-
-    -- Attach debounce listeners
-    -- timer 由调用方（search.lua close_ui）在 teardown 时 stop + close；
-    -- 关闭后 on_lines 返回 true 自动 detach，防抖回调也不再触发。
-    local function setup_on_lines(buf, cb)
-        local timer = vim.loop.new_timer()
-        vim.api.nvim_buf_attach(buf, false, {
-            on_lines = function(_, _, _, _, _, _)
-                if timer:is_closing() then return true end
-                timer:stop()
-                timer:start(350, 0, vim.schedule_wrap(function()
-                    if timer:is_closing() then return end
-                    notify_change(cb)
-                end))
-            end
-        })
-        return timer
-    end
-
-    local timer1 = setup_on_lines(path_buf, callbacks.on_path_change)
-    local timer2 = setup_on_lines(input_buf, callbacks.on_query_change)
-
-    -- Shared mappings
-    for _, buf in ipairs({ path_buf, input_buf, results_buf }) do
-        local opts = { buffer = buf, silent = true }
-        vim.keymap.set("n", "q", callbacks.on_close, opts)
-        vim.keymap.set("n", "<Esc>", callbacks.on_close, opts)
-
-        -- Override C-c to toggle case sensitivity instead of close
-        vim.keymap.set({ "i", "n" }, "<C-c>", function()
-            toggle_state.case_sensitive = not toggle_state.case_sensitive
-            update_input_footer()
-            notify_change(callbacks.on_query_change)
-        end, { buffer = buf, silent = true, nowait = true })
-
-        vim.keymap.set({ "i", "n" }, "<C-w>", function()
-            toggle_state.whole_word = not toggle_state.whole_word
-            update_input_footer()
-            notify_change(callbacks.on_query_change)
-        end, { buffer = buf, silent = true, nowait = true })
-
-        vim.keymap.set({ "i", "n" }, "<C-t>", function()
-            vim.cmd("stopinsert")
-            open_type_picker()
-        end, { buffer = buf, silent = true, nowait = true })
-
-        -- Automatically enter insert mode when focusing path or query inputs
-        vim.keymap.set("n", "i", function()
-            local cur_win = vim.api.nvim_get_current_win()
-            if cur_win == path_win or cur_win == input_win then
-                vim.cmd("startinsert")
-            end
-        end, opts)
-
-        -- Esc out of insert -> automatically jump to results
-        vim.keymap.set("i", "<Esc>", function()
-            vim.cmd("stopinsert")
-            focus_window("results")
-        end, opts)
-
-        vim.keymap.set({ "i", "n" }, "<CR>", callbacks.on_enter, opts)
-    end
-
-    -- path_buf: j→query, J→results
-    vim.keymap.set("n", "j", function() focus_window("query") end, { buffer = path_buf, silent = true })
-    vim.keymap.set("n", "<Down>", function() focus_window("query") end, { buffer = path_buf, silent = true })
-    vim.keymap.set("n", "J", function() focus_window("query") end, { buffer = path_buf, silent = true })
-
-    -- input_buf: k→path, j→results, K→path (same), J→results (same)
-    vim.keymap.set("n", "k", function() focus_window("path") end, { buffer = input_buf, silent = true })
-    vim.keymap.set("n", "<Up>", function() focus_window("path") end, { buffer = input_buf, silent = true })
-    vim.keymap.set("n", "j", function() focus_window("results") end, { buffer = input_buf, silent = true })
-    vim.keymap.set("n", "<Down>", function() focus_window("results") end, { buffer = input_buf, silent = true })
-    vim.keymap.set("n", "K", function() focus_window("path") end, { buffer = input_buf, silent = true })
-    vim.keymap.set("n", "J", function() focus_window("results") end, { buffer = input_buf, silent = true })
-
-    -- results_buf: k→prev result (top→query), j→next result, K→query, J→last result
-    vim.keymap.set("n", "k", function()
-        if callbacks.on_select_prev() then
-            focus_window("query")
-        end
-    end, { buffer = results_buf, silent = true })
-    vim.keymap.set("n", "<Up>", function()
-        if callbacks.on_select_prev() then
-            focus_window("query")
-        end
-    end, { buffer = results_buf, silent = true })
-    vim.keymap.set("n", "K", function() focus_window("query") end, { buffer = results_buf, silent = true })
-    vim.keymap.set("n", "J", function() focus_window("path") end, { buffer = results_buf, silent = true })
-
-    vim.keymap.set("n", "j", callbacks.on_select_next, { buffer = results_buf, silent = true })
-    vim.keymap.set("n", "<Down>", callbacks.on_select_next, { buffer = results_buf, silent = true })
-
-    -- results_buf specific folding navigation
-    vim.keymap.set("n", "h", callbacks.on_toggle_fold, { buffer = results_buf, silent = true })
-    vim.keymap.set("n", "l", callbacks.on_toggle_fold, { buffer = results_buf, silent = true })
-    vim.keymap.set("n", "<Left>", callbacks.on_toggle_fold, { buffer = results_buf, silent = true })
-    vim.keymap.set("n", "<Right>", callbacks.on_toggle_fold, { buffer = results_buf, silent = true })
-
-    -- 任一浮窗被关闭（:q / <C-w>o / :only 等非 q/<Esc> 路径）→ 整个 UI 一起关，
-    -- 由 on_close 负责 cancel 远端 stream、关 timer、清 current_session。
-    -- 每个 UI 实例一个 augroup，teardown 时由调用方删除。
-    ui_seq = ui_seq + 1
-    local augroup = vim.api.nvim_create_augroup("ZeroSearchUI_" .. ui_seq, { clear = true })
-    for _, win in ipairs({ path_win, input_win, results_win, preview_win }) do
-        vim.api.nvim_create_autocmd("WinClosed", {
-            group = augroup,
-            pattern = tostring(win),
-            once = true,
-            callback = function()
-                -- WinClosed 期间不能关别的窗口，延到下一 tick
-                vim.schedule(callbacks.on_close)
+        vim.cmd("stopinsert")
+        type_picker.open({
+            row = r + 3,
+            col = c + w - 30,
+            selected = ts.file_types,
+            on_close = function(types)
+                ts.file_types = types
+                M.update_footers(session)
+                M.focus(session, "query")
+                cb.on_change()
             end,
         })
     end
+    local function focus(name) return function() M.focus(session, name) end end
+    local function prev_or_query()
+        if cb.on_select_prev() then M.focus(session, "query") end
+    end
 
-    -- Default: start in query window, insert mode
-    -- Caller can override by setting has_previous_state
-    focus_window("query")
-    vim.cmd("startinsert!")
+    -- 三个 buffer 共用的按键
+    for _, buf in ipairs({ session.path_buf, session.input_buf, session.results_buf }) do
+        local o = { buffer = buf, silent = true }
+        local now = { buffer = buf, silent = true, nowait = true }
+        vim.keymap.set("n", "q", cb.on_close, o)
+        vim.keymap.set("n", "<Esc>", cb.on_close, o)
+        -- C-c 切大小写（不是关闭）
+        vim.keymap.set({ "i", "n" }, "<C-c>", toggle("case_sensitive"), now)
+        vim.keymap.set({ "i", "n" }, "<C-w>", toggle("whole_word"), now)
+        vim.keymap.set({ "i", "n" }, "<C-t>", open_type_picker, now)
+        -- 只有 path / query 输入框里 i 才进 insert
+        vim.keymap.set("n", "i", function()
+            local cur = vim.api.nvim_get_current_win()
+            if cur == session.path_win or cur == session.input_win then vim.cmd("startinsert") end
+        end, o)
+        -- insert 里 Esc → 跳到结果
+        vim.keymap.set("i", "<Esc>", function()
+            vim.cmd("stopinsert")
+            M.focus(session, "results")
+        end, o)
+        vim.keymap.set({ "i", "n" }, "<CR>", cb.on_enter, o)
+    end
 
-    return {
-        path_win = path_win,
-        input_win = input_win,
-        results_win = results_win,
-        preview_win = preview_win,
-        path_buf = path_buf,
-        input_buf = input_buf,
-        results_buf = results_buf,
-        preview_buf = preview_buf,
-        ns = ns,
-        augroup = augroup,
-        timer1 = timer1,
-        timer2 = timer2,
-        toggle_state = toggle_state,
-        update_input_footer = update_input_footer,
-        update_path_footer = update_path_footer,
+    -- 各窗口的导航：path ↓ query ↓ results；results 顶部再 k 回 query
+    local nav = {
+        [session.path_buf] = { j = focus("query"), ["<Down>"] = focus("query"), J = focus("query") },
+        [session.input_buf] = {
+            k = focus("path"), ["<Up>"] = focus("path"), K = focus("path"),
+            j = focus("results"), ["<Down>"] = focus("results"), J = focus("results"),
+        },
+        [session.results_buf] = {
+            k = prev_or_query, ["<Up>"] = prev_or_query,
+            j = cb.on_select_next, ["<Down>"] = cb.on_select_next,
+            K = focus("query"), J = focus("path"),
+            h = cb.on_toggle_fold, l = cb.on_toggle_fold,
+            ["<Left>"] = cb.on_toggle_fold, ["<Right>"] = cb.on_toggle_fold,
+        },
     }
+    for buf, maps in pairs(nav) do
+        for lhs, fn in pairs(maps) do
+            vim.keymap.set("n", lhs, fn, { buffer = buf, silent = true })
+        end
+    end
+
+    -- 任一浮窗被关闭（:q / <C-w>o / :only 等非 q/<Esc> 路径）→ 整个 UI 一起关。
+    -- 每个 UI 实例一个 augroup，teardown 时由 search.close_ui 删除。
+    ui_seq = ui_seq + 1
+    session.augroup = vim.api.nvim_create_augroup("ZeroSearchUI_" .. ui_seq, { clear = true })
+    for _, win in ipairs({ session.path_win, session.input_win, session.results_win, session.preview_win }) do
+        vim.api.nvim_create_autocmd("WinClosed", {
+            group = session.augroup,
+            pattern = tostring(win),
+            once = true,
+            -- WinClosed 期间不能关别的窗口，延到下一 tick
+            callback = function() vim.schedule(cb.on_close) end,
+        })
+    end
+
+    M.focus(session, "query")
+    vim.cmd("startinsert!")
 end
 
 return M

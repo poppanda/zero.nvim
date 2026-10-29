@@ -112,8 +112,7 @@ if not zb then fail("gitsigns.backends.get('zero') returned nil") end
 ok("zero backend registered")
 
 -- 触发 daemon 启动
-local zero = require("zero-nvim")
-local chan = zero.ensure_connection(USER, HOST, PORT)
+local chan = require("zero-nvim.remote").ensure_connection(USER, HOST, PORT)
 if not chan then fail("ensure_connection returned nil") end
 ok("daemon started, connected " .. USER .. "@" .. HOST .. ":" .. PORT)
 

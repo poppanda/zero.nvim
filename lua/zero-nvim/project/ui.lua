@@ -1,52 +1,16 @@
-local M = {}
+--- :ZeroProject 的项目列表 / 新增 / 健康检查浮窗。
 local manager = require("zero-nvim.project.manager")
-local store = require("zero-nvim.project.store")
-local utils = require("zero-nvim.ui.utils")
-local zero = require("zero-nvim")
+local float = require("zero-nvim.ui.float")
+local remote = require("zero-nvim.remote")
+local uri = require("zero-nvim.uri")
+local log = require("zero-nvim.log")
+local ssh_config = require("zero-nvim.ssh_config")
 
---- Show a floating input prompt
----@param opts { title: string, default?: string }
----@param on_confirm fun(text: string)
-function M.prompt_float(opts, on_confirm)
-    local width = 40
-    local height = 1
-    local buf, win = utils.create_float({
-        title = opts.title,
-        width = width,
-        height = height,
-        footer = "<Enter>: Confirm"
-    })
+local M = {}
 
-    if opts.default then
-        vim.api.nvim_buf_set_lines(buf, 0, -1, false, { opts.default })
-    end
-
-    local function confirm()
-        local lines = vim.api.nvim_buf_get_lines(buf, 0, 1, false)
-        local text = vim.trim(lines[1] or "")
-        utils.close_float(win, buf)
-        vim.cmd("stopinsert")
-        if text ~= "" then
-            on_confirm(text)
-        end
-    end
-
-    local function close()
-        utils.close_float(win, buf)
-        vim.cmd("stopinsert")
-    end
-
-    vim.keymap.set("i", "<CR>", confirm, { buffer = buf })
-    vim.keymap.set("n", "<CR>", confirm, { buffer = buf })
-    vim.keymap.set("n", "<Esc>", close, { buffer = buf })
-    vim.keymap.set("i", "<Esc>", close, { buffer = buf })
-    vim.keymap.set("n", "q", close, { buffer = buf })
-
-    vim.cmd("startinsert")
-    -- Ensure cursor is at end of line
-    if opts.default then
-        vim.api.nvim_win_set_cursor(win, { 1, #opts.default })
-    end
+--- 老配置可能没存 user/port：回落到默认用户 / 22
+local function with_target_defaults(config)
+    return vim.tbl_extend("keep", config, { user = ssh_config.default_user(), port = uri.DEFAULT_PORT })
 end
 
 --- Add a project based on a specific buffer's path
@@ -55,85 +19,24 @@ end
 function M.add_current_project(bufnr, on_complete)
     bufnr = bufnr or 0
     local buf_name = vim.api.nvim_buf_get_name(bufnr)
-    local user, host, port, path = zero.parse_uri(buf_name)
-
+    local user, host, port, path = uri.parse(buf_name)
     if not user then
-        vim.notify("Target buffer is not a zero:// buffer.", vim.log.levels.WARN)
+        log.warn("target buffer is not a zero:// buffer")
         return
     end
 
     -- Project root is always a directory: for a file buffer use its parent.
-    local uri = require("zero-nvim.uri")
     local is_dir = path:sub(-1) == "/" or vim.b[bufnr].zero_is_dir == true
     local root = is_dir and uri.as_dir(path) or uri.parent_dir(path)
 
-    -- Default project name is the folder name
-    local clean_path = root:gsub("/+$", "")
-    if clean_path == "" then clean_path = "/" end
-    local default_name = vim.fs.basename(clean_path)
+    -- Default project name is the folder name（根目录 "/" 时为 "/"）
+    local default_name = vim.fs.basename(manager.norm_root(root))
+    if default_name == "" then default_name = "/" end
 
-    -- Use custom prompt float instead of vim.ui.input for consistency
-    M.prompt_float({ title = "Project Name", default = default_name }, function(name)
-        local config = {
-            host = host,
-            user = user,
-            port = port,
-            root = root,
-            created_at = os.time(),
-        }
-        manager.add(name, config)
+    float.prompt({ title = "Project Name", default = default_name }, function(name)
+        manager.add(name, { host = host, user = user, port = port, root = root })
         if on_complete then on_complete() end
     end)
-end
-
---- Format JSON string nicely. Wraps store.format_json to give callers a
---- safe "{}" fallback when encoding fails.
-function M.format_json(obj)
-    return store.format_json(obj) or "{}"
-end
-
---- Edit a JSON object in a floating window. Save (`:w`) parses, validates, and
---- invokes on_save with the decoded table; closing the window cancels.
----@param name string Buffer-name suffix, e.g. project name
----@param current_config table
----@param on_save fun(new_config: table)
-function M.edit_json(name, current_config, on_save)
-    local formatted_json = M.format_json(current_config)
-    local content = vim.split(formatted_json, "\n")
-
-    local buf, win = utils.create_float({ title = "Edit Config: " .. name, width = 80, height = 20 })
-
-    -- Set buffer name and type for correct write behavior
-    -- Use a simple name to avoid special character issues
-    local buf_name = string.format("zero-project-%s.json", name)
-    pcall(vim.api.nvim_buf_set_name, buf, buf_name)
-
-    vim.api.nvim_set_option_value("buftype", "acwrite", { buf = buf })
-    vim.api.nvim_set_option_value("swapfile", false, { buf = buf })
-
-    vim.api.nvim_buf_set_lines(buf, 0, -1, false, content)
-    vim.api.nvim_set_option_value("filetype", "json", { buf = buf })
-    vim.api.nvim_set_option_value("modifiable", true, { buf = buf })
-
-    vim.notify("Edit config and write (:w) to save. Close window to cancel.", vim.log.levels.INFO)
-
-    -- Auto-save on write
-    vim.api.nvim_create_autocmd("BufWriteCmd", {
-        buffer = buf,
-        callback = function()
-            local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
-            local json_str = table.concat(lines, "\n")
-            local ok, new_config = pcall(vim.json.decode, json_str)
-            if not ok then
-                vim.notify("Invalid JSON: " .. tostring(new_config), vim.log.levels.ERROR)
-                return
-            end
-
-            on_save(new_config)
-            vim.api.nvim_set_option_value("modified", false, { buf = buf })
-            utils.close_float(win, buf)
-        end,
-    })
 end
 
 --- Show the project picker
@@ -165,7 +68,7 @@ function M.show_project_picker()
     -- [Fixed] Minimum height 10, Maximum 20
     local win_height = math.min(math.max(#names, 10), 20)
 
-    local buf, win = utils.create_float({
+    local buf, win = float.create({
         title = "Zero Projects",
         footer = "<CR>:Open | <C-a>:Add | <C-e>:Edit | <C-d>:Del | <C-l>:Add LSP | <C-h>:Check",
         width = final_width,
@@ -187,7 +90,7 @@ function M.show_project_picker()
     end
 
     local function close()
-        utils.close_float(win, buf)
+        float.close(win, buf)
     end
 
     local function refresh()
@@ -202,11 +105,11 @@ function M.show_project_picker()
             local config = projects[name]
             close()
             if type(config.root) ~= "string" then
-                vim.notify("Project '" .. name .. "' has no root directory configured.", vim.log.levels.ERROR)
+                log.error("project '" .. name .. "' has no root directory configured")
                 return
             end
-            -- 老配置可能没存 user/port：回落到 $USER / 22
-            zero.open_remote(config.user or vim.env.USER or "root", config.host, config.port or 22, config.root)
+            config = with_target_defaults(config)
+            require("zero-nvim.link").open_remote(config.user, config.host, config.port, config.root)
         end
     end, { buffer = buf, silent = true })
 
@@ -225,7 +128,7 @@ function M.show_project_picker()
         local name = get_selected_name()
         if name then
             close()
-            M.edit_json(name, projects[name], function(new_config)
+            float.edit_json(name, projects[name], function(new_config)
                 manager.add(name, new_config)
                 refresh()
             end)
@@ -251,7 +154,7 @@ function M.show_project_picker()
         if not name then return end
         local config = projects[name]
         close()
-        require("zero-nvim.ui.lsp_add_wizard").open({
+        require("zero-nvim.lsp.add_wizard").open({
             user = config.user,
             host = config.host,
             port = config.port,
@@ -277,7 +180,7 @@ end
 ---@param lines string[] Initial lines
 ---@return integer buf, integer win, function update_line
 local function open_health_window(name, lines)
-    local buf, win = utils.create_float({
+    local buf, win = float.create({
         title = "Health Check: " .. name,
         width = 60,
         height = math.max(#lines + 2, 5),
@@ -286,17 +189,16 @@ local function open_health_window(name, lines)
     vim.api.nvim_set_option_value("modifiable", false, { buf = buf })
     vim.api.nvim_set_option_value("buftype", "nofile", { buf = buf })
 
-    local close = function() utils.close_float(win, buf) end
+    local close = function() float.close(win, buf) end
     vim.keymap.set("n", "q", close, { buffer = buf })
     vim.keymap.set("n", "<Esc>", close, { buffer = buf })
 
     --- Update a specific line (1-based index)
     local function update_line(idx, text)
-        if vim.api.nvim_buf_is_valid(buf) then
-            vim.api.nvim_set_option_value("modifiable", true, { buf = buf })
-            vim.api.nvim_buf_set_lines(buf, idx - 1, idx, false, { text })
-            vim.api.nvim_set_option_value("modifiable", false, { buf = buf })
-        end
+        if not vim.api.nvim_buf_is_valid(buf) then return end
+        vim.bo[buf].modifiable = true
+        vim.api.nvim_buf_set_lines(buf, idx - 1, idx, false, { text })
+        vim.bo[buf].modifiable = false
     end
 
     return buf, win, update_line
@@ -307,17 +209,16 @@ end
 function M.check_health(project_name_or_args)
     local name = project_name_or_args
     if not name or name == "" then
-        vim.notify("Please specify a project name.", vim.log.levels.WARN)
+        log.warn("please specify a project name")
         return
     end
 
     local config = manager.get(name)
     if not config then
-        vim.notify("Project not found: " .. name, vim.log.levels.ERROR)
+        log.error("project not found: " .. name)
         return
     end
-    -- 老配置可能没存 user/port
-    config = vim.tbl_extend("keep", config, { user = vim.env.USER or "root", port = 22 })
+    config = with_target_defaults(config)
 
     -- Prepare initial checklist
     local checklist = {
@@ -349,16 +250,10 @@ function M.check_health(project_name_or_args)
         local idx = 1
         update_line(idx, "[●] " .. checklist[idx].label .. " (Connecting...)")
 
-        -- Need to use defer or just rely on the blocking ensure_connection?
-        -- ensure_connection is unfortunately blocking on the RPC part in some implementations,
-        -- but here it sends 'connect' request.
-        -- To make UI update visible, we might need to yield.
-        -- But Lua is single threaded.
-        -- However, since ensure_connection might take time, we want to at least show the "Connecting..." state.
-        -- We force a redraw?
+        -- ensure_connection 是阻塞的 RPC：先 redraw 让 "Connecting..." 显示出来
         vim.cmd("redraw")
 
-        local chan, err = zero.ensure_connection(config.user, config.host, config.port)
+        local chan, err = remote.ensure_connection(config.user, config.host, config.port)
         if not chan then
             update_line(idx, "[x] " .. checklist[idx].label .. ": Failed (" .. (err or "Unknown") .. ")")
             return -- Stop if SSH fails
@@ -369,22 +264,20 @@ function M.check_health(project_name_or_args)
         idx = 2
         update_line(idx, "[●] " .. checklist[idx].label .. " (Checking...)")
         vim.cmd("redraw")
-        local ok, ftype = zero.request(config.user, config.host, config.port, "stat", config.root)
+        local ok, ftype = remote.request(config.user, config.host, config.port, "stat", config.root)
         if ok and ftype == "directory" then
             update_line(idx, "[✓] " .. checklist[idx].label)
         else
             update_line(idx, "[x] " .. checklist[idx].label .. ": Not accessible")
         end
 
-        -- 3. LSP Checks
-        -- Offset for LSP items
+        -- 3. LSP Checks (checklist[3..])
         local lsp = require("zero-nvim.lsp")
         for i = 3, #checklist do
             local item = checklist[i]
             if item.status ~= "SKIP" then
                 local srv_name = item.key:gsub("^lsp_", "")
-                local srv_cfg = config.lsp and config.lsp[srv_name] or {}
-                local cmd_args = (srv_cfg.cmd and #srv_cfg.cmd > 0) and srv_cfg.cmd or { srv_name, "--stdio" }
+                local cmd_args = lsp.server_cmd(srv_name, config.lsp[srv_name])
 
                 update_line(i, "[●] " .. item.label .. " (Checking ssh + binary...)")
                 vim.cmd("redraw")

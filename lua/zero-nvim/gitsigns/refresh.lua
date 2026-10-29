@@ -14,6 +14,9 @@
 -- 重抓 baseline、重算 hunks。我们用全局 debounce + in-flight gate 防止短时间
 -- 内多个 autocmd 把它跑成 N 次。
 
+local util = require("zero-nvim.util")
+local uri = require("zero-nvim.uri")
+
 local M = {}
 
 local uv = vim.uv or vim.loop
@@ -24,22 +27,6 @@ local poll_ms = 0
 local debounce_timer
 local poll_timer
 local in_flight = false
-
---- 当前是否至少有一个 zero:// buffer 摆在某个 window 上。
---- 用 win 列表而非 buffer 列表：未显示的 buffer 即使 attached 也不必为它轮询。
----@return boolean
-local function any_zero_window_visible()
-    for _, win in ipairs(vim.api.nvim_list_wins()) do
-        if vim.api.nvim_win_is_valid(win) then
-            local buf = vim.api.nvim_win_get_buf(win)
-            local name = vim.api.nvim_buf_get_name(buf)
-            if name:sub(1, 7) == "zero://" then
-                return true
-            end
-        end
-    end
-    return false
-end
 
 --- 真正跑刷新；in-flight gate 确保上一次没回来时新请求被丢弃（防 thrash）。
 local function do_refresh()
@@ -72,15 +59,12 @@ end
 --- 道理：debounce 用来合并"短时间内多个事件"；poll 自身就是固定节奏，再 debounce
 --- 反而会导致 poll_ms < debounce_ms 时 debounce timer 被反复重置永远不触发。
 local function configure_poll()
-    if poll_timer then
-        poll_timer:stop()
-        poll_timer:close()
-        poll_timer = nil
-    end
+    util.close_timer(poll_timer)
+    poll_timer = nil
     if poll_ms <= 0 then return end
     poll_timer = uv.new_timer()
     poll_timer:start(poll_ms, poll_ms, vim.schedule_wrap(function()
-        if any_zero_window_visible() then
+        if util.any_zero_window_visible() then
             do_refresh()
         end
     end))
@@ -108,10 +92,7 @@ function M.setup(opts)
     vim.api.nvim_create_autocmd("FocusGained", {
         group = group,
         callback = function()
-            local name = vim.api.nvim_buf_get_name(0)
-            if name:sub(1, 7) == "zero://" then
-                schedule_refresh()
-            end
+            if uri.is_zero(vim.api.nvim_buf_get_name(0)) then schedule_refresh() end
         end,
     })
 

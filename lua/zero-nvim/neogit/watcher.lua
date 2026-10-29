@@ -13,6 +13,9 @@
 -- start() 注册 session，autocmd / poll 触发时 fan-out 到所有匹配 git_dir 的
 -- session 的 on_event。
 
+local util = require("zero-nvim.util")
+local log = require("zero-nvim.log")
+
 local M = {}
 
 local uv = vim.uv or vim.loop
@@ -33,19 +36,6 @@ local function gen_sid()
     return "watch-" .. sid_counter
 end
 
---- 当前是否至少有一个 zero:// buffer 摆在某个 window 上。
---- 与 gitsigns/refresh 一致：用 win 列表而非 buffer 列表。
-local function any_zero_window_visible()
-    for _, win in ipairs(vim.api.nvim_list_wins()) do
-        if vim.api.nvim_win_is_valid(win) then
-            local buf = vim.api.nvim_win_get_buf(win)
-            local name = vim.api.nvim_buf_get_name(buf)
-            if name:sub(1, 7) == "zero://" then return true end
-        end
-    end
-    return false
-end
-
 --- 真正分发；in-flight gate 确保上一次未结束时新触发被丢弃，防止 thrash。
 local function dispatch_all()
     if in_flight then return end
@@ -56,8 +46,7 @@ local function dispatch_all()
         local ok, err = pcall(s.on_event, nil)
         if not ok then
             -- session 自身挂了不该影响别的 session
-            require("zero-nvim").log("WARN",
-                ("[neogit watcher] session %s on_event err: %s"):format(s.id, tostring(err)))
+            log.warn(("neogit watcher: session %s on_event err: %s"):format(s.id, tostring(err)))
         end
     end
     vim.defer_fn(function() in_flight = false end, debounce_ms)
@@ -72,15 +61,12 @@ local function schedule()
 end
 
 local function configure_poll()
-    if poll_timer then
-        poll_timer:stop()
-        poll_timer:close()
-        poll_timer = nil
-    end
+    util.close_timer(poll_timer)
+    poll_timer = nil
     if poll_ms <= 0 then return end
     poll_timer = uv.new_timer()
     poll_timer:start(poll_ms, poll_ms, vim.schedule_wrap(function()
-        if next(sessions) and any_zero_window_visible() then
+        if next(sessions) and util.any_zero_window_visible() then
             dispatch_all()
         end
     end))

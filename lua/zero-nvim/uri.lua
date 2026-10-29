@@ -50,10 +50,41 @@ end
 ---@param path string
 ---@return string
 function M.format(user, host, port, path)
+    return M.prefix(user, host, port) .. path
+end
+
+--- URI prefix without the path: "zero://user@host:port" (IPv6 bracketed).
+--- Also used as the per-remote backend id (gitsigns / neogit).
+---@param user string
+---@param host string
+---@param port? integer
+---@return string
+function M.prefix(user, host, port)
     if host:find(":", 1, true) and host:sub(1, 1) ~= "[" then
         host = "[" .. host .. "]"
     end
-    return string.format("zero://%s@%s:%d%s", user, host, tonumber(port) or M.DEFAULT_PORT, path)
+    return string.format("zero://%s@%s:%d", user, host, tonumber(port) or M.DEFAULT_PORT)
+end
+
+--- 是否是 zero:// 名字（只看 scheme，不校验其余部分）。
+---@param name any
+---@return boolean
+function M.is_zero(name)
+    return type(name) == "string" and name:sub(1, 7) == "zero://"
+end
+
+--- gitsigns / neogit backend 的 detect 结果：
+--- { target = { user, host, port }, path, id = prefix }，非 zero:// 返回 nil。
+---@param name string
+---@return { target: { user: string, host: string, port: integer }, path: string, id: string }?
+function M.backend_ctx(name)
+    local user, host, port, path = M.parse(name)
+    if not user then return nil end
+    return {
+        target = { user = user, host = host, port = port },
+        path = path,
+        id = M.prefix(user, host, port),
+    }
 end
 
 --- Normalize a remote path: collapse repeated slashes and drop "/./"

@@ -93,14 +93,11 @@ local icon_map = {
     o = "🔧",
 }
 
---- Get an emoji icon for a file extension
+--- Emoji icon for a file extension (case-insensitive; "📄" when unknown)
 ---@param ext? string File extension (without dot)
 ---@return string icon
-function M._file_icon(ext)
-    if not ext then return "📄" end
-    return icon_map[ext:lower()] or "📄"
+function M.for_ext(ext)
+    return ext and icon_map[ext:lower()] or "📄"
 end
-
-M.icon_map = icon_map
 
 return M

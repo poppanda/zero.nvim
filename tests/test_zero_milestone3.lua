@@ -1,6 +1,7 @@
 -- Milestone 3 Test: Directory handling and Caching logic
 package.path = package.path .. ";./lua/?.lua;./lua/?/init.lua"
-local remote = require('zero-nvim.init')
+local zero = require("zero-nvim")
+local buffers = require("zero-nvim.buffers")
 
 local function run_test()
     print("Running Milestone 3 Test (Directory Support)...")
@@ -26,14 +27,14 @@ local function run_test()
         table.insert(rpc_calls, { method = method, args = {...}, notify = true })
     end
 
-    remote.setup()
+    zero.setup()
 
     local buf = vim.api.nvim_create_buf(true, false)
     local uri = "zero://user@localhost:22/home/user/project"
     vim.api.nvim_buf_set_name(buf, uri)
 
     -- Trigger fetch
-    remote.handle_fetch(buf, "user", "localhost", 22, "/home/user/project")
+    buffers.load(buf, "user", "localhost", 22, "/home/user/project")
 
     -- Verify RPC calls
     local found_fetch_path = false

@@ -4,8 +4,8 @@ package.path = package.path .. ";./lua/?.lua;./lua/?/init.lua"
 local chan = 7
 local notified = {}
 local cancels = {}
-package.loaded["zero-nvim"] = {
-    _get_daemon_chan = function() return chan end,
+package.loaded["zero-nvim.daemon"] = {
+    channel = function() return chan end,
 }
 vim.fn.rpcnotify = function(c, method, sid)
     table.insert(cancels, { chan = c, method = method, sid = sid })

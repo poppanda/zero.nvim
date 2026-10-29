@@ -9,7 +9,7 @@ local function flush() vim.wait(50, function() return false end) end
 local search = require("zero-nvim.search")
 
 -- 1. 全局搜索：关掉 preview 窗口（非 q/<Esc> 路径）
-search.last_query = ""
+search.last.query = ""
 search.open_ui({ is_local = true, initial_path = vim.fn.getcwd() })
 local s = search.current_session
 check(s and vim.api.nvim_win_is_valid(s.results_win), "search UI should open")
@@ -37,7 +37,7 @@ check(search.current_session == nil, "q path teardown")
 -- 3. mini search：关掉结果窗口 → 输入窗口也关
 local src = vim.api.nvim_get_current_buf()
 vim.api.nvim_buf_set_lines(src, 0, -1, false, { "hello [world]", "hello again" })
-local ui_mini = require("zero-nvim.ui.search_mini")
+local ui_mini = require("zero-nvim.search_mini.view")
 local captured
 local orig_create = ui_mini.create_ui
 ui_mini.create_ui = function(st)

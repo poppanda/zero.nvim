@@ -1,6 +1,8 @@
-local M = {}
-
+--- LSP 自动重启 / 退避重连的状态簿记（不直接操作 client）。
 local client_select = require("zero-nvim.lsp.client_select")
+local util = require("zero-nvim.util")
+
+local M = {}
 
 M.MAX_RESTART_ATTEMPTS = 3
 M.BACKOFF_SECS = { 1, 2, 4, 8, 16, 30, 60 }
@@ -13,10 +15,6 @@ local state = {
     stale_restart_exits = {},
     dormant_lsps = {},
 }
-
-local function has_key(t, key)
-    return t[key] ~= nil
-end
 
 function M.track(client_id, entry)
     state.active_lsps[client_id] = entry
@@ -44,11 +42,11 @@ function M.mark_intentional_stop(client_id)
 end
 
 function M.is_intentional_stop(client_id)
-    return has_key(state.intentional_stops, client_id)
+    return state.intentional_stops[client_id] ~= nil
 end
 
 function M.consume_intentional_stop(client_id)
-    local marked = has_key(state.intentional_stops, client_id)
+    local marked = state.intentional_stops[client_id] ~= nil
     state.intentional_stops[client_id] = nil
     return marked
 end
@@ -58,7 +56,7 @@ function M.mark_stale_exit(client_id)
 end
 
 function M.consume_stale_exit(client_id)
-    local marked = has_key(state.stale_restart_exits, client_id)
+    local marked = state.stale_restart_exits[client_id] ~= nil
     state.stale_restart_exits[client_id] = nil
     return marked
 end
@@ -147,14 +145,7 @@ function M.resolve_transport_fallback(client_id)
 end
 
 function M.dormant_key_for(entry)
-    return "zero-" .. entry.server_name .. "@"
-        .. client_select.target_key(entry.user, entry.host, entry.port) .. ":" .. entry.root_dir
-end
-
-function M.cancel_timer(timer)
-    if not timer then return end
-    pcall(function() timer:stop() end)
-    pcall(function() timer:close() end)
+    return client_select.client_key(entry.server_name, entry.user, entry.host, entry.port, entry.root_dir)
 end
 
 function M.get_dormant(key)
@@ -168,38 +159,22 @@ end
 function M.clear_dormant(key)
     local dormant = state.dormant_lsps[key]
     if dormant then
-        M.cancel_timer(dormant.timer)
+        util.close_timer(dormant.timer)
     end
     state.dormant_lsps[key] = nil
 end
 
 function M.dormant_keys()
-    if vim and vim.tbl_keys then
-        return vim.tbl_keys(state.dormant_lsps)
-    end
-
-    local keys = {}
-    for key, _ in pairs(state.dormant_lsps) do
-        table.insert(keys, key)
-    end
-    return keys
+    return vim.tbl_keys(state.dormant_lsps)
 end
 
 function M.dormant_count()
-    if vim and vim.tbl_count then
-        return vim.tbl_count(state.dormant_lsps)
-    end
-
-    local count = 0
-    for _, _ in pairs(state.dormant_lsps) do
-        count = count + 1
-    end
-    return count
+    return vim.tbl_count(state.dormant_lsps)
 end
 
 function M._reset_for_tests()
     for _, dormant in pairs(state.dormant_lsps) do
-        M.cancel_timer(dormant.timer)
+        util.close_timer(dormant.timer)
     end
     state.active_lsps = {}
     state.intentional_stops = {}

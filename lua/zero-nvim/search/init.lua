@@ -1,18 +1,27 @@
+--- :ZeroSearch 控制器：rg 调度（本地 jobstart / 远端 cmd.stream）、结果树渲染、预览。
 local M = {}
 
-local zero = require("zero-nvim")
-local ui = require("zero-nvim.ui")
 local uri = require("zero-nvim.uri")
 local cmd = require("zero-nvim.cmd")
+local log = require("zero-nvim.log")
+local util = require("zero-nvim.util")
+local remote = require("zero-nvim.remote")
+local buffer_io = require("zero-nvim.buffer_io")
+local icons = require("zero-nvim.ui.icons")
 local rg_parser = require("zero-nvim.cmd.parsers.rg")
+local view = require("zero-nvim.search.view")
+local type_picker = require("zero-nvim.search.type_picker")
 
 M.current_session = nil
-M.last_query = ""
-M.last_path = nil
-M.last_case_sensitive = false
-M.last_whole_word = false
-M.last_file_types = {}
-M.last_selected_index = 0
+-- 上次搜索的状态，下次打开时恢复
+M.last = {
+    query = "",
+    path = nil,
+    case_sensitive = false,
+    whole_word = false,
+    file_types = {},
+    selected_index = 0,
+}
 
 -- 结果上限：超过后停止 rg 并显示 truncated 提示（防 UI 卡死）
 M.MAX_RESULTS = 5000
@@ -29,12 +38,15 @@ end
 
 local uv = vim.uv or vim.loop
 
-local function close_timer(t)
-    if t then
-        pcall(function()
-            t:stop()
-            if not t:is_closing() then t:close() end
-        end)
+local function define_highlights()
+    for name, val in pairs({
+        ZeroSearchMatch = { fg = "#61afef", bold = true },
+        ZeroSearchCount = { fg = "#e5c07b" },
+        ZeroSearchLineNr = { fg = "#5c6370" },
+        ZeroSearchSep = { fg = "#5c6370" },
+    }) do
+        val.default = true
+        vim.api.nvim_set_hl(0, name, val)
     end
 end
 
@@ -42,50 +54,20 @@ end
 -- 内部：rg argv 构造
 -- =============================================================================
 
--- ripgrep 内置 type（其余走 --glob '*.<ext>'）
-local RG_BUILTIN = {
-    c = true, cpp = true, css = true, go = true, h = true, html = true,
-    java = true, js = true, json = true, lua = true, md = true, py = true,
-    rust = true, sh = true, sql = true, toml = true, ts = true, txt = true,
-    xml = true, yaml = true,
-}
-
--- 远端 PATH 注入：sshd non-interactive shell 通常缺 brew/cargo bin
-local REMOTE_PATH_PREFIX =
-"/usr/local/bin:/opt/homebrew/bin:$HOME/.cargo/bin:/home/linuxbrew/.linuxbrew/bin"
-
-local function build_rg_args(query, path, case_sensitive, whole_word, file_types)
+local function build_rg_args(query, path, ts)
     -- --max-columns：超长行（minified js / 单行 json）只给预览片段，避免几 MB
     -- 的行塞进 msgpack + 渲染
     local args = { "rg", "--json", "--max-columns=500", "--max-columns-preview" }
-    if case_sensitive then
-        table.insert(args, "--case-sensitive")
-    else
-        table.insert(args, "--ignore-case")
-    end
-    if whole_word then table.insert(args, "--word-regexp") end
-    for _, ft in ipairs(file_types or {}) do
-        if RG_BUILTIN[ft] then
-            table.insert(args, "--type"); table.insert(args, ft)
+    table.insert(args, ts.case_sensitive and "--case-sensitive" or "--ignore-case")
+    if ts.whole_word then table.insert(args, "--word-regexp") end
+    for _, ft in ipairs(ts.file_types or {}) do
+        if type_picker.is_builtin(ft) then
+            vim.list_extend(args, { "--type", ft })
         else
-            table.insert(args, "--glob"); table.insert(args, "*." .. ft)
+            vim.list_extend(args, { "--glob", "*." .. ft })
         end
     end
-    table.insert(args, "--")
-    table.insert(args, query)
-    table.insert(args, path)
-    return args
-end
-
--- 远端：用 sh -c 包一层让 $PATH 在远端运行时展开
-local function wrap_remote_argv(rg_args)
-    local out = {
-        "sh", "-c",
-        ('PATH="%s:$PATH" exec "$@"'):format(REMOTE_PATH_PREFIX),
-        "--",
-    }
-    vim.list_extend(out, rg_args)
-    return out
+    return vim.list_extend(args, { "--", query, path })
 end
 
 -- =============================================================================
@@ -172,146 +154,96 @@ function M.render_tree()
     local session = M.current_session
     if not session then return end
 
-    if not M._hl_defined then
-        vim.api.nvim_set_hl(0, "ZeroSearchMatch", { fg = "#61afef", bold = true })
-        vim.api.nvim_set_hl(0, "ZeroSearchCount", { fg = "#e5c07b" })
-        vim.api.nvim_set_hl(0, "ZeroSearchLineNr", { fg = "#5c6370" })
-        vim.api.nvim_set_hl(0, "ZeroSearchSep", { fg = "#5c6370" })
-        M._hl_defined = true
-    end
-
     session.nodes = {}
-    local display_lines = {}
-    local extmarks = {} -- { lnum, col, end_col, hl_group }
+    local lines = {}
+    local marks = {} -- { lnum, col, end_col, hl_group }
+    local function add(line, node)
+        table.insert(lines, line)
+        table.insert(session.nodes, node)
+        return #lines - 1
+    end
 
     local win_width = vim.api.nvim_win_is_valid(session.results_win)
         and vim.api.nvim_win_get_width(session.results_win) or 60
 
     for fi, file_obj in ipairs(session.files) do
-        local is_expanded = file_obj.expanded
-        local icon = is_expanded and "" or ""
-        local match_count = #file_obj.matches
         local filepath = file_obj.file
         local filename = vim.fs.basename(filepath)
         local dirpath = filepath:sub(1, #filepath - #filename)
+        local count = #file_obj.matches
 
-        local ext = filename:match("%.([^%.]+)$") or ""
-        local file_icon = (ui.icon_map and ui.icon_map[ext]) and ui.icon_map[ext] or "󰈔"
-
-        local name_part = string.format("%s %s %s ", icon, file_icon, filename)
-        local count_text = string.format("[%d match%s]", match_count, match_count > 1 and "es" or "")
+        local head = string.format("%s %s ", file_obj.expanded and "" or "",
+            icons.for_ext(filename:match("%.([^%.]+)$")))
+        local name_part = head .. filename .. " "
+        local count_text = string.format("[%d match%s]", count, count > 1 and "es" or "")
         local name_w = vim.fn.strdisplaywidth(name_part)
-        local dir_w = vim.fn.strdisplaywidth(dirpath)
         local count_w = vim.fn.strdisplaywidth(count_text)
-        local max_dir_w = win_width - name_w - count_w - 2
         local display_dir = dirpath
-        if dir_w > max_dir_w and max_dir_w > 3 then
+        local max_dir_w = win_width - name_w - count_w - 2
+        if vim.fn.strdisplaywidth(dirpath) > max_dir_w and max_dir_w > 3 then
             display_dir = "..." .. fit_tail(dirpath, max_dir_w - 3)
-            dir_w = vim.fn.strdisplaywidth(display_dir)
         end
-        local padding = string.rep(" ", math.max(1, win_width - name_w - dir_w - count_w - 1))
+        local padding = string.rep(" ", math.max(1, win_width - name_w - vim.fn.strdisplaywidth(display_dir) - count_w - 1))
         local full_line = name_part .. display_dir .. padding .. count_text
 
-        table.insert(display_lines, full_line)
-        local current_row = #display_lines - 1
+        local row = add(full_line, { type = "file", file = filepath, ref = file_obj })
+        table.insert(marks, { row, 0, #head + #filename, "Title" })
+        table.insert(marks, { row, #name_part, #name_part + #display_dir, "Comment" })
+        table.insert(marks, { row, #full_line - #count_text, #full_line, "ZeroSearchCount" })
 
-        table.insert(session.nodes, { type = "file", file = file_obj.file, ref = file_obj })
-
-        local icon_bytes = #string.format("%s %s ", icon, file_icon)
-        local name_end = icon_bytes + #filename
-        local dir_start = #name_part
-        local dir_end = dir_start + #display_dir
-        table.insert(extmarks, { current_row, 0, icon_bytes, "Title" })
-        table.insert(extmarks, { current_row, icon_bytes, name_end, "Title" })
-        table.insert(extmarks, { current_row, dir_start, dir_end, "Comment" })
-        table.insert(extmarks, { current_row, #full_line - #count_text, #full_line, "ZeroSearchCount" })
-
-        if is_expanded then
+        if file_obj.expanded then
             for _, match in ipairs(file_obj.matches) do
                 local lnum_str = string.format("%4d", match.lnum)
                 local prefix = lnum_str .. " │ "
-                local prefix_w = vim.fn.strdisplaywidth(prefix)
-                local max_text_width = win_width - prefix_w
+                local max_text_width = win_width - vim.fn.strdisplaywidth(prefix)
                 local text = match.text
-                -- 旧 text 模式 col 是 1-based；新 JSON 模式我们也产 1-based。
+                -- col 是 1-based
                 local col0 = math.max(0, match.col - 1)
-                local match_len = match.match_len or #(session.query or "")
 
-                local text_offset = 0
-                local display_text = text
+                local display_text, text_offset = text, 0
                 if #text > max_text_width and vim.fn.strdisplaywidth(text) > max_text_width then
                     display_text, text_offset = truncate_around(text, col0, max_text_width)
                 end
-
                 local c_line = prefix .. display_text
+                local c_row = add(c_line, { type = "match", file = filepath, lnum = match.lnum, col = match.col, text = text })
 
-                table.insert(display_lines, c_line)
-                local c_row = #display_lines - 1
-
-                table.insert(session.nodes, {
-                    type = "match",
-                    file = file_obj.file,
-                    lnum = match.lnum,
-                    col = match.col,
-                    text = match.text
-                })
-
-                local lnum_end = #lnum_str
-                local sep_start = lnum_end + 1
-                local sep_end = sep_start + #"│"
-                table.insert(extmarks, { c_row, 0, lnum_end, "ZeroSearchLineNr" })
-                table.insert(extmarks, { c_row, sep_start, sep_end, "ZeroSearchSep" })
-
-                local prefix_bytes = #prefix
-                local match_start = prefix_bytes + col0 - text_offset
-                local match_end = math.min(match_start + match_len, #c_line)
-                if match.col > 0 and match_start >= prefix_bytes and match_end > match_start then
-                    table.insert(extmarks, { c_row, match_start, match_end, "ZeroSearchMatch" })
+                table.insert(marks, { c_row, 0, #lnum_str, "ZeroSearchLineNr" })
+                table.insert(marks, { c_row, #lnum_str + 1, #lnum_str + 1 + #"│", "ZeroSearchSep" })
+                local match_start = #prefix + col0 - text_offset
+                local match_end = math.min(match_start + (match.match_len or #(session.query or "")), #c_line)
+                if match.col > 0 and match_start >= #prefix and match_end > match_start then
+                    table.insert(marks, { c_row, match_start, match_end, "ZeroSearchMatch" })
                 end
             end
         end
 
-        if fi < #session.files then
-            table.insert(display_lines, "")
-            table.insert(session.nodes, { type = "spacer" })
-        end
+        if fi < #session.files then add("", { type = "spacer" }) end
     end
 
-    if session.truncated and #display_lines > 0 then
-        table.insert(display_lines, "")
-        table.insert(session.nodes, { type = "spacer" })
-        table.insert(display_lines, string.format("  ... truncated at %d matches (refine the query)", M.MAX_RESULTS))
-        table.insert(session.nodes, { type = "spacer" })
-        table.insert(extmarks, { #display_lines - 1, 0, #display_lines[#display_lines], "Comment" })
+    if session.truncated and #lines > 0 then
+        add("", { type = "spacer" })
+        local row = add(string.format("  ... truncated at %d matches (refine the query)", M.MAX_RESULTS),
+            { type = "spacer" })
+        table.insert(marks, { row, 0, #lines[#lines], "Comment" })
     end
 
     local buf = session.results_buf
-    if vim.api.nvim_buf_is_valid(buf) then
-        vim.api.nvim_set_option_value("modifiable", true, { buf = buf })
-        if #display_lines == 0 then
-            vim.api.nvim_buf_set_lines(buf, 0, -1, false, { "  0 results found." })
-        else
-            vim.api.nvim_buf_set_lines(buf, 0, -1, false, display_lines)
-            vim.api.nvim_buf_clear_namespace(buf, session.ns, 0, -1)
-            for _, mark in ipairs(extmarks) do
-                pcall(vim.api.nvim_buf_set_extmark, buf, session.ns, mark[1], mark[2], {
-                    end_col = mark[3],
-                    hl_group = mark[4]
-                })
-            end
-        end
-        vim.api.nvim_set_option_value("modifiable", false, { buf = buf })
+    if not vim.api.nvim_buf_is_valid(buf) then return end
+    util.set_lines(buf, #lines == 0 and { "  0 results found." } or lines)
+    vim.api.nvim_buf_clear_namespace(buf, session.ns, 0, -1)
+    for _, m in ipairs(marks) do
+        pcall(vim.api.nvim_buf_set_extmark, buf, session.ns, m[1], m[2], { end_col = m[3], hl_group = m[4] })
+    end
 
-        if M.last_selected_index > 0 then
-            if #session.nodes >= M.last_selected_index then
-                M.set_selection(M.last_selected_index)
-                M.last_selected_index = 0
-            end
-        elseif session.selected_index == 0 and #session.nodes > 0 then
-            M.set_selection(1)
-        else
-            M.set_selection(session.selected_index)
+    if M.last.selected_index > 0 then
+        if #session.nodes >= M.last.selected_index then
+            M.set_selection(M.last.selected_index)
+            M.last.selected_index = 0
         end
+    elseif session.selected_index == 0 and #session.nodes > 0 then
+        M.set_selection(1)
+    else
+        M.set_selection(session.selected_index)
     end
 end
 
@@ -325,20 +257,26 @@ function M.toggle_fold()
     end
 end
 
+local function read_content(session, file)
+    if session.is_local then
+        local f = io.open(file, "rb")
+        if not f then return nil end
+        local content = f:read("*a")
+        f:close()
+        return content
+    end
+    return remote.read_file(session.user, session.host, session.port, file)
+end
+
 --- 立即渲染当前选中节点的预览。内容按文件缓存在 session 内（失败也缓存为
 --- false，避免对同一个拉不下来的文件反复同步 RPC）。
 local function render_preview(session)
     if M.current_session ~= session or session.closed then return end
 
     local node = session.nodes[session.selected_index]
-
     if not node or node.type == "spacer" then
         session._preview_key = nil
-        if vim.api.nvim_buf_is_valid(session.preview_buf) then
-            vim.api.nvim_set_option_value("modifiable", true, { buf = session.preview_buf })
-            vim.api.nvim_buf_set_lines(session.preview_buf, 0, -1, false, {})
-            vim.api.nvim_set_option_value("modifiable", false, { buf = session.preview_buf })
-        end
+        util.set_lines(session.preview_buf, {})
         return
     end
 
@@ -349,46 +287,26 @@ local function render_preview(session)
     session.file_cache = session.file_cache or {}
     local content = session.file_cache[node.file]
     if content == nil then
-        if session.is_local then
-            local f = io.open(node.file, "r")
-            if f then
-                content = f:read("*a")
-                f:close()
-            end
-        else
-            content = zero.get_file_content(session.user, session.host, session.port, node.file)
-        end
-        if type(content) ~= "string" then content = false end
+        content = read_content(session, node.file) or false
         session.file_cache[node.file] = content
         -- 同步拉取期间 UI 可能已被关闭
         if M.current_session ~= session or session.closed then return end
     end
     session._preview_key = key
+    if not content or not vim.api.nvim_buf_is_valid(session.preview_buf) then return end
 
-    if content and vim.api.nvim_buf_is_valid(session.preview_buf) then
-        local lines = vim.split(content, "\n")
-        if #lines > 0 and lines[#lines] == "" then table.remove(lines) end
+    util.set_lines(session.preview_buf, (buffer_io.content_to_lines(content)))
+    local ft = vim.filetype.match({ filename = node.file })
+    if ft then pcall(vim.api.nvim_set_option_value, "filetype", ft, { buf = session.preview_buf }) end
 
-        vim.api.nvim_set_option_value("modifiable", true, { buf = session.preview_buf })
-        vim.api.nvim_buf_set_lines(session.preview_buf, 0, -1, false, lines)
-        vim.api.nvim_set_option_value("modifiable", false, { buf = session.preview_buf })
-
-        local ft = vim.filetype.match({ filename = node.file })
-        if ft then pcall(vim.api.nvim_set_option_value, "filetype", ft, { buf = session.preview_buf }) end
-
-        local win = session.preview_win
-        if vim.api.nvim_win_is_valid(win) then
-            local lnum = node.type == "match" and node.lnum or 1
-            local col = node.type == "match" and math.max(0, node.col - 1) or 0
-
-            pcall(vim.api.nvim_win_set_cursor, win, { lnum, col })
-            vim.api.nvim_win_call(win, function() vim.cmd("normal! zz") end)
-
-            pcall(vim.api.nvim_buf_clear_namespace, session.preview_buf, session.ns, 0, -1)
-            if node.type == "match" then
-                pcall(vim.api.nvim_buf_add_highlight, session.preview_buf, session.ns, "Search", lnum - 1, 0, -1)
-            end
-        end
+    local win = session.preview_win
+    if not vim.api.nvim_win_is_valid(win) then return end
+    local is_match = node.type == "match"
+    pcall(vim.api.nvim_win_set_cursor, win, { is_match and node.lnum or 1, is_match and math.max(0, node.col - 1) or 0 })
+    vim.api.nvim_win_call(win, function() vim.cmd("normal! zz") end)
+    pcall(vim.api.nvim_buf_clear_namespace, session.preview_buf, session.ns, 0, -1)
+    if is_match then
+        pcall(vim.api.nvim_buf_add_highlight, session.preview_buf, session.ns, "Search", node.lnum - 1, 0, -1)
     end
 end
 
@@ -396,9 +314,7 @@ end
 function M.update_preview()
     local session = M.current_session
     if not session or session.closed then return end
-    if not session.preview_timer then
-        session.preview_timer = uv.new_timer()
-    end
+    session.preview_timer = session.preview_timer or uv.new_timer()
     session.preview_timer:stop()
     session.preview_timer:start(M.PREVIEW_DEBOUNCE_MS, 0, vim.schedule_wrap(function()
         render_preview(session)
@@ -409,9 +325,7 @@ function M.set_selection(idx)
     local session = M.current_session
     if not session or #session.nodes == 0 then return end
 
-    if idx < 1 then idx = 1 end
-    if idx > #session.nodes then idx = #session.nodes end
-
+    idx = math.max(1, math.min(idx, #session.nodes))
     if session.nodes[idx].type == "spacer" then
         if idx > session.selected_index and idx < #session.nodes then
             idx = idx + 1
@@ -421,19 +335,14 @@ function M.set_selection(idx)
             return
         end
     end
-
     session.selected_index = idx
 
-    local win = session.results_win
-    if vim.api.nvim_win_is_valid(win) then
-        pcall(vim.api.nvim_win_set_cursor, win, { idx, 0 })
+    if vim.api.nvim_win_is_valid(session.results_win) then
+        pcall(vim.api.nvim_win_set_cursor, session.results_win, { idx, 0 })
     end
-
     local buf = session.results_buf
     if vim.api.nvim_buf_is_valid(buf) then
-        if not session.cursor_ns then
-            session.cursor_ns = vim.api.nvim_create_namespace("zero_search_cursor")
-        end
+        session.cursor_ns = session.cursor_ns or vim.api.nvim_create_namespace("zero_search_cursor")
         pcall(vim.api.nvim_buf_clear_namespace, buf, session.cursor_ns, 0, -1)
         pcall(vim.api.nvim_buf_add_highlight, buf, session.cursor_ns, "CursorLine", idx - 1, 0, -1)
     end
@@ -469,45 +378,28 @@ function M.close_ui(session)
     -- 代号 +1：在飞 stream 的迟到事件 / 防抖回调全部失效
     session.id = next_gen()
     cancel_inflight(session)
-    close_timer(session.timer1); session.timer1 = nil
-    close_timer(session.timer2); session.timer2 = nil
-    close_timer(session.preview_timer); session.preview_timer = nil
-
-    local wins = { session.path_win, session.input_win, session.results_win, session.preview_win }
-    for _, win in ipairs(wins) do
-        if win and vim.api.nvim_win_is_valid(win) then pcall(vim.api.nvim_win_close, win, true) end
+    for _, k in ipairs({ "timer1", "timer2", "preview_timer" }) do
+        util.close_timer(session[k])
+        session[k] = nil
     end
-    for _, buf in ipairs({ session.path_buf, session.input_buf, session.results_buf, session.preview_buf }) do
+    for _, name in ipairs({ "path", "input", "results", "preview" }) do
+        local win, buf = session[name .. "_win"], session[name .. "_buf"]
+        if win and vim.api.nvim_win_is_valid(win) then pcall(vim.api.nvim_win_close, win, true) end
         if buf and vim.api.nvim_buf_is_valid(buf) then pcall(vim.api.nvim_buf_delete, buf, { force = true }) end
     end
-    M.last_selected_index = session.selected_index or 0
+    M.last.selected_index = session.selected_index or 0
     if M.current_session == session then
         M.current_session = nil
     end
     vim.cmd("stopinsert")
 end
 
-function M.execute_search(case_sensitive, whole_word)
-    local session = M.current_session
-    if not session or session.closed then return end
+-- =============================================================================
+-- 执行搜索
+-- =============================================================================
 
-    local path_lines = vim.api.nvim_buf_get_lines(session.path_buf, 0, 1, false)
-    local query_lines = vim.api.nvim_buf_get_lines(session.input_buf, 0, 1, false)
-
-    local path = path_lines[1] or "/"
-    local query = query_lines[1] or ""
-    M.last_query = query
-    M.last_path = path
-    M.last_case_sensitive = case_sensitive
-    M.last_whole_word = whole_word
-    M.last_file_types = (session.toggle_state and session.toggle_state.file_types) or {}
-
-    cancel_inflight(session)
-    -- 先换代号再决定是否 early return：清空 query 时旧 stream 的迟到结果
-    -- 不能再回填列表
-    session.id = next_gen()
-    local sid_capture = session.id
-
+--- 新一轮搜索前清空 session 的结果状态和两个 buffer
+local function reset(session, query)
     session.query = query
     session.files = {}
     session.file_map = {}
@@ -518,45 +410,25 @@ function M.execute_search(case_sensitive, whole_word)
     session._stderr_buf = nil
     session._parse_errors = 0
     session._preview_key = nil
-
+    util.set_lines(session.results_buf, {})
+    util.set_lines(session.preview_buf, {})
     if vim.api.nvim_buf_is_valid(session.results_buf) then
-        vim.api.nvim_set_option_value("modifiable", true, { buf = session.results_buf })
-        vim.api.nvim_buf_set_lines(session.results_buf, 0, -1, false, {})
-        vim.api.nvim_set_option_value("modifiable", false, { buf = session.results_buf })
         pcall(vim.api.nvim_buf_clear_namespace, session.results_buf, session.ns, 0, -1)
     end
+end
 
-    if vim.api.nvim_buf_is_valid(session.preview_buf) then
-        vim.api.nvim_set_option_value("modifiable", true, { buf = session.preview_buf })
-        vim.api.nvim_buf_set_lines(session.preview_buf, 0, -1, false, {})
-        vim.api.nvim_set_option_value("modifiable", false, { buf = session.preview_buf })
-    end
-
-    if query == "" or path == "" then return end
-
-    local file_types = (session.toggle_state and session.toggle_state.file_types) or {}
-    local rg_args = build_rg_args(query, path, case_sensitive, whole_word, file_types)
-
-    local function is_live()
-        return M.current_session == session and not session.closed and session.id == sid_capture
-    end
-
+--- 本轮搜索的 on_event / on_done；is_live 为 false 时（关了 / 换代了）一律丢弃。
+local function make_handlers(session, is_live)
     local function on_event(ev)
         if not is_live() or session.truncated then return end
-        local kind = ev.kind
-        if kind == "match" then
-            local f = ev.file
-            if not session.file_map[f] then
-                local nf = { file = f, expanded = true, matches = {} }
-                session.file_map[f] = nf
-                table.insert(session.files, nf)
+        if ev.kind == "match" then
+            local entry = session.file_map[ev.file]
+            if not entry then
+                entry = { file = ev.file, expanded = true, matches = {} }
+                session.file_map[ev.file] = entry
+                table.insert(session.files, entry)
             end
-            table.insert(session.file_map[f].matches, {
-                lnum = ev.lnum,
-                col = ev.col,
-                text = ev.text,
-                match_len = ev.match_len,
-            })
+            table.insert(entry.matches, { lnum = ev.lnum, col = ev.col, text = ev.text, match_len = ev.match_len })
             session.match_count = session.match_count + 1
             if session.match_count >= M.MAX_RESULTS then
                 -- 到上限：停掉 rg，保留已有结果 + truncated 提示。
@@ -566,12 +438,12 @@ function M.execute_search(case_sensitive, whole_word)
                 if session.stream_sid then pcall(cmd.cancel, session.stream_sid) end
             end
             schedule_render(session)
-        elseif kind == "stderr" then
+        elseif ev.kind == "stderr" then
             -- stderr 只留前 4KB，够诊断
             local buf = session._stderr_buf or ""
             if #buf < 4096 then session._stderr_buf = buf .. ev.text end
-        elseif kind == "parse_error" then
-            session._parse_errors = (session._parse_errors or 0) + 1
+        elseif ev.kind == "parse_error" then
+            session._parse_errors = session._parse_errors + 1
         end
         -- file_begin / file_end 忽略：match 上来时 lazy 创建条目
     end
@@ -586,11 +458,10 @@ function M.execute_search(case_sensitive, whole_word)
         if session.truncated then
             -- 我们自己因结果上限取消的：不报错
         elseif reason then
-            -- aborted / cancelled：daemon 的 reason 形如 "cancelled (exit=N)" /
-            -- "cancelled: ..." / "aborted: ..."。主动 cancel 已经换过代号走不到这里；
-            -- 能到这里的是 daemon 侧中断（连接断 / daemon 退出），提示一下。
+            -- 主动 cancel 已经换过代号走不到这里；能到这里的是 daemon 侧中断
+            -- （连接断 / daemon 退出），提示一下。
             if not reason:match("^cancelled") then
-                vim.notify("ZeroSearch: search aborted (" .. reason .. ")", vim.log.levels.WARN)
+                log.warn("Search: search aborted (" .. reason .. ")")
             end
         elseif code and code >= 2 then
             -- rg 退出码：0 = 有匹配；1 = 无匹配；2 = 出错（但可能已有部分结果，
@@ -598,113 +469,145 @@ function M.execute_search(case_sensitive, whole_word)
             local msg = (session._stderr_buf or ""):gsub("^sh: %d+: ", "")
             if msg == "" then msg = "rg exited with code " .. tostring(code) end
             if has_results then
-                vim.notify("ZeroSearch: rg reported errors (partial results):\n" .. msg, vim.log.levels.WARN)
+                log.warn("Search: rg reported errors (partial results):\n" .. msg)
             else
-                vim.notify("ZeroSearch Error: " .. msg, vim.log.levels.ERROR)
+                log.error("Search: " .. msg)
             end
         end
-        if (session._parse_errors or 0) > 0 and not has_results then
-            vim.notify(
-                ("ZeroSearch: rg --json 解析失败 %d 行（远端 rg 可能太老或不存在）"):format(
-                    session._parse_errors),
-                vim.log.levels.WARN)
+        if session._parse_errors > 0 and not has_results then
+            log.warn(("Search: rg --json 解析失败 %d 行（远端 rg 可能太老或不存在）"):format(session._parse_errors))
         end
 
         M.render_tree()
-        if M.last_selected_index > 0 and #session.nodes > 0 then
-            M.set_selection(math.min(M.last_selected_index, #session.nodes))
-            M.last_selected_index = 0
+        if M.last.selected_index > 0 and #session.nodes > 0 then
+            M.set_selection(math.min(M.last.selected_index, #session.nodes))
+            M.last.selected_index = 0
         end
     end
 
-    if session.is_local then
-        local parser = rg_parser.new()
-        session._local_parser = parser
-        local job_id = vim.fn.jobstart(rg_args, {
-            on_stdout = function(_, data)
-                if not data or #data == 0 then return end
-                local events = parser:feed(table.concat(data, "\n"))
-                if events then for _, ev in ipairs(events) do on_event(ev) end end
-            end,
-            on_stderr = function(_, data)
-                if not data or #data == 0 then return end
-                local s = table.concat(data, "\n")
-                if #s > 0 then on_event({ kind = "stderr", text = s }) end
-            end,
-            on_exit = function(_, code)
-                if session._local_parser == parser then
-                    local tail = parser:finalize() or {}
-                    for _, ev in ipairs(tail) do on_event(ev) end
-                end
-                on_done(code, nil)
-            end,
-        })
-        if job_id <= 0 then
-            session._local_parser = nil
-            local why = job_id == -1 and "rg not found in PATH" or "invalid arguments"
-            vim.notify("ZeroSearch: failed to start rg (" .. why .. ")", vim.log.levels.ERROR)
-            return
-        end
-        session.job_id = job_id
-    else
-        local target = { user = session.user, host = session.host, port = session.port }
-        local sid, err = cmd.stream(target, {
-            argv = wrap_remote_argv(rg_args),
-            parser = rg_parser.new(),
-            owner_buf = session.results_buf,
-            owner_win = session.results_win,
-        }, {
-            on_event = on_event,
-            on_exit = function(code, _signal, reason, _dur)
-                on_done(code, reason)
-            end,
-        })
-        if not sid then
-            vim.notify("ZeroSearch: cmd.stream failed: " .. tostring(err), vim.log.levels.ERROR)
-            return
-        end
-        -- stream 启动期间（同步 RPC）UI 可能已被关掉 / 已换代
-        if not is_live() then
-            pcall(cmd.cancel, sid)
-            return
-        end
-        session.stream_sid = sid
-    end
+    return on_event, on_done
 end
 
-function M.focus_window(name)
+local function start_local(session, args, on_event, on_done)
+    local parser = rg_parser.new()
+    session._local_parser = parser
+    local function feed_all(events)
+        for _, ev in ipairs(events or {}) do on_event(ev) end
+    end
+    local job_id = vim.fn.jobstart(args, {
+        on_stdout = function(_, data)
+            if data and #data > 0 then feed_all(parser:feed(table.concat(data, "\n"))) end
+        end,
+        on_stderr = function(_, data)
+            local s = data and table.concat(data, "\n") or ""
+            if #s > 0 then on_event({ kind = "stderr", text = s }) end
+        end,
+        on_exit = function(_, code)
+            if session._local_parser == parser then feed_all(parser:finalize()) end
+            on_done(code, nil)
+        end,
+    })
+    if job_id <= 0 then
+        session._local_parser = nil
+        log.error("Search: failed to start rg (" .. (job_id == -1 and "rg not found in PATH" or "invalid arguments") .. ")")
+        return
+    end
+    session.job_id = job_id
+end
+
+local function start_remote(session, args, on_event, on_done, is_live)
+    local sid, err = cmd.stream({ user = session.user, host = session.host, port = session.port }, {
+        argv = cmd.with_remote_path(args),
+        parser = rg_parser.new(),
+        owner_buf = session.results_buf,
+        owner_win = session.results_win,
+    }, {
+        on_event = on_event,
+        on_exit = function(code, _signal, reason) on_done(code, reason) end,
+    })
+    if not sid then
+        log.error("Search: cmd.stream failed: " .. tostring(err))
+        return
+    end
+    -- stream 启动期间（同步 RPC）UI 可能已被关掉 / 已换代
+    if not is_live() then
+        pcall(cmd.cancel, sid)
+        return
+    end
+    session.stream_sid = sid
+end
+
+--- 按 path / query 输入框和 toggle_state 重新搜索（取消在飞的上一轮）。
+function M.execute_search()
     local session = M.current_session
-    if not session then return end
+    if not session or session.closed then return end
 
-    if name == "path" and vim.api.nvim_win_is_valid(session.path_win) then
-        vim.api.nvim_set_current_win(session.path_win)
-        session.focus = "path"
-    elseif name == "query" and vim.api.nvim_win_is_valid(session.input_win) then
-        vim.api.nvim_set_current_win(session.input_win)
-        session.focus = "query"
-    elseif name == "results" and vim.api.nvim_win_is_valid(session.results_win) then
-        vim.api.nvim_set_current_win(session.results_win)
-        session.focus = "results"
+    local path = vim.api.nvim_buf_get_lines(session.path_buf, 0, 1, false)[1] or "/"
+    local query = vim.api.nvim_buf_get_lines(session.input_buf, 0, 1, false)[1] or ""
+    local ts = session.toggle_state
+    M.last.query = query
+    M.last.path = path
+    M.last.case_sensitive = ts.case_sensitive
+    M.last.whole_word = ts.whole_word
+    M.last.file_types = ts.file_types
+
+    cancel_inflight(session)
+    -- 先换代号再决定是否 early return：清空 query 时旧 stream 的迟到结果
+    -- 不能再回填列表
+    session.id = next_gen()
+    local gen = session.id
+    reset(session, query)
+    if query == "" or path == "" then return end
+
+    local function is_live()
+        return M.current_session == session and not session.closed and session.id == gen
+    end
+    local on_event, on_done = make_handlers(session, is_live)
+    local args = build_rg_args(query, path, ts)
+    if session.is_local then
+        start_local(session, args, on_event, on_done)
+    else
+        start_remote(session, args, on_event, on_done, is_live)
     end
 end
 
+-- =============================================================================
+-- 打开
+-- =============================================================================
+
+local function open_selected(session)
+    local node = session.nodes[session.selected_index]
+    if not node or node.type == "spacer" then return end
+    if node.type == "file" then return M.toggle_fold() end
+
+    M.close_ui(session)
+    local target = session.is_local and node.file or uri.format(session.user, session.host, session.port, node.file)
+    vim.cmd("edit " .. vim.fn.fnameescape(target))
+    vim.schedule(function()
+        pcall(vim.api.nvim_win_set_cursor, 0, { node.lnum, math.max(0, node.col - 1) })
+        vim.cmd("normal! zz")
+    end)
+end
+
+---@param opts { is_local?: boolean, user?: string, host?: string, port?: integer, initial_path?: string }
 function M.open_ui(opts)
-    local title_prefix
+    local title
     if opts.is_local then
-        title_prefix = "Local"
+        title = "Local"
     else
-        local chan = zero.ensure_connection(opts.user, opts.host, opts.port)
+        local chan, err = remote.ensure_connection(opts.user, opts.host, opts.port)
         if not chan then
-            vim.notify("ZeroNvim: Cannot connect to daemon for search", vim.log.levels.ERROR)
+            log.error("Cannot connect for search: " .. tostring(err))
             return
         end
-        title_prefix = string.format("%s@%s:%s", opts.user, opts.host, opts.port)
+        title = string.format("%s@%s:%s", opts.user, opts.host, opts.port)
     end
 
     -- 旧 UI 还开着（比如 WinClosed 之外的路径漏关）：先完整 teardown
     if M.current_session then M.close_ui() end
+    define_highlights()
 
-    local this_session = {
+    local session = {
         is_local = opts.is_local,
         user = opts.user,
         host = opts.host,
@@ -715,127 +618,55 @@ function M.open_ui(opts)
         query = "",
         selected_index = 0,
         id = next_gen(),
+        toggle_state = {
+            case_sensitive = M.last.case_sensitive,
+            whole_word = M.last.whole_word,
+            file_types = vim.deepcopy(M.last.file_types),
+        },
     }
-    M.current_session = this_session
+    M.current_session = session
 
-    -- 回调全部绑定到 this_session：防抖 timer / WinClosed 的 vim.schedule
+    -- 回调全部绑定到这个 session：防抖 timer / WinClosed 的 vim.schedule
     -- 迟到时不能作用到下一次打开的 session 上
-    local function is_current()
-        return M.current_session == this_session and not this_session.closed
+    local function live(fn)
+        return function(...)
+            if M.current_session == session and not session.closed then return fn(...) end
+        end
     end
 
-    local ui_state = ui.open_search_ui(title_prefix, opts.initial_path, {
-        on_query_change = function(cs, ww) if is_current() then M.execute_search(cs, ww) end end,
-        on_path_change = function(cs, ww) if is_current() then M.execute_search(cs, ww) end end,
-        on_close = function() M.close_ui(this_session) end,
-        on_enter = function()
-            if not is_current() then return end
-            local session = this_session
-            local node = session.nodes[session.selected_index]
-            if not node or node.type == "spacer" then return end
-
-            if node.type == "file" then
-                M.toggle_fold()
-                return
-            end
-
-            M.close_ui()
-            if session.is_local then
-                vim.cmd("edit " .. vim.fn.fnameescape(node.file))
-            else
-                local target = uri.format(session.user, session.host, session.port, node.file)
-                vim.cmd("edit " .. vim.fn.fnameescape(target))
-            end
-            vim.schedule(function()
-                pcall(vim.api.nvim_win_set_cursor, 0, { node.lnum, math.max(0, node.col - 1) })
-                vim.cmd("normal! zz")
-            end)
-        end,
-        on_toggle_fold = function()
-            M.toggle_fold()
-        end,
-        on_select_next = function()
-            if M.current_session and M.current_session.selected_index then
-                M.set_selection(M.current_session.selected_index + 1)
-            end
-        end,
-        on_select_prev = function()
-            if M.current_session and M.current_session.selected_index then
-                if M.current_session.selected_index <= 1 then
-                    return true
-                else
-                    M.set_selection(M.current_session.selected_index - 1)
-                    return false
-                end
-            end
+    view.open(session, {
+        title = title,
+        path = opts.initial_path or M.last.path or "/",
+        query = M.last.query or "",
+    }, {
+        on_change = live(M.execute_search),
+        on_close = function() M.close_ui(session) end,
+        on_enter = live(function() open_selected(session) end),
+        on_toggle_fold = live(M.toggle_fold),
+        on_select_next = live(function() M.set_selection(session.selected_index + 1) end),
+        -- 返回 true = 已在第一项，交给 view 把焦点移回 query
+        on_select_prev = live(function()
+            if session.selected_index <= 1 then return true end
+            M.set_selection(session.selected_index - 1)
             return false
-        end
+        end),
     })
 
-    if M.last_query and M.last_query ~= "" then
-        vim.api.nvim_buf_set_lines(ui_state.input_buf, 0, -1, false, { M.last_query })
-        vim.api.nvim_win_set_cursor(ui_state.input_win, { 1, #M.last_query })
-    end
-    if M.last_path and not opts.initial_path then
-        vim.api.nvim_buf_set_lines(ui_state.path_buf, 0, -1, false, { M.last_path })
-    end
-    if ui_state.toggle_state then
-        ui_state.toggle_state.case_sensitive = M.last_case_sensitive or false
-        ui_state.toggle_state.whole_word = M.last_whole_word or false
-        if M.last_file_types and #M.last_file_types > 0 then
-            ui_state.toggle_state.file_types = vim.deepcopy(M.last_file_types)
-        end
-        if ui_state.update_input_footer then ui_state.update_input_footer() end
-        if ui_state.update_path_footer then ui_state.update_path_footer() end
-    end
-
-    for k, v in pairs(ui_state) do
-        this_session[k] = v
-    end
-
-    if M.last_query and M.last_query ~= "" then
-        if M.current_session.timer1 then M.current_session.timer1:stop() end
-        if M.current_session.timer2 then M.current_session.timer2:stop() end
+    if M.last.query ~= "" then
         vim.cmd("stopinsert")
-        M.execute_search(
-            M.current_session.toggle_state.case_sensitive,
-            M.current_session.toggle_state.whole_word
-        )
-        M.focus_window("results")
+        M.execute_search()
+        view.focus(session, "results")
     end
 end
 
-function M.live_grep(opts)
-    local buf_name = vim.api.nvim_buf_get_name(0)
-    local is_remote = buf_name:match("^zero://")
-
-    local default_path = "/"
-    local default_user, default_host, default_port
-
-    if is_remote then
-        local user, host, port, path = uri.parse(buf_name)
-        if user and host and path then
-            default_user = user
-            default_host = host
-            default_port = port
-            default_path = path:match("/$") and path or vim.fs.dirname(path)
-            if default_path == "" or default_path == "." then default_path = "/" end
-        end
+function M.live_grep()
+    local user, host, port, path = uri.parse(vim.api.nvim_buf_get_name(0))
+    if not user then
+        return M.open_ui({ is_local = true, initial_path = vim.fn.getcwd() })
     end
-
-    if default_user then
-        M.open_ui({
-            user = default_user,
-            host = default_host,
-            port = default_port,
-            initial_path = default_path
-        })
-    else
-        M.open_ui({
-            is_local = true,
-            initial_path = vim.fn.getcwd()
-        })
-    end
+    local dir = path:match("/$") and path or vim.fs.dirname(path)
+    if dir == "" or dir == "." then dir = "/" end
+    M.open_ui({ user = user, host = host, port = port, initial_path = dir })
 end
 
 return M

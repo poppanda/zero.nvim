@@ -1,11 +1,22 @@
+--- zero-* LSP client 的复用 / 附着选择（纯函数，便于测试）。
+local uri = require("zero-nvim.uri")
+local manager = require("zero-nvim.project.manager")
+
 local M = {}
 
-function M.target_key(user, host, port)
-    return string.format("%s@%s:%d", user, host, port)
+M.norm_root = manager.norm_root
+
+--- Neovim LSP client name for a server. ALWAYS keyed by the project-config
+--- key (e.g. "pyright"), never by the binary in cmd[1] — autostart, prewarm,
+--- :ZeroLspStart and restart must agree or duplicate clients get started.
+function M.client_name(server_key)
+    return "zero-" .. server_key
 end
 
-function M.norm_root(path)
-    return (path or ""):gsub("/+$", "")
+--- 一个 (server, remote, root) 的唯一 key："zero-<key>@user@host:port:<root>"。
+--- 启动锁与 dormant 表共用。
+function M.client_key(server_key, user, host, port, root_dir)
+    return M.client_name(server_key) .. "@" .. uri.target_key(user, host, port) .. ":" .. M.norm_root(root_dir)
 end
 
 function M.root_covers(parent, child)

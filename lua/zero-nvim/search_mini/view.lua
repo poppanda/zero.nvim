@@ -1,6 +1,32 @@
+--- :ZeroSearchMini 的两个浮窗（输入 / 结果）与渲染。状态在 search_mini/init.lua。
+local float = require("zero-nvim.ui.float")
+local util = require("zero-nvim.util")
+
 local M = {}
 
 local ui_seq = 0
+local WIDTH = 50
+
+--- 结果行前缀：普通模式一行一个匹配；替换模式每个匹配两行（🟥 原文 / 🟩 替换后）
+---@param kind? "old"|"new"  nil = 普通模式
+local function row_prefix(kind, lnum)
+    local mark = kind == "old" and " 🟥 " or kind == "new" and " 🟩 " or "  "
+    return string.format("%s%4d: ", mark, lnum)
+end
+
+--- 输入框第 2 行（替换串）；未开替换时为 ""
+local function replacement(state)
+    if not state.show_replace or not vim.api.nvim_buf_is_valid(state.input_buf) then return "" end
+    return vim.api.nvim_buf_get_lines(state.input_buf, 1, 2, false)[1] or ""
+end
+
+local function clear(buf, ns)
+    if buf and vim.api.nvim_buf_is_valid(buf) then pcall(vim.api.nvim_buf_clear_namespace, buf, ns, 0, -1) end
+end
+
+local function hl(buf, ns, group, row, s, e)
+    pcall(vim.api.nvim_buf_add_highlight, buf, ns, group, row, s, e)
+end
 
 --- 可重入 teardown：q/<Esc>/<CR> 或任一浮窗被外部关闭（WinClosed）都走这里。
 function M.close_ui(state)
@@ -11,97 +37,52 @@ function M.close_ui(state)
         pcall(vim.api.nvim_del_augroup_by_id, state.augroup)
         state.augroup = nil
     end
-    if state.input_win and vim.api.nvim_win_is_valid(state.input_win) then
-        vim.api.nvim_win_close(state.input_win, true)
-    end
-    if state.results_win and vim.api.nvim_win_is_valid(state.results_win) then
-        vim.api.nvim_win_close(state.results_win, true)
-    end
-    if state.input_buf and vim.api.nvim_buf_is_valid(state.input_buf) then
-        vim.api.nvim_buf_delete(state.input_buf, { force = true })
-    end
-    if state.results_buf and vim.api.nvim_buf_is_valid(state.results_buf) then
-        vim.api.nvim_buf_delete(state.results_buf, { force = true })
-    end
-    if state.source_win and vim.api.nvim_win_is_valid(state.source_win) then
-        if state.source_buf and vim.api.nvim_buf_is_valid(state.source_buf) then
-            pcall(vim.api.nvim_buf_clear_namespace, state.source_buf, state.ns_id, 0, -1)
-        end
-    end
-    if state.timer then
-        pcall(function()
-            state.timer:stop()
-            if not state.timer:is_closing() then state.timer:close() end
-        end)
-        state.timer = nil
-    end
+    float.close(state.input_win, state.input_buf)
+    float.close(state.results_win, state.results_buf)
+    clear(state.source_buf, state.ns_id)
+    util.close_timer(state.timer)
+    state.timer = nil
     vim.cmd("stopinsert")
     state.active = false
 end
 
+--- 跳到 state.selected_index 对应的匹配：移动源窗口光标 + 刷新源 / 结果高亮
 function M.jump_to_match(state)
-    if state.selected_index > 0 and state.selected_index <= #state.matches then
-        local match = state.matches[state.selected_index]
-        if vim.api.nvim_win_is_valid(state.source_win) then
-            vim.api.nvim_win_set_cursor(state.source_win, { match.lnum, match.col })
-            -- keep jump centered minimally
-            vim.api.nvim_win_call(state.source_win, function()
-                vim.cmd("normal! zz")
-            end)
+    local match = state.matches[state.selected_index]
+    if not match then return end
+    if vim.api.nvim_win_is_valid(state.source_win) then
+        vim.api.nvim_win_set_cursor(state.source_win, { match.lnum, match.col })
+        vim.api.nvim_win_call(state.source_win, function() vim.cmd("normal! zz") end)
+    end
+
+    if vim.api.nvim_buf_is_valid(state.source_buf) then
+        clear(state.source_buf, state.ns_id)
+        hl(state.source_buf, state.ns_id, "IncSearch", match.lnum - 1, match.col, match.end_col)
+    end
+
+    local per = state.show_replace and 2 or 1
+    local sel_row = (state.selected_index - 1) * per
+    if vim.api.nvim_win_is_valid(state.results_win) then
+        pcall(vim.api.nvim_win_set_cursor, state.results_win, { sel_row + 1, 0 })
+    end
+    local buf = state.results_buf
+    if not vim.api.nvim_buf_is_valid(buf) then return end
+    clear(buf, state.ns_id)
+    local rep_len = #replacement(state)
+    for i, m in ipairs(state.matches) do
+        local row = (i - 1) * per
+        if state.show_replace then
+            local p_old, p_new = #row_prefix("old", m.lnum), #row_prefix("new", m.lnum)
+            hl(buf, state.ns_id, "DiagnosticError", row, p_old + m.col, p_old + m.end_col)
+            hl(buf, state.ns_id, "DiagnosticOk", row + 1, p_new + m.col, p_new + m.col + rep_len)
+        else
+            local p = #row_prefix(nil, m.lnum)
+            hl(buf, state.ns_id, "IncSearch", row, p + m.col, p + m.end_col)
         end
-
-        -- Highlighting in source
-        if vim.api.nvim_buf_is_valid(state.source_buf) then
-            pcall(vim.api.nvim_buf_clear_namespace, state.source_buf, state.ns_id, 0, -1)
-            pcall(vim.api.nvim_buf_add_highlight, state.source_buf, state.ns_id, "IncSearch", match.lnum - 1, match.col,
-                match.end_col)
-        end
-
-        -- Select line in results
-        if vim.api.nvim_win_is_valid(state.results_win) then
-            local row = state.show_replace and ((state.selected_index - 1) * 2) or (state.selected_index - 1)
-            pcall(vim.api.nvim_win_set_cursor, state.results_win, { row + 1, 0 })
-        end
-        if vim.api.nvim_buf_is_valid(state.results_buf) then
-            pcall(vim.api.nvim_buf_clear_namespace, state.results_buf, state.ns_id, 0, -1)
-            local res_match = state.matches[state.selected_index]
-            pcall(vim.api.nvim_buf_clear_namespace, state.results_buf, state.ns_id, 0, -1) -- Clear all highlights first
-            -- Re-apply all Diagnostic highlights
-            local replacement = ""
-            if state.show_replace and vim.api.nvim_buf_is_valid(state.input_buf) then
-                local in_lines = vim.api.nvim_buf_get_lines(state.input_buf, 0, -1, false)
-                replacement = in_lines[2] or ""
-            end
-
-            for i, match_item in ipairs(state.matches) do
-                if state.show_replace then
-                    local row1 = (i - 1) * 2
-                    local row2 = row1 + 1
-                    local prefix1 = string.format(" 🟥 %4d: ", match_item.lnum)
-                    pcall(vim.api.nvim_buf_add_highlight, state.results_buf, state.ns_id, "DiagnosticError", row1,
-                        #prefix1 + match_item.col, #prefix1 + match_item.end_col)
-
-                    local prefix2 = string.format(" 🟩 %4d: ", match_item.lnum)
-                    pcall(vim.api.nvim_buf_add_highlight, state.results_buf, state.ns_id, "DiagnosticOk", row2,
-                        #prefix2 + match_item.col, #prefix2 + match_item.col + #replacement)
-                else
-                    local prefix_len = #string.format("  %4d: ", match_item.lnum)
-                    pcall(vim.api.nvim_buf_add_highlight, state.results_buf, state.ns_id, "IncSearch",
-                        i - 1, prefix_len + match_item.col, prefix_len + match_item.end_col)
-                end
-            end
-
-            -- Apply CursorLine only to the selected match
-            if state.show_replace then
-                local row1 = (state.selected_index - 1) * 2
-                local row2 = row1 + 1
-                pcall(vim.api.nvim_buf_add_highlight, state.results_buf, state.ns_id, "CursorLine", row1, 0, -1)
-                pcall(vim.api.nvim_buf_add_highlight, state.results_buf, state.ns_id, "CursorLine", row2, 0, -1)
-            else
-                pcall(vim.api.nvim_buf_add_highlight, state.results_buf, state.ns_id, "CursorLine",
-                    state.selected_index - 1, 0, -1)
-            end
-        end
+    end
+    -- CursorLine 只给选中的匹配（替换模式两行）
+    for r = sel_row, sel_row + per - 1 do
+        hl(buf, state.ns_id, "CursorLine", r, 0, -1)
     end
 end
 
@@ -110,143 +91,86 @@ function M.render_results(state)
     local buf = state.results_buf
     if not vim.api.nvim_buf_is_valid(buf) then return end
 
-    vim.api.nvim_set_option_value("modifiable", true, { buf = buf })
-
     local lines = {}
-    if #state.matches == 0 then
-        table.insert(lines, "  0 results found.")
-    else
-        local replacement = ""
-        if state.show_replace and vim.api.nvim_buf_is_valid(state.input_buf) then
-            local in_lines = vim.api.nvim_buf_get_lines(state.input_buf, 0, -1, false)
-            replacement = in_lines[2] or ""
-        end
-
-        for _, match in ipairs(state.matches) do
-            if state.show_replace then
-                local prefix1 = string.format(" 🟥 %4d: ", match.lnum)
-                table.insert(lines, prefix1 .. match.text)
-
-                local new_text = string.sub(match.text, 1, match.col) ..
-                    replacement .. string.sub(match.text, match.end_col + 1)
-                local prefix2 = string.format(" 🟩 %4d: ", match.lnum)
-                table.insert(lines, prefix2 .. new_text)
-            else
-                local prefix = string.format("  %4d: ", match.lnum)
-                table.insert(lines, prefix .. match.text)
-            end
+    local rep = replacement(state)
+    for _, m in ipairs(state.matches) do
+        if state.show_replace then
+            table.insert(lines, row_prefix("old", m.lnum) .. m.text)
+            table.insert(lines, row_prefix("new", m.lnum) .. m.text:sub(1, m.col) .. rep .. m.text:sub(m.end_col + 1))
+        else
+            table.insert(lines, row_prefix(nil, m.lnum) .. m.text)
         end
     end
+    util.set_lines(buf, #lines > 0 and lines or { "  0 results found." })
 
-    vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
-    if state.show_replace and #state.matches > 0 then
-        for i, match in ipairs(state.matches) do
-            local row1 = (i - 1) * 2
-            local row2 = row1 + 1
-            local prefix1 = string.format(" 🟥 %4d: ", match.lnum)
-            pcall(vim.api.nvim_buf_add_highlight, buf, state.ns_id, "DiagnosticError", row1, #prefix1, -1)
-            local prefix2 = string.format(" 🟩 %4d: ", match.lnum)
-            pcall(vim.api.nvim_buf_add_highlight, buf, state.ns_id, "DiagnosticOk", row2, #prefix2, -1)
-        end
-    end
-    vim.api.nvim_set_option_value("modifiable", false, { buf = buf })
-
-    local h = state.show_replace and 10 or 5
     if vim.api.nvim_win_is_valid(state.results_win) then
-        vim.api.nvim_win_set_config(state.results_win, { height = h })
+        vim.api.nvim_win_set_config(state.results_win, { height = state.show_replace and 10 or 5 })
     end
 
     if #state.matches > 0 then
         M.jump_to_match(state)
     else
-        pcall(vim.api.nvim_buf_clear_namespace, buf, state.ns_id, 0, -1)
-        if vim.api.nvim_buf_is_valid(state.source_buf) then
-            pcall(vim.api.nvim_buf_clear_namespace, state.source_buf, state.ns_id, 0, -1)
-        end
+        clear(buf, state.ns_id)
+        clear(state.source_buf, state.ns_id)
     end
 end
 
 function M.render_input(state)
     if not state.active then return end
-    pcall(vim.api.nvim_buf_clear_namespace, state.input_buf, state.ns_id, 0, -1)
+    clear(state.input_buf, state.ns_id)
 
     local lines = vim.api.nvim_buf_get_lines(state.input_buf, 0, -1, false)
-    local find_text = lines[1] or ""
-    if find_text == "" then
-        pcall(vim.api.nvim_buf_set_extmark, state.input_buf, state.ns_id, 0, 0, {
-            virt_text = { { "Find:", "Comment" } },
-            virt_text_pos = "overlay",
-            hl_mode = "combine"
-        })
-    end
-
-    if state.show_replace then
-        local replace_text = lines[2] or ""
-        if replace_text == "" then
-            pcall(vim.api.nvim_buf_set_extmark, state.input_buf, state.ns_id, 1, 0, {
-                virt_text = { { "Replace:", "Comment" } },
+    local placeholders = { "Find:", state.show_replace and "Replace:" or nil }
+    for i, text in pairs(placeholders) do
+        if (lines[i] or "") == "" then
+            pcall(vim.api.nvim_buf_set_extmark, state.input_buf, state.ns_id, i - 1, 0, {
+                virt_text = { { text, "Comment" } },
                 virt_text_pos = "overlay",
-                hl_mode = "combine"
+                hl_mode = "combine",
             })
         end
     end
 
     if vim.api.nvim_win_is_valid(state.input_win) then
-        local cs_box = state.case_sensitive and "[x]" or "[ ]"
-        local ww_box = state.whole_word and "[x]" or "[ ]"
-        local footer = string.format("  %sAa  %sword  ", cs_box, ww_box)
-        pcall(vim.api.nvim_win_set_config, state.input_win, { footer = footer, footer_pos = "right" })
+        pcall(vim.api.nvim_win_set_config, state.input_win,
+            { footer = float.toggle_footer(state.case_sensitive, state.whole_word), footer_pos = "right" })
     end
 end
+
+--- 替换模式下输入框上移成两行、结果区变高
+local LAYOUT = {
+    [false] = { input_dr = 0, input_h = 1, results_dr = 3, results_h = 5,
+        footer = " C-r:Replace | C-c:Case | C-w:Word " },
+    [true] = { input_dr = -6, input_h = 2, results_dr = -2, results_h = 10,
+        footer = " r:Replace | C-r:Replace | C-c:Case | C-w:Word " },
+}
 
 function M.toggle_replace(state)
     if not state.active then return end
     state.show_replace = not state.show_replace
+    local l = LAYOUT[state.show_replace]
 
+    if vim.api.nvim_win_is_valid(state.input_win) then
+        vim.api.nvim_win_set_config(state.input_win,
+            { relative = "editor", row = state.base_row + l.input_dr, col = state.base_col, height = l.input_h })
+    end
+    if vim.api.nvim_win_is_valid(state.results_win) then
+        vim.api.nvim_win_set_config(state.results_win, {
+            relative = "editor",
+            row = state.base_row + l.results_dr,
+            col = state.base_col,
+            height = l.results_h,
+            footer = l.footer,
+            footer_pos = "left",
+        })
+    end
+    local count = vim.api.nvim_buf_line_count(state.input_buf)
     if state.show_replace then
-        if vim.api.nvim_win_is_valid(state.input_win) then
-            vim.api.nvim_win_set_config(state.input_win,
-                { relative = "editor", row = state.base_row - 6, col = state.base_col, height = 2 })
-        end
-        if vim.api.nvim_win_is_valid(state.results_win) then
-            vim.api.nvim_win_set_config(state.results_win,
-                {
-                    relative = "editor",
-                    row = state.base_row - 2,
-                    col = state.base_col,
-                    height = 10,
-                    footer =
-                    " r:Replace | C-r:Replace | C-c:Case | C-w:Word ",
-                    footer_pos = "left"
-                })
-        end
-        local lines = vim.api.nvim_buf_get_lines(state.input_buf, 0, -1, false)
-        if #lines < 2 then
-            vim.api.nvim_buf_set_lines(state.input_buf, 1, 1, false, { "" })
-        end
+        if count < 2 then vim.api.nvim_buf_set_lines(state.input_buf, 1, 1, false, { "" }) end
         pcall(vim.api.nvim_win_set_cursor, state.input_win, { 2, 0 })
     else
-        if vim.api.nvim_win_is_valid(state.input_win) then
-            vim.api.nvim_win_set_config(state.input_win,
-                { relative = "editor", row = state.base_row, col = state.base_col, height = 1 })
-            pcall(vim.api.nvim_win_set_cursor, state.input_win, { 1, 0 })
-            local lines = vim.api.nvim_buf_get_lines(state.input_buf, 0, -1, false)
-            if #lines > 1 then
-                vim.api.nvim_buf_set_lines(state.input_buf, 1, -1, false, {})
-            end
-        end
-        if vim.api.nvim_win_is_valid(state.results_win) then
-            vim.api.nvim_win_set_config(state.results_win,
-                {
-                    relative = "editor",
-                    row = state.base_row + 3,
-                    col = state.base_col,
-                    height = 5,
-                    footer =
-                    " C-r:Replace | C-c:Case | C-w:Word ",
-                    footer_pos = "left"
-                })
-        end
+        pcall(vim.api.nvim_win_set_cursor, state.input_win, { 1, 0 })
+        if count > 1 then vim.api.nvim_buf_set_lines(state.input_buf, 1, -1, false, {}) end
     end
 
     M.render_input(state)
@@ -254,71 +178,56 @@ function M.toggle_replace(state)
 end
 
 function M.create_ui(state)
-    local ui_conf = vim.api.nvim_list_uis()[1] or { width = 80, height = 24 }
-    local w = 50
-    local r = ui_conf.height - 10
-    local c = ui_conf.width - w - 2 -- bottom right
+    local ew, eh = util.editor_size()
+    local r, c = eh - 10, ew - WIDTH - 2 -- 右下角
+    state.base_row, state.base_col = r, c
 
-    state.base_row = r
-    state.base_col = c
-
-    local input_buf = vim.api.nvim_create_buf(false, true)
-    local input_win = vim.api.nvim_open_win(input_buf, true, {
+    state.input_buf = vim.api.nvim_create_buf(false, true)
+    state.input_win = vim.api.nvim_open_win(state.input_buf, true, {
         relative = "editor",
         row = r,
         col = c,
-        width = w,
+        width = WIDTH,
         height = 1,
         style = "minimal",
         border = { "╭", "─", "╮", "│", "┤", "─", "├", "│" },
         title = " 󰍉 Mini Search ",
         title_pos = "center",
-        footer = "  [ ]Aa  [ ]word  ",
-        footer_pos = "right"
+        footer = float.toggle_footer(false, false),
+        footer_pos = "right",
     })
 
-    local results_buf = vim.api.nvim_create_buf(false, true)
-    local results_win = vim.api.nvim_open_win(results_buf, false, {
+    state.results_buf = vim.api.nvim_create_buf(false, true)
+    state.results_win = vim.api.nvim_open_win(state.results_buf, false, {
         relative = "editor",
         row = r + 3,
         col = c,
-        width = w,
+        width = WIDTH,
         height = 5,
         style = "minimal",
         border = { "", "", "", "│", "╯", "─", "╰", "│" },
-        footer = " C-r:Replace | C-c:Case | C-w:Word ",
-        footer_pos = "left"
+        footer = LAYOUT[false].footer,
+        footer_pos = "left",
     })
-
-    state.input_buf = input_buf
-    state.input_win = input_win
-    state.results_buf = results_buf
-    state.results_win = results_win
 
     -- 任一浮窗被关（:q / <C-w>o 等）→ 两个一起关并清理 timer / 高亮
     ui_seq = ui_seq + 1
     state.augroup = vim.api.nvim_create_augroup("ZeroSearchMiniUI_" .. ui_seq, { clear = true })
-    for _, win in ipairs({ input_win, results_win }) do
+    for _, win in ipairs({ state.input_win, state.results_win }) do
         vim.api.nvim_create_autocmd("WinClosed", {
             group = state.augroup,
             pattern = tostring(win),
             once = true,
-            callback = function()
-                vim.schedule(function() M.close_ui(state) end)
-            end,
+            callback = function() vim.schedule(function() M.close_ui(state) end) end,
         })
     end
 
-    pcall(vim.api.nvim_set_option_value, "winhl", "NormalFloat:TelescopePromptNormal,FloatBorder:TelescopePromptBorder",
-        { win = input_win })
-    pcall(vim.api.nvim_set_option_value, "wrap", false, { win = input_win })
-
-    pcall(vim.api.nvim_set_option_value, "winhl", "NormalFloat:TelescopeResultsNormal,FloatBorder:TelescopeResultsBorder",
-        { win = results_win })
-    pcall(vim.api.nvim_set_option_value, "wrap", false, { win = results_win })
-    vim.api.nvim_set_option_value("cursorline", false, { win = results_win })
-
-    vim.api.nvim_buf_set_lines(input_buf, 0, -1, false, { "" })
+    vim.wo[state.input_win].winhl = "NormalFloat:TelescopePromptNormal,FloatBorder:TelescopePromptBorder"
+    vim.wo[state.input_win].wrap = false
+    vim.wo[state.results_win].winhl = "NormalFloat:TelescopeResultsNormal,FloatBorder:TelescopeResultsBorder"
+    vim.wo[state.results_win].wrap = false
+    vim.wo[state.results_win].cursorline = false
+    vim.bo[state.results_buf].modifiable = false
 end
 
 return M

@@ -7,7 +7,10 @@
 --   3. 根据 owner_buf / owner_win 的 BufWipeout / WinClosed 触发自动 cancel
 --   4. parser:feed / feed_err / finalize 调用，把字节流翻译成 events
 --
--- 这里不暴露用户 API，用户调用 cmd/init.lua 的 sync / sync_full / stream
+-- 这里不暴露用户 API，用户调用 cmd/init.lua 的 sync / stream
+
+local daemon = require("zero-nvim.daemon")
+local log = require("zero-nvim.log")
 
 local M = {}
 
@@ -24,7 +27,7 @@ end
 --- daemon 的 nvim_exec_lua 调用失败。错误异步 notify（可能处在 textlock 里）。
 local function report(label, err)
     vim.schedule(function()
-        vim.notify(("[zero-nvim/cmd] %s error: %s"):format(label, tostring(err)), vim.log.levels.ERROR)
+        log.error(("cmd %s error: %s"):format(label, tostring(err)))
     end)
 end
 
@@ -128,8 +131,7 @@ function M.cancel(sid)
     local s = M._sessions[sid]
     if not s or s.cancelled then return end
     s.cancelled = true
-    local ok_req, zero = pcall(require, "zero-nvim")
-    local chan = ok_req and zero._get_daemon_chan and zero._get_daemon_chan() or nil
+    local chan = daemon.channel()
     local sent = false
     if chan then
         sent = pcall(vim.fn.rpcnotify, chan, "cmd_cancel", sid)
@@ -184,7 +186,7 @@ function M._dispatch(sid, kind, payload)
     end
 end
 
---- daemon 进程死亡时由 init.lua 调用：所有在飞 session 走 aborted 收尾
+--- daemon 进程死亡时由 daemon.lua 调用：所有在飞 session 走 aborted 收尾
 --- （finalize + on_exit(-1, nil, reason, 0)），然后清空注册表。可重复调用。
 ---@param reason string?
 function M.abort_all(reason)

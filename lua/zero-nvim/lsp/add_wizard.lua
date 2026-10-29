@@ -1,5 +1,5 @@
 -- =============================================================================
--- ui/lsp_add_wizard.lua — :ZeroLspAdd interactive wizard
+-- lsp/add_wizard.lua — :ZeroLspAdd interactive wizard
 -- =============================================================================
 -- Three-step state machine:
 --   1. Pick server  (mason bins ⊕ Manual entry, [*] tags existing entries)
@@ -11,11 +11,13 @@
 
 local M = {}
 
-local utils         = require("zero-nvim.ui.utils")
-local zero          = require("zero-nvim")
+local float         = require("zero-nvim.ui.float")
+local util          = require("zero-nvim.util")
+local log           = require("zero-nvim.log")
 local manager       = require("zero-nvim.project.manager")
-local presets       = require("zero-nvim.lsp_servers")
-local project_ui    = require("zero-nvim.project.ui")
+local store         = require("zero-nvim.project.store")
+local presets       = require("zero-nvim.lsp.presets")
+local lsp           = require("zero-nvim.lsp")
 
 -- ---------------------------------------------------------------------------
 -- Save + prewarm
@@ -25,13 +27,10 @@ local function save_and_prewarm(ctx, server_name, server_cfg)
     if not manager.upsert_lsp(ctx.project_name, server_name, server_cfg) then
         return
     end
-    vim.notify(string.format("ZeroNvim: Added LSP %s to project %s",
-        server_name, ctx.project_name), vim.log.levels.INFO)
+    log.info(string.format("added LSP %s to project %s", server_name, ctx.project_name))
     vim.schedule(function()
         local fresh = manager.get(ctx.project_name)
-        if fresh then
-            require("zero-nvim.lsp").prewarm_lsps(ctx.user, ctx.host, ctx.port, fresh)
-        end
+        if fresh then lsp.prewarm_lsps(ctx.user, ctx.host, ctx.port, fresh) end
     end)
 end
 
@@ -41,11 +40,10 @@ end
 
 local function step3_preview(ctx, server_name, server_cfg)
     local payload = { [server_name] = server_cfg }
-    local pretty = project_ui.format_json(payload)
-    local lines = vim.split(pretty, "\n")
+    local lines = vim.split(store.format_json(payload) or "{}", "\n")
 
     local height = math.min(math.max(#lines + 2, 8), 25)
-    local buf, win = utils.create_float({
+    local buf, win = float.create({
         title = "Preview LSP entry: " .. ctx.project_name,
         footer = "<CR>:Save | <C-e>:Edit | <Esc>:Cancel",
         width = 80,
@@ -57,7 +55,7 @@ local function step3_preview(ctx, server_name, server_cfg)
     vim.api.nvim_set_option_value("modifiable", false, { buf = buf })
     vim.api.nvim_set_option_value("buftype", "nofile", { buf = buf })
 
-    local function close() utils.close_float(win, buf) end
+    local function close() float.close(win, buf) end
 
     vim.keymap.set("n", "<CR>", function()
         close()
@@ -67,10 +65,10 @@ local function step3_preview(ctx, server_name, server_cfg)
     vim.keymap.set("n", "<C-e>", function()
         close()
         -- Edit the same { [server] = cfg } shape; on save extract the entry.
-        project_ui.edit_json(ctx.project_name .. "-" .. server_name, payload, function(new_payload)
+        float.edit_json(ctx.project_name .. "-" .. server_name, payload, function(new_payload)
             local new_cfg = new_payload[server_name]
             if type(new_cfg) ~= "table" then
-                vim.notify("ZeroNvim: edited JSON missing key '" .. server_name .. "'", vim.log.levels.ERROR)
+                log.error("edited JSON missing key '" .. server_name .. "'")
                 return
             end
             save_and_prewarm(ctx, server_name, new_cfg)
@@ -112,20 +110,16 @@ local function step2_resolve(ctx, server_name)
     end
 
     -- Preset miss + no existing entry: ask for filetypes.
-    project_ui.prompt_float({
-        title = "Filetypes for " .. server_name .. " (comma-separated)",
-        default = "",
-    }, function(input)
+    float.prompt({ title = "Filetypes for " .. server_name .. " (comma-separated)" }, function(input)
         local fts = {}
-        for ft in (input or ""):gmatch("[^,%s]+") do
+        for ft in input:gmatch("[^,%s]+") do
             table.insert(fts, ft)
         end
         if #fts == 0 then
-            vim.notify("ZeroNvim: cancelled (no filetypes)", vim.log.levels.WARN)
+            log.warn("cancelled (no filetypes)")
             return
         end
-        local cfg = { filetypes = fts, cmd = { server_name, "--stdio" } }
-        step3_preview(ctx, server_name, cfg)
+        step3_preview(ctx, server_name, { filetypes = fts, cmd = lsp.server_cmd(server_name) })
     end)
 end
 
@@ -137,7 +131,7 @@ local SENTINEL_MANUAL = "__manual__"
 
 local function step1_pick(ctx)
     local function build_rows()
-        local bins = zero.get_mason_bins(ctx.user, ctx.host, ctx.port)
+        local bins = lsp.mason_bins(ctx.user, ctx.host, ctx.port)
         table.sort(bins)
         local rows = {}
         local existing_set = {}
@@ -159,7 +153,7 @@ local function step1_pick(ctx)
     local lines = vim.tbl_map(function(r) return r.label end, rows)
 
     local height = math.min(math.max(#lines, 8), 20)
-    local buf, win = utils.create_float({
+    local buf, win = float.create({
         title = "Add LSP to " .. ctx.project_name,
         footer = "<CR>:Select | r:Refresh bins | <Esc>:Cancel",
         width = 60,
@@ -169,7 +163,7 @@ local function step1_pick(ctx)
     vim.api.nvim_set_option_value("modifiable", false, { buf = buf })
     vim.api.nvim_set_option_value("buftype", "nofile", { buf = buf })
 
-    local function close() utils.close_float(win, buf) end
+    local function close() float.close(win, buf) end
 
     local function selected_row()
         local idx = vim.api.nvim_win_get_cursor(win)[1]
@@ -183,8 +177,7 @@ local function step1_pick(ctx)
             step2_resolve(ctx, row.name)
         elseif row.kind == "manual" then
             close()
-            project_ui.prompt_float({ title = "LSP binary name" }, function(name)
-                if not name or name == "" then return end
+            float.prompt({ title = "LSP binary name" }, function(name)
                 step2_resolve(ctx, name)
             end)
         end
@@ -194,15 +187,11 @@ local function step1_pick(ctx)
 
     vim.keymap.set("n", "r", function()
         -- Force a re-scan; scan_mason_bins is sync (RPC request + readdir).
-        zero.scan_mason_bins(ctx.user, ctx.host, ctx.port)
+        lsp.scan_mason_bins(ctx.user, ctx.host, ctx.port)
         rows = build_rows()
-        lines = vim.tbl_map(function(r) return r.label end, rows)
-        vim.api.nvim_set_option_value("modifiable", true, { buf = buf })
-        vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
-        vim.api.nvim_set_option_value("modifiable", false, { buf = buf })
-        local has_bins = rows[1] and rows[1].kind == "bin"
-        if not has_bins then
-            vim.notify("ZeroNvim: no mason bins found, manual entry only", vim.log.levels.WARN)
+        util.set_lines(buf, vim.tbl_map(function(r) return r.label end, rows))
+        if rows[1].kind ~= "bin" then
+            log.warn("no mason bins found, manual entry only")
         end
     end, { buffer = buf, silent = true })
 
@@ -226,7 +215,7 @@ end
 ---            project_config:table, prefill_server?:string }
 function M.open(ctx)
     if not ctx or not ctx.project_name or not ctx.project_config then
-        vim.notify("ZeroNvim: wizard called without project context", vim.log.levels.ERROR)
+        log.error("wizard called without project context")
         return
     end
     if ctx.prefill_server and ctx.prefill_server ~= "" then

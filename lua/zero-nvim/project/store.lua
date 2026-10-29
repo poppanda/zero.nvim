@@ -1,3 +1,5 @@
+local log = require("zero-nvim.log")
+
 local M = {}
 
 ---@class ZeroProjectConfig
@@ -40,10 +42,7 @@ local function ensure_dir(path)
     end
 end
 
-local function is_list(t)
-    if vim.islist then return vim.islist(t) end
-    return vim.tbl_islist(t)
-end
+local is_list = vim.islist or vim.tbl_islist
 
 --- Pure-Lua JSON pretty printer (2-space indent, sorted object keys).
 --- Scalars / string escaping go through vim.json.encode, so the output is
@@ -76,8 +75,7 @@ local function pretty(v, indent)
 end
 
 --- Format a value as pretty-printed JSON.
---- Returns nil if the input cannot be encoded. Callers that want a
---- placeholder on failure should fall back themselves (see project/ui.lua).
+--- Returns nil if the input cannot be encoded (callers fall back to "{}").
 ---@param obj any
 ---@return string?
 function M.format_json(obj)
@@ -118,7 +116,7 @@ function M.load()
 
     local ok, data = pcall(vim.json.decode, content)
     if not ok then
-        vim.notify("zero-nvim: Failed to decode projects.json", vim.log.levels.ERROR)
+        log.error("failed to decode projects.json")
         return {}
     end
 
@@ -135,7 +133,7 @@ end
 function M.save(data)
     local content = M.format_json(data)
     if not content then
-        vim.notify("zero-nvim: Failed to encode projects data", vim.log.levels.ERROR)
+        log.error("failed to encode projects data")
         return false
     end
 
@@ -144,21 +142,21 @@ function M.save(data)
     local tmp = string.format("%s.%d.tmp", path, uv.os_getpid and uv.os_getpid() or 0)
     local file = io.open(tmp, "w")
     if not file then
-        vim.notify("zero-nvim: Failed to open projects.json for writing", vim.log.levels.ERROR)
+        log.error("failed to open projects.json for writing")
         return false
     end
     local ok_write = file:write(content)
     file:close()
     if not ok_write then
         os.remove(tmp)
-        vim.notify("zero-nvim: Failed to write projects.json", vim.log.levels.ERROR)
+        log.error("failed to write projects.json")
         return false
     end
 
     local ok_rename, rename_err = os.rename(tmp, path)
     if not ok_rename then
         os.remove(tmp)
-        vim.notify("zero-nvim: Failed to replace projects.json: " .. tostring(rename_err), vim.log.levels.ERROR)
+        log.error("failed to replace projects.json: " .. tostring(rename_err))
         return false
     end
 

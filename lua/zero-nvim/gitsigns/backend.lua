@@ -8,60 +8,13 @@
 -- 不会污染普通本地文件——pattern 限定 ^zero://，gitsigns 默认 local backend
 -- 处理其他 buffer。
 
+local cmd = require("zero-nvim.cmd")
+
 local M = {}
 
--- 常见远端二进制安装位置；ssh 非交互 shell 默认 PATH 经常缺这些。
--- $PATH 在远端 sh -c 里才展开。
-local REMOTE_PATH_PREFIX =
-    "/usr/local/bin:/opt/homebrew/bin:$HOME/.cargo/bin:/home/linuxbrew/.linuxbrew/bin"
-
---- 把 argv 包成 sh -c 'PATH=... exec "$@"' --，让远端 git 能找到。
----@param argv string[]
----@return string[]
-local function wrap_with_path(argv)
-    local wrapped = {
-        "sh",
-        "-c",
-        ('PATH="%s:$PATH" exec "$@"'):format(REMOTE_PATH_PREFIX),
-        "--",
-    }
-    for _, a in ipairs(argv) do
-        wrapped[#wrapped + 1] = a
-    end
-    return wrapped
-end
-
---- gitsigns 用 lua dict 形式传 env（{LC_ALL='C', ...}）；daemon 期望 [[k,v], ...]。
----@param env table?
----@return string[][]?
-local function env_to_pairs(env)
-    if not env then return nil end
-    local pairs_list = {}
-    for k, v in pairs(env) do
-        pairs_list[#pairs_list + 1] = { tostring(k), tostring(v) }
-    end
-    if #pairs_list == 0 then return nil end
-    return pairs_list
-end
-
---- 远程后端 id：包含 user/host/port，确保不同主机的同名 gitdir 不会撞 Repo 缓存。
----@param target table { user, host, port }
----@return string
-function M.id_for(target)
-    return ("zero://%s@%s:%d"):format(target.user, target.host, target.port or 22)
-end
-
----@param bufpath string
----@return table?  ctx
-function M.detect(bufpath)
-    local user, host, port, path = require("zero-nvim.uri").parse(bufpath)
-    if not user then return nil end
-    return {
-        target = { user = user, host = host, port = port },
-        path = path,
-        id = M.id_for({ user = user, host = host, port = port }),
-    }
-end
+--- ctx = { target, path, id }；id 含 user/host/port，确保不同主机的同名
+--- gitdir 不会撞 Repo 缓存。
+M.detect = require("zero-nvim.uri").backend_ctx
 
 ---@param ctx table
 ---@param _bufpath string  -- original buffer name (unused; ctx already holds the parsed path)
@@ -81,11 +34,11 @@ end
 --- gitsigns blame --incremental 用 buffered_line_reader（coroutine yield）等数据
 --- 的契约——少了那个 nil 收尾，coroutine 永远阻塞，blame 不会出结果。
 --- 用了流式回调的通道，对应 SystemCompleted.stdout/stderr 留空（与 vim.system 语义一致）。
----@param cmd string[]
+---@param argv string[]
 ---@param opts table
 ---@param ctx table
 ---@param gitsigns_on_exit fun(obj: table)
-function M.system(cmd, opts, ctx, gitsigns_on_exit)
+function M.system(argv, opts, ctx, gitsigns_on_exit)
     -- gitsigns 的 stage_hunks 用 string[] patch；daemon stdin 是 bytes。
     -- vim.system 对 string[] 的语义是 *每* 行都补一个 '\n'（含末尾），等价于
     -- table.concat(arr, "\n") .. "\n"。漏掉这个末尾 '\n'，git apply 会报
@@ -100,10 +53,10 @@ function M.system(cmd, opts, ctx, gitsigns_on_exit)
 
     local stdout_chunks, stderr_chunks = {}, {}
 
-    local _, err = require("zero-nvim.cmd").stream(ctx.target, {
-        argv = wrap_with_path(cmd),
+    local _, err = cmd.stream(ctx.target, {
+        argv = cmd.with_remote_path(argv),
         cwd = opts.cwd,
-        env = env_to_pairs(opts.env),
+        env = cmd.env_pairs(opts.env),
         stdin = stdin,
         timeout_ms = opts.timeout and (opts.timeout * 1000) or nil,
     }, {
