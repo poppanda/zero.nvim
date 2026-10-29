@@ -20,8 +20,9 @@
 // 注意：vim.uri_from_bufnr 对已带 scheme 的 buffer name（如 zero://...）原样返回，
 // 不会加 file:// 前缀，因此 client_prefix 不含 "file://" 前缀。
 
-use crate::cmd::spec::shell_quote;
-use crate::state::{DaemonState, LockExt};
+use crate::rpc::map;
+use crate::session::{get_conn, shell_quote};
+use crate::state::{LockExt, SharedState, Target};
 use anyhow::Context;
 use rmpv::Value;
 use std::io::{Read, Write};
@@ -35,8 +36,35 @@ use std::time::{Duration, Instant};
 /// Neovim 拿到端口后应在这段时间内连上来；超时则关掉 listener，避免线程泄漏
 const ACCEPT_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// 远端 LSP 侧的 URI 前缀（不带结尾 `/`）
+const FILE_PREFIX: &str = "file://";
+
+/// 让通过 Mason 安装的工具无需 login shell 也能被找到
+const MASON_PATH: &str = "PATH=$HOME/.local/share/nvim/mason/bin:$PATH";
+
+/// cmd 参数：argv 数组；兼容旧版 Lua 客户端发来的单个 shell 字符串
+pub fn parse_argv(value: &Value) -> anyhow::Result<Vec<String>> {
+    if let Some(cmd) = value.as_str() {
+        return Ok(vec!["sh".into(), "-c".into(), cmd.into()]);
+    }
+    let argv = value
+        .as_array()
+        .ok_or(anyhow::anyhow!("cmd must be string or string[]"))?
+        .iter()
+        .map(|v| {
+            v.as_str()
+                .map(str::to_string)
+                .ok_or(anyhow::anyhow!("cmd argv item must be string"))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    if argv.is_empty() {
+        return Err(anyhow::anyhow!("cmd argv is empty"));
+    }
+    Ok(argv)
+}
+
 /// 校验交给系统 ssh 的 user / host，防止参数注入（如 host = "-oProxyCommand=..."）。
-fn validate_ssh_target(user: &str, host: &str) -> Result<(), anyhow::Error> {
+fn validate_ssh_target(user: &str, host: &str) -> anyhow::Result<()> {
     fn bad(s: &str) -> bool {
         s.starts_with('-') || s.chars().any(|c| c.is_whitespace() || c.is_control())
     }
@@ -57,7 +85,10 @@ fn control_dir() -> Option<PathBuf> {
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
     let dir = match std::env::var_os("XDG_RUNTIME_DIR").filter(|v| !v.is_empty()) {
         Some(rt) => PathBuf::from(rt).join("zero-nvim"),
-        None => dirs::home_dir()?.join(".cache").join("zero-nvim").join("ssh"),
+        None => dirs::home_dir()?
+            .join(".cache")
+            .join("zero-nvim")
+            .join("ssh"),
     };
     // "cm-" + %C（40 位十六进制）+ ssh 临时后缀（约 17 字节）
     if dir.as_os_str().len() + 1 + 3 + 40 + 17 > 104 {
@@ -104,19 +135,17 @@ fn base_ssh_args(port: u16) -> Vec<String> {
 
 /// 完整的 ssh 参数：公共参数 + `--` + user@host + 远端命令
 fn ssh_command_args(
-    user: &str,
-    host: &str,
-    port: u16,
+    t: &Target,
     extra_opts: &[&str],
     remote_cmd: &str,
-) -> Result<Vec<String>, anyhow::Error> {
-    validate_ssh_target(user, host)?;
-    let mut args = base_ssh_args(port);
+) -> anyhow::Result<Vec<String>> {
+    validate_ssh_target(&t.user, &t.host)?;
+    let mut args = base_ssh_args(t.port);
     args.extend(extra_opts.iter().map(|s| s.to_string()));
-    let dest = if user.is_empty() {
-        host.to_string()
+    let dest = if t.user.is_empty() {
+        t.host.clone()
     } else {
-        format!("{}@{}", user, host)
+        format!("{}@{}", t.user, t.host)
     };
     // `--` 之后的参数不会再被当作选项解析
     args.push("--".into());
@@ -125,32 +154,20 @@ fn ssh_command_args(
     Ok(args)
 }
 
-pub fn handle_start_lsp(
-    user: &str,
-    host: &str,
-    port: u16,
-    cmd_argv: Vec<String>,
+/// 起本地 TCP 代理，返回端口；Neovim 连上后才 spawn ssh 子进程。
+///
+/// 只要求共享会话存在（NOT_CONNECTED 让 Lua 侧先走 connect），实际流量走系统 ssh。
+pub fn start(
+    t: &Target,
+    argv: Vec<String>,
     client_prefix: &str,
-    state: &Arc<Mutex<DaemonState>>,
-) -> Result<Value, anyhow::Error> {
-    let key = DaemonState::connection_key(user, host, port);
+    state: &SharedState,
+) -> anyhow::Result<Value> {
+    get_conn(state, t)?;
+    let client_prefix = client_prefix.trim_end_matches('/').to_string();
 
-    // Verify the connection exists in state
-    {
-        let state_lock = state.lock_ok();
-        if !state_lock.sessions.contains_key(&key) {
-            return Err(anyhow::anyhow!("NOT_CONNECTED: {}", key));
-        }
-    }
-
-    let file_prefix = "file://".to_string();
-    let client_prefix_s = client_prefix.trim_end_matches('/').to_string();
-
-    let login_cmd = build_lsp_login_command(&cmd_argv)?;
     let ssh_args = ssh_command_args(
-        user,
-        host,
-        port,
+        t,
         // SSH-layer keepalive：每 30s 发一个心跳；连续 3 次（90s）无应答
         // 才判死。两个作用：(1) 让 NAT/防火墙的 idle flow timeout 永远归
         // 零，避免 idle-disconnect；(2) 真正掉线时 90s 内 ssh 子进程退出，
@@ -162,11 +179,9 @@ pub fn handle_start_lsp(
             "-o",
             "ServerAliveCountMax=3",
         ],
-        &login_cmd,
+        &build_lsp_login_command(&argv)?,
     )?;
-    let cmd_display = cmd_argv.join(" ");
 
-    // Bind a random ephemeral port locally
     let listener = TcpListener::bind("127.0.0.1:0").context("Failed to bind random TCP port")?;
     let local_port = listener.local_addr()?.port();
     listener
@@ -174,12 +189,10 @@ pub fn handle_start_lsp(
         .context("Failed to set listener non-blocking")?;
 
     debug_log!(
-        "Daemon: LSP proxy :{} → {}@{}:{} ({})",
+        "Daemon: LSP proxy :{} → {} ({})",
         local_port,
-        user,
-        host,
-        port,
-        cmd_display
+        t,
+        argv.join(" ")
     );
 
     thread::spawn(move || {
@@ -194,7 +207,7 @@ pub fn handle_start_lsp(
             }
         };
         drop(listener);
-        if let Err(e) = run_lsp_proxy(tcp_stream, &ssh_args, client_prefix_s, file_prefix) {
+        if let Err(e) = run_lsp_proxy(tcp_stream, &ssh_args, &client_prefix) {
             eprintln!("Daemon: LSP proxy :{} 失败: {:#}", local_port, e);
         }
     });
@@ -233,17 +246,13 @@ fn accept_with_timeout(listener: &TcpListener, timeout: Duration) -> Option<TcpS
 fn run_lsp_proxy(
     tcp_stream: TcpStream,
     ssh_args: &[String],
-    client_prefix: String,
-    file_prefix: String,
-) -> Result<(), anyhow::Error> {
-    // Spawn ssh as a child process. It reuses ~/.ssh/config + SSH Agent.
-    // Prepend mason/bin to PATH so tools installed via Mason are found
-    // without needing a login shell or modifying ~/.profile.
+    client_prefix: &str,
+) -> anyhow::Result<()> {
     let mut child = Command::new("ssh")
         .args(ssh_args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped()) // Pipe stderr to prevent blocking if parent doesn't read fast enough
+        .stderr(Stdio::piped())
         .spawn()
         .context("Failed to spawn ssh for LSP")?;
 
@@ -252,40 +261,39 @@ fn run_lsp_proxy(
     let child_stderr = child.stderr.take().context("child stderr")?;
     let child = Arc::new(Mutex::new(child));
 
-    // Thread 0: Consume SSH stderr to prevent blocking
-    // We also log it to daemon stderr so Neovim can see it
+    // 持续消费 ssh stderr（防止管道写满阻塞子进程），转发到 daemon stderr 让 Neovim 看到
     thread::spawn(move || {
         use std::io::{BufRead, BufReader};
-        let reader = BufReader::new(child_stderr);
-        for l in reader.lines().map_while(Result::ok) {
+        for l in BufReader::new(child_stderr).lines().map_while(Result::ok) {
             eprintln!("[SSH-ERR] {}", l);
         }
     });
 
-    let tcp_writer = tcp_stream.try_clone().context("Failed to clone TCP stream")?;
-    let tcp_ctl_a = tcp_stream.try_clone().context("Failed to clone TCP stream")?;
-    let tcp_ctl_b = tcp_stream.try_clone().context("Failed to clone TCP stream")?;
+    let tcp_writer = tcp_stream
+        .try_clone()
+        .context("Failed to clone TCP stream")?;
+    let tcp_ctl_a = tcp_stream
+        .try_clone()
+        .context("Failed to clone TCP stream")?;
+    let tcp_ctl_b = tcp_stream
+        .try_clone()
+        .context("Failed to clone TCP stream")?;
 
-    // Thread 1: TCP (Neovim) → SSH stdin
-    // Translate: zero://user@host:port/ → file:///
-    let from1 = client_prefix.clone();
-    let to1 = file_prefix.clone();
+    // TCP (Neovim) → ssh stdin：zero://user@host:port/ → file:///
+    let from = client_prefix.to_string();
     let child_a = child.clone();
     thread::spawn(move || {
-        let mut r = tcp_stream;
-        let mut w = child_stdin;
-        let _ = pump_and_translate(&mut r, &mut w, &from1, &to1, "TCP->SSH");
+        let (mut r, mut w) = (tcp_stream, child_stdin);
+        let _ = pump_and_translate(&mut r, &mut w, &from, FILE_PREFIX, "TCP->SSH");
         // Neovim 断开：关 ssh stdin（远端 LSP 读到 EOF），关 TCP，宽限后杀 ssh
         drop(w);
         let _ = tcp_ctl_a.shutdown(Shutdown::Both);
         reap_child(&child_a, Duration::from_secs(2));
     });
 
-    // Thread 2 (当前线程): SSH stdout → TCP (Neovim)
-    // Translate: file:/// → zero://user@host:port/
-    let mut r = child_stdout;
-    let mut w = tcp_writer;
-    let _ = pump_and_translate(&mut r, &mut w, &file_prefix, &client_prefix, "SSH->TCP");
+    // 当前线程：ssh stdout → TCP (Neovim)：file:/// → zero://user@host:port/
+    let (mut r, mut w) = (child_stdout, tcp_writer);
+    let _ = pump_and_translate(&mut r, &mut w, FILE_PREFIX, client_prefix, "SSH->TCP");
     // 远端 LSP / ssh 退出：shutdown 让 Neovim 立刻看到 EOF，并让 Thread 1 的 read 返回
     let _ = tcp_ctl_b.shutdown(Shutdown::Both);
     if let Some(status) = reap_child(&child, Duration::from_secs(5)) {
@@ -317,88 +325,66 @@ fn reap_child(child: &Mutex<Child>, grace: Duration) -> Option<std::process::Exi
     }
 }
 
-pub fn handle_probe_lsp(
-    user: &str,
-    host: &str,
-    port: u16,
-    cmd_argv: Vec<String>,
-    state: &Arc<Mutex<DaemonState>>,
-) -> Result<Value, anyhow::Error> {
-    let key = DaemonState::connection_key(user, host, port);
-    {
-        let state_lock = state.lock_ok();
-        if !state_lock.sessions.contains_key(&key) {
-            return Err(anyhow::anyhow!("NOT_CONNECTED: {}", key));
-        }
-    }
-
-    let probe_cmd = build_lsp_probe_command(&cmd_argv)?;
-    let ssh_args = ssh_command_args(user, host, port, &["-o", "ConnectTimeout=5"], &probe_cmd)?;
-    let output = Command::new("ssh").args(&ssh_args).output();
-
-    match output {
-        Ok(out) if out.status.success() => Ok(lsp_probe_result(true, "")),
+/// 检查远端能否找到 LSP 可执行文件。返回 { ok, message }。
+///
+/// 故意走系统 ssh（与 lsp_start 同一条路径：BatchMode + ControlMaster），而不是
+/// 共享会话：探针要验证的正是 LSP 启动时用的那套认证能否工作。
+pub fn probe(t: &Target, argv: Vec<String>, state: &SharedState) -> anyhow::Result<Value> {
+    get_conn(state, t)?;
+    let ssh_args = ssh_command_args(
+        t,
+        &["-o", "ConnectTimeout=5"],
+        &build_lsp_probe_command(&argv)?,
+    )?;
+    let (ok, message) = match Command::new("ssh").args(&ssh_args).output() {
+        Ok(out) if out.status.success() => (true, String::new()),
         Ok(out) => {
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            let msg = if !stderr.trim().is_empty() {
-                stderr.trim().to_string()
-            } else if !stdout.trim().is_empty() {
-                stdout.trim().to_string()
+            let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            let msg = if !stderr.is_empty() {
+                stderr
+            } else if !stdout.is_empty() {
+                stdout
             } else {
                 format!("ssh exited with status {}", out.status)
             };
-            Ok(lsp_probe_result(false, &msg))
+            (false, msg)
         }
-        Err(e) => Ok(lsp_probe_result(
-            false,
-            &format!("failed to spawn ssh: {}", e),
-        )),
-    }
+        Err(e) => (false, format!("failed to spawn ssh: {}", e)),
+    };
+    Ok(map([
+        ("ok", Value::from(ok)),
+        ("message", Value::from(message)),
+    ]))
 }
 
-fn lsp_probe_result(ok: bool, message: &str) -> Value {
-    Value::Map(vec![
-        (Value::String("ok".into()), Value::Boolean(ok)),
-        (
-            Value::String("message".into()),
-            Value::String(message.into()),
-        ),
-    ])
-}
-
-fn build_lsp_login_command(argv: &[String]) -> Result<String, anyhow::Error> {
+fn build_lsp_login_command(argv: &[String]) -> anyhow::Result<String> {
     if argv.is_empty() {
         return Err(anyhow::anyhow!("LSP command argv is empty"));
     }
-    let argv_quoted = argv
-        .iter()
-        .map(|arg| shell_quote(arg))
-        .collect::<Vec<_>>()
-        .join(" ");
-    Ok(format!(
-        "PATH=$HOME/.local/share/nvim/mason/bin:$PATH exec {}",
-        argv_quoted
-    ))
+    let quoted: Vec<String> = argv.iter().map(|a| shell_quote(a)).collect();
+    Ok(format!("{} exec {}", MASON_PATH, quoted.join(" ")))
 }
 
-fn build_lsp_probe_command(argv: &[String]) -> Result<String, anyhow::Error> {
+fn build_lsp_probe_command(argv: &[String]) -> anyhow::Result<String> {
     let bin = argv
         .first()
         .ok_or_else(|| anyhow::anyhow!("LSP command argv is empty"))?;
     Ok(format!(
-        "PATH=$HOME/.local/share/nvim/mason/bin:$PATH command -v -- {} >/dev/null 2>&1",
+        "{} command -v -- {} >/dev/null 2>&1",
+        MASON_PATH,
         shell_quote(bin)
     ))
 }
 
+/// 逐条转发 LSP 消息（Content-Length 帧），转发前改写 body 里的 URI 前缀
 fn pump_and_translate<R: Read, W: Write>(
     reader: &mut R,
     writer: &mut W,
     from: &str,
     to: &str,
     label: &str,
-) -> Result<(), anyhow::Error> {
+) -> anyhow::Result<()> {
     loop {
         let mut headers = String::new();
         let mut content_length: Option<usize> = None;
@@ -558,12 +544,24 @@ mod tests {
 
     #[test]
     fn ssh_args_put_double_dash_before_destination() {
-        let args = ssh_command_args("u", "h", 2200, &[], "cmd").unwrap();
+        let args = ssh_command_args(&Target::new("u", "h", 2200), &[], "cmd").unwrap();
         let n = args.len();
         assert_eq!(&args[n - 3..], &["--", "u@h", "cmd"]);
         assert!(args.contains(&"StrictHostKeyChecking=accept-new".to_string()));
         assert!(!args.iter().any(|a| a.contains("StrictHostKeyChecking=no")));
         assert!(!args.iter().any(|a| a.contains("ControlPath=/tmp/")));
+    }
+
+    #[test]
+    fn parse_argv_accepts_array_or_legacy_string() {
+        let arr = Value::Array(vec![Value::from("pyright"), Value::from("--stdio")]);
+        assert_eq!(parse_argv(&arr).unwrap(), vec!["pyright", "--stdio"]);
+        assert_eq!(
+            parse_argv(&Value::from("a b")).unwrap(),
+            vec!["sh", "-c", "a b"]
+        );
+        assert!(parse_argv(&Value::Array(vec![])).is_err());
+        assert!(parse_argv(&Value::Array(vec![Value::from(1)])).is_err());
     }
 
     #[test]

@@ -10,16 +10,16 @@
 //
 // stdout / stderr 是分开两个缓冲，flush 时分别发出 CommandEvent::Stdout / Stderr。
 //
-// 下游（dispatch.rs sink）把每个 chunk 解码成 UTF-8 字符串发给 Lua，所以阈值
+// 下游（stream.rs）把每个 chunk 解码成 UTF-8 字符串发给 Lua，所以阈值
 // flush 时不能把一个多字节字符切成两半：末尾不完整的 UTF-8 序列留在缓冲里，
 // 跟下一批一起发。只有 flush_all（EOF / cancel）才把残留原样冲出去。
 
-use crate::cmd::CommandEvent;
+use super::stream::CommandEvent;
 use std::time::{Duration, Instant};
 
-pub const TIME_THRESHOLD: Duration = Duration::from_millis(80);
-pub const BYTE_THRESHOLD: usize = 16 * 1024;
-pub const LINE_THRESHOLD: usize = 200;
+const TIME_THRESHOLD: Duration = Duration::from_millis(80);
+const BYTE_THRESHOLD: usize = 16 * 1024;
+const LINE_THRESHOLD: usize = 200;
 
 pub struct Batcher {
     stdout_buf: Vec<u8>,
@@ -31,28 +31,12 @@ pub struct Batcher {
     line_threshold: usize,
 }
 
-impl Default for Batcher {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl Batcher {
     pub fn new() -> Self {
-        Self {
-            stdout_buf: Vec::with_capacity(BYTE_THRESHOLD),
-            stderr_buf: Vec::with_capacity(4 * 1024),
-            stdout_lines: 0,
-            last_flush: Instant::now(),
-            time_threshold: TIME_THRESHOLD,
-            byte_threshold: BYTE_THRESHOLD,
-            line_threshold: LINE_THRESHOLD,
-        }
+        Self::with_thresholds(TIME_THRESHOLD, BYTE_THRESHOLD, LINE_THRESHOLD)
     }
 
-    /// 主要给测试用——允许覆盖阈值
-    #[cfg(test)]
-    pub fn with_thresholds(time: Duration, bytes: usize, lines: usize) -> Self {
+    fn with_thresholds(time: Duration, bytes: usize, lines: usize) -> Self {
         Self {
             stdout_buf: Vec::new(),
             stderr_buf: Vec::new(),
@@ -65,17 +49,11 @@ impl Batcher {
     }
 
     pub fn feed_stdout(&mut self, data: &[u8]) {
-        if data.is_empty() {
-            return;
-        }
         self.stdout_lines += data.iter().filter(|&&b| b == b'\n').count();
         self.stdout_buf.extend_from_slice(data);
     }
 
     pub fn feed_stderr(&mut self, data: &[u8]) {
-        if data.is_empty() {
-            return;
-        }
         self.stderr_buf.extend_from_slice(data);
     }
 
@@ -88,7 +66,7 @@ impl Batcher {
         let lines_due = self.stdout_lines >= self.line_threshold;
 
         if time_due || bytes_due || lines_due {
-            self.flush_all_with_now(now)
+            self.flush_with(now, true)
         } else {
             Vec::new()
         }
@@ -97,10 +75,6 @@ impl Batcher {
     /// 强制 flush 所有缓冲（用于 EOF / cancel）
     pub fn flush_all(&mut self) -> Vec<CommandEvent> {
         self.flush_with(Instant::now(), false)
-    }
-
-    fn flush_all_with_now(&mut self, now: Instant) -> Vec<CommandEvent> {
-        self.flush_with(now, true)
     }
 
     fn flush_with(&mut self, now: Instant, keep_partial_utf8: bool) -> Vec<CommandEvent> {
@@ -137,7 +111,7 @@ fn take_chunk(buf: &mut Vec<u8>, keep_partial_utf8: bool) -> Option<Vec<u8>> {
 /// 返回 buf 末尾"尚未完整"的 UTF-8 多字节序列的字节数（0..=3）。
 /// 只检查最后 3 个字节：若找到一个前导字节且其声明的长度超出剩余字节，则这些
 /// 字节需要等下一批数据补齐。非法字节（不可能补齐的）返回 0，交给 lossy 解码。
-pub fn incomplete_utf8_tail(buf: &[u8]) -> usize {
+fn incomplete_utf8_tail(buf: &[u8]) -> usize {
     let len = buf.len();
     for i in 1..=len.min(3) {
         let b = buf[len - i];

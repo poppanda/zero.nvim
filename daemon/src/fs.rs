@@ -1,23 +1,21 @@
 // =============================================================================
 // fs.rs — 远程文件系统操作
 // =============================================================================
-// 包含所有 SFTP 相关的 RPC 方法:
-//   - fetch_file:    读取远程文件
-//   - write_file:    写入远程文件
-//   - read_dir:      读取目录（带缓存）
-//   - stat:          查询路径类型
-//   - scan_project:  递归预扫描目录树
-//
-// 所有 handler 通过 DaemonState::with_conn 走，自动应对会话断开后的重连。
+// 所有 handler 通过 session::with_conn 走共享会话，自动应对会话断开后的重连。
+// 读文件走 exec 通道（一次往返合并 stat + 读取），其余走 SFTP。
 
-use crate::cmd::spec::shell_quote;
-use crate::state::{ConnSession, DaemonState, DirEntry, LockExt, ProjectCache};
+use crate::rpc::map;
+use crate::session::{self, exec_shared, shell_quote, with_conn, ConnSession};
+use crate::state::{DirCache, DirEntry, LockExt, SharedState, Target};
 use rmpv::Value;
-use ssh2::{FileStat, OpenFlags, OpenType, RenameFlags};
+use ssh2::{FileStat, OpenFlags, OpenType, RenameFlags, Sftp};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+
+/// 远程文件读取上限（10 MiB）。超过该大小的文件直接拒绝，避免 RPC 通道被一次
+/// 性塞入海量数据导致 Neovim UI 长时间卡死。需要查看大文件请走 ripgrep / less。
+const MAX_FETCH_SIZE: u64 = 10 * 1024 * 1024;
 
 /// 文件内容 → msgpack 值：合法 UTF-8 发 String，否则发 Binary（原样字节）。
 /// 不做 lossy 转换——U+FFFD 替换会在写回时永久破坏数据。
@@ -28,135 +26,91 @@ fn bytes_to_value(bytes: Vec<u8>) -> Value {
     }
 }
 
-// =============================================================================
-// fetch_path — 合并 stat 和 fetch，通过 Exec 通道直接获取，显著降低延迟
-// =============================================================================
+fn too_big(size: impl std::fmt::Display, path: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "文件过大无法打开 ({} 字节，上限 {} 字节): {}",
+        size,
+        MAX_FETCH_SIZE,
+        path
+    )
+}
 
-/// 远程文件读取上限（10 MiB）。超过该大小的文件直接拒绝，避免 RPC 通道被一次
-/// 性塞入海量数据导致 Neovim UI 长时间卡死。需要查看大文件请走 ripgrep / less。
-const MAX_FETCH_SIZE: u64 = 10 * 1024 * 1024;
+/// 在共享会话的 SFTP 通道上执行操作
+fn with_sftp<T>(
+    state: &SharedState,
+    t: &Target,
+    mut f: impl FnMut(&Sftp) -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    with_conn(state, t, |conn| f(conn.sftp()?))
+}
 
-pub fn handle_fetch_path(
-    user: &str,
-    host: &str,
-    port: u16,
-    path: &str,
-    state: &Arc<Mutex<DaemonState>>,
-) -> Result<Value, anyhow::Error> {
-    DaemonState::with_conn(state, user, host, port, |conn| {
-        let mut channel = conn
-            .session
-            .channel_session()
-            .map_err(|e| anyhow::anyhow!("无法开启 SSH 通道: {}", e))?;
-
-        let escaped_path = format!("'{}'", path.replace('\'', "'\\''"));
-        // 远端先 stat 大小：超出阈值直接返回 TOOBIG，不执行 cat，避免无谓传输。
-        let script = format!(
-            "if [ -d {0} ]; then printf 'DIR'; elif [ -f {0} ]; then size=$(wc -c < {0} 2>/dev/null | tr -d ' '); if [ \"${{size:-0}}\" -gt {1} ]; then printf 'TOOBIG:%s' \"$size\"; else printf 'FILE'; cat {0}; fi; else printf 'MISSING'; fi",
-            escaped_path, MAX_FETCH_SIZE
-        );
-
-        channel
-            .exec(&script)
-            .map_err(|e| anyhow::anyhow!("远程执行失败: {}", e))?;
-
-        let mut out = Vec::new();
-        channel
-            .read_to_end(&mut out)
-            .map_err(|e| anyhow::anyhow!("读取数据失败: {}", e))?;
-
-        let mut err = String::new();
-        channel.stderr().read_to_string(&mut err).ok();
-        channel.wait_close().ok();
-
-        if out.starts_with(b"DIR") {
-            Ok(Value::Array(vec![
-                Value::String("directory".into()),
-                Value::Nil,
-            ]))
-        } else if out.starts_with(b"FILE") {
-            // 非 UTF-8 内容（Latin-1 / GBK / 二进制）以 Binary 原样返回，不做 lossy 转换
-            let content = out.split_off(4);
-            Ok(Value::Array(vec![
-                Value::String("file".into()),
-                bytes_to_value(content),
-            ]))
-        } else if out.starts_with(b"TOOBIG:") {
-            let size_str = String::from_utf8_lossy(&out[b"TOOBIG:".len()..])
-                .trim()
-                .to_string();
-            Err(anyhow::anyhow!(
-                "文件过大无法打开 ({} 字节，上限 {} 字节): {}",
-                size_str,
-                MAX_FETCH_SIZE,
-                path
-            ))
-        } else if out.starts_with(b"MISSING") {
-            Err(anyhow::anyhow!("路径不存在: {}", path))
-        } else {
-            let out_str = String::from_utf8_lossy(&out);
-            Err(anyhow::anyhow!("未知结果: {} | stderr: {}", out_str, err))
-        }
-    })
+/// 对某连接的目录缓存执行操作
+fn with_cache(state: &SharedState, t: &Target, f: impl FnOnce(&mut DirCache)) {
+    f(state.lock_ok().caches.entry(t.key()).or_default());
 }
 
 // =============================================================================
-// fetch_paths — 批量获取多个文件内容，极大地降低 LSP 跳转等场景的网络 RTT 延迟
+// fetch_path — 合并 stat 和读取，一次 exec 往返
 // =============================================================================
+// 返回 ["directory", nil] | ["file", content]
 
-pub fn handle_fetch_paths(
-    user: &str,
-    host: &str,
-    port: u16,
-    paths: Vec<String>,
-    state: &Arc<Mutex<DaemonState>>,
-) -> Result<Value, anyhow::Error> {
+pub fn fetch_path(t: &Target, path: &str, state: &SharedState) -> anyhow::Result<Value> {
+    let q = shell_quote(path);
+    // 远端先 stat 大小：超出阈值直接返回 TOOBIG，不执行 cat，避免无谓传输。
+    let script = format!(
+        "if [ -d {0} ]; then printf 'DIR'; elif [ -f {0} ]; then size=$(wc -c < {0} 2>/dev/null | tr -d ' '); if [ \"${{size:-0}}\" -gt {1} ]; then printf 'TOOBIG:%s' \"$size\"; else printf 'FILE'; cat {0}; fi; else printf 'MISSING'; fi",
+        q, MAX_FETCH_SIZE
+    );
+    let mut out = exec_shared(state, t, &script, None, None)?;
+    let stdout = &mut out.stdout;
+
+    if stdout.starts_with(b"DIR") {
+        Ok(Value::Array(vec![Value::from("directory"), Value::Nil]))
+    } else if stdout.starts_with(b"FILE") {
+        // 非 UTF-8 内容（Latin-1 / GBK / 二进制）以 Binary 原样返回
+        let content = stdout.split_off(4);
+        Ok(Value::Array(vec![
+            Value::from("file"),
+            bytes_to_value(content),
+        ]))
+    } else if let Some(size) = stdout.strip_prefix(b"TOOBIG:") {
+        Err(too_big(String::from_utf8_lossy(size).trim(), path))
+    } else if stdout.starts_with(b"MISSING") {
+        // Lua 侧按 "路径不存在" 识别新文件
+        Err(anyhow::anyhow!("路径不存在: {}", path))
+    } else {
+        Err(anyhow::anyhow!(
+            "未知结果: {} | stderr: {}",
+            String::from_utf8_lossy(stdout),
+            String::from_utf8_lossy(&out.stderr)
+        ))
+    }
+}
+
+// =============================================================================
+// fetch_paths — 批量获取多个文件内容（LSP 跳转等场景降低 RTT）
+// =============================================================================
+// 返回 { path = content }，不存在的路径直接省略
+
+pub fn fetch_paths(t: &Target, paths: Vec<String>, state: &SharedState) -> anyhow::Result<Value> {
     if paths.is_empty() {
         return Ok(Value::Map(vec![]));
     }
-
-    DaemonState::with_conn(state, user, host, port, |conn| {
-        let mut channel = conn
-            .session
-            .channel_session()
-            .map_err(|e| anyhow::anyhow!("无法开启 SSH 通道: {}", e))?;
-
-        let script = build_fetch_paths_script(&paths);
-
-        channel
-            .exec(&script)
-            .map_err(|e| anyhow::anyhow!("批量远程执行失败: {}", e))?;
-
-        let mut out = Vec::new();
-        channel
-            .read_to_end(&mut out)
-            .map_err(|e| anyhow::anyhow!("读取数据失败: {}", e))?;
-        channel.wait_close().ok();
-
-        let records = parse_fetch_paths_payload(&out)?;
-        let mut result_map = Vec::new();
-        for record in records {
-            match record {
-                FetchPathRecord::File { path, content } => {
-                    result_map.push((Value::String(path.into()), bytes_to_value(content)));
-                }
-                FetchPathRecord::Missing { .. } => {}
-                FetchPathRecord::TooBig { path, size } => {
-                    return Err(anyhow::anyhow!(
-                        "文件过大无法打开 ({} 字节，上限 {} 字节): {}",
-                        size,
-                        MAX_FETCH_SIZE,
-                        path
-                    ));
-                }
+    let out = exec_shared(state, t, &build_fetch_paths_script(&paths), None, None)?;
+    let mut result = Vec::new();
+    for record in parse_fetch_paths_payload(&out.stdout)? {
+        match record {
+            FetchPathRecord::File { path, content } => {
+                result.push((Value::from(path), bytes_to_value(content)));
             }
+            FetchPathRecord::Missing { .. } => {}
+            FetchPathRecord::TooBig { path, size } => return Err(too_big(size, &path)),
         }
-
-        Ok(Value::Map(result_map))
-    })
+    }
+    Ok(Value::Map(result))
 }
 
-/// 生成批量读取脚本。
+/// 生成批量读取脚本。每条记录：`ZP\n<path_len>\n<status>\n<data_len>\n<path><data>`
 ///
 /// 长度帧必须与实际发送的字节严格一致：先 `head -c` 把文件快照到临时文件，
 /// 再对快照取大小并 cat 快照。直接 `wc -c` 原文件再 cat 原文件，中间文件
@@ -167,26 +121,25 @@ fn build_fetch_paths_script(paths: &[String]) -> String {
         "t=$(mktemp 2>/dev/null) || t=/tmp/.zero-fetch-$$; trap 'rm -f \"$t\"' EXIT; ",
     );
     for path in paths {
-        let path_q = shell_quote(path);
         script.push_str(&format!(
-            "printf 'ZP\\n{}\\n'; \
-             if [ -f {path_q} ] && head -c {limit} {path_q} > \"$t\" 2>/dev/null; then \
+            "printf 'ZP\\n{len}\\n'; \
+             if [ -f {q} ] && head -c {limit} {q} > \"$t\" 2>/dev/null; then \
                size=$(wc -c < \"$t\" | tr -d ' '); \
                if [ \"${{size:-0}}\" -gt {max} ]; then \
-                 size=$(wc -c < {path_q} 2>/dev/null | tr -d ' '); \
+                 size=$(wc -c < {q} 2>/dev/null | tr -d ' '); \
                  printf 'TOOBIG\\n%s\\n' \"${{size:-0}}\"; \
-                 printf %s {path_q}; \
+                 printf %s {q}; \
                else \
                  printf 'OK\\n%s\\n' \"${{size:-0}}\"; \
-                 printf %s {path_q}; \
+                 printf %s {q}; \
                  cat \"$t\"; \
                fi; \
              else \
                printf 'MISSING\\n0\\n'; \
-               printf %s {path_q}; \
+               printf %s {q}; \
              fi; ",
-            path.len(),
-            path_q = path_q,
+            len = path.len(),
+            q = shell_quote(path),
             max = MAX_FETCH_SIZE,
             limit = MAX_FETCH_SIZE + 1
         ));
@@ -201,127 +154,91 @@ enum FetchPathRecord {
     TooBig { path: String, size: u64 },
 }
 
-fn parse_fetch_paths_payload(out: &[u8]) -> Result<Vec<FetchPathRecord>, anyhow::Error> {
+fn parse_fetch_paths_payload(out: &[u8]) -> anyhow::Result<Vec<FetchPathRecord>> {
+    let err = |msg: String| anyhow::anyhow!("批量读取协议错误: {}", msg);
+    let parse_len = |s: &str, label: &str| {
+        s.parse::<usize>()
+            .map_err(|_| err(format!("invalid {}", label)))
+    };
     let mut pos = 0;
     let mut records = Vec::new();
     while pos < out.len() {
-        let magic = read_payload_line(out, &mut pos)?;
-        if magic != b"ZP" {
-            return Err(anyhow::anyhow!(
-                "批量读取协议错误: expected ZP marker, got {:?}",
-                String::from_utf8_lossy(magic)
-            ));
+        let magic = read_line(out, &mut pos)?;
+        if magic != "ZP" {
+            return Err(err(format!("expected ZP marker, got {:?}", magic)));
         }
+        let path_len = parse_len(read_line(out, &mut pos)?, "path length")?;
+        let status = read_line(out, &mut pos)?;
+        let data_len = parse_len(read_line(out, &mut pos)?, "data length")?;
 
-        let path_len = parse_usize_line(read_payload_line(out, &mut pos)?, "path length")?;
-        let status = std::str::from_utf8(read_payload_line(out, &mut pos)?)
-            .map_err(|_| anyhow::anyhow!("批量读取协议错误: status 非 UTF-8"))?;
-        let data_len = parse_usize_line(read_payload_line(out, &mut pos)?, "data length")?;
+        let path =
+            take(out, &mut pos, path_len).ok_or_else(|| err("path length out of bounds".into()))?;
+        let path = String::from_utf8(path.to_vec()).map_err(|_| err("path 非 UTF-8".into()))?;
 
-        if pos + path_len > out.len() {
-            return Err(anyhow::anyhow!(
-                "批量读取协议错误: path length out of bounds"
-            ));
-        }
-        let path = std::str::from_utf8(&out[pos..pos + path_len])
-            .map_err(|_| anyhow::anyhow!("批量读取协议错误: path 非 UTF-8"))?
-            .to_string();
-        pos += path_len;
-
-        match status {
+        records.push(match status {
             "OK" => {
-                if pos + data_len > out.len() {
-                    return Err(anyhow::anyhow!(
-                        "批量读取协议错误: content length out of bounds for {}",
-                        path
-                    ));
+                let content = take(out, &mut pos, data_len)
+                    .ok_or_else(|| err(format!("content length out of bounds for {}", path)))?;
+                FetchPathRecord::File {
+                    path,
+                    content: content.to_vec(),
                 }
-                let content = out[pos..pos + data_len].to_vec();
-                pos += data_len;
-                records.push(FetchPathRecord::File { path, content });
             }
-            "MISSING" => records.push(FetchPathRecord::Missing { path }),
-            "TOOBIG" => records.push(FetchPathRecord::TooBig {
+            "MISSING" => FetchPathRecord::Missing { path },
+            "TOOBIG" => FetchPathRecord::TooBig {
                 path,
                 size: data_len as u64,
-            }),
-            other => {
-                return Err(anyhow::anyhow!(
-                    "批量读取协议错误: unknown status {}",
-                    other
-                ));
-            }
-        }
+            },
+            other => return Err(err(format!("unknown status {}", other))),
+        });
     }
     Ok(records)
 }
 
-fn read_payload_line<'a>(out: &'a [u8], pos: &mut usize) -> Result<&'a [u8], anyhow::Error> {
-    let start = *pos;
-    let rel_end = out[start..]
+/// 读到下一个换行（不含换行本身）
+fn read_line<'a>(out: &'a [u8], pos: &mut usize) -> anyhow::Result<&'a str> {
+    let rest = &out[*pos..];
+    let nl = rest
         .iter()
         .position(|b| *b == b'\n')
         .ok_or(anyhow::anyhow!("批量读取协议错误: missing newline"))?;
-    let end = start + rel_end;
-    *pos = end + 1;
-    Ok(&out[start..end])
+    *pos += nl + 1;
+    std::str::from_utf8(&rest[..nl])
+        .map_err(|_| anyhow::anyhow!("批量读取协议错误: header 非 UTF-8"))
 }
 
-fn parse_usize_line(line: &[u8], label: &str) -> Result<usize, anyhow::Error> {
-    let s = std::str::from_utf8(line)
-        .map_err(|_| anyhow::anyhow!("批量读取协议错误: {} 非 UTF-8", label))?;
-    s.parse::<usize>()
-        .map_err(|_| anyhow::anyhow!("批量读取协议错误: invalid {}", label))
+/// 从 pos 起取 len 字节；越界返回 None
+fn take<'a>(out: &'a [u8], pos: &mut usize, len: usize) -> Option<&'a [u8]> {
+    let bytes = out.get(*pos..pos.checked_add(len)?)?;
+    *pos += len;
+    Some(bytes)
 }
 
 // =============================================================================
-// fetch_file — SFTP 读取远程文件 (保留做备用或特定场景)
+// SFTP 读写
 // =============================================================================
 
-pub fn handle_fetch_file(
-    user: &str,
-    host: &str,
-    port: u16,
-    path: &str,
-    state: &Arc<Mutex<DaemonState>>,
-) -> Result<Value, anyhow::Error> {
-    DaemonState::with_conn(state, user, host, port, |conn| {
-        let sftp = conn
-            .sftp()
-            .map_err(|e| anyhow::anyhow!("SFTP 初始化失败: {}", e))?;
-        let mut remote_file = sftp
+pub fn fetch_file(t: &Target, path: &str, state: &SharedState) -> anyhow::Result<Value> {
+    with_sftp(state, t, |sftp| {
+        let mut file = sftp
             .open(Path::new(path))
             .map_err(|e| anyhow::anyhow!("无法打开远程文件 {}: {}", path, e))?;
         let mut content = Vec::new();
-        remote_file
-            .read_to_end(&mut content)
+        file.read_to_end(&mut content)
             .map_err(|e| anyhow::anyhow!("读取失败 {}: {}", path, e))?;
-
         Ok(bytes_to_value(content))
     })
 }
 
-// =============================================================================
-// write_file — SFTP 写入远程文件
-// =============================================================================
-
-pub fn handle_write_file(
-    user: &str,
-    host: &str,
-    port: u16,
+pub fn write_file(
+    t: &Target,
     path: &str,
     content: &[u8],
-    state: &Arc<Mutex<DaemonState>>,
-) -> Result<Value, anyhow::Error> {
-    DaemonState::with_conn(state, user, host, port, |conn| {
-        write_file_atomic(conn, path, content)
-    })?;
-
+    state: &SharedState,
+) -> anyhow::Result<Value> {
+    with_conn(state, t, |conn| write_file_atomic(conn, path, content))?;
     debug_log!("Daemon: 文件已写入 {} ({} bytes)", path, content.len());
-
-    let key = DaemonState::connection_key(user, host, port);
-    with_cache(state, &key, |c| c.invalidate_parent(Path::new(path)));
-
+    with_cache(state, t, |c| c.invalidate_parent(Path::new(path)));
     Ok(Value::Boolean(true))
 }
 
@@ -329,36 +246,29 @@ pub fn handle_write_file(
 /// 写到一半断线 / 磁盘满时，原文件保持完好，不会留下被截断的半截文件。
 ///
 /// 回退：目标是符号链接 / 非普通文件，或临时文件建不出来（目录不可写）时，
-/// 退回原来的"截断后原地写"，保证至少和以前一样能保存。
-fn write_file_atomic(conn: &mut ConnSession, path: &str, content: &[u8]) -> Result<(), anyhow::Error> {
+/// 退回"截断后原地写"，保证至少能保存。
+fn write_file_atomic(conn: &mut ConnSession, path: &str, content: &[u8]) -> anyhow::Result<()> {
     let target = Path::new(path);
-    let sftp_err = |e: ssh2::Error| anyhow::anyhow!("SFTP 初始化失败: {}", e);
+    let write_err = |e: std::io::Error| anyhow::anyhow!("写入失败 {}: {}", path, e);
+    let close_err = |e: ssh2::Error| anyhow::anyhow!("关闭文件失败 {}: {}", path, e);
 
     // lstat：不跟随符号链接——rename 覆盖链接会把链接替换成普通文件
-    let existing = match conn.sftp().map_err(sftp_err)?.lstat(target) {
+    let existing = match conn.sftp()?.lstat(target) {
         Ok(st) => Some(st),
-        Err(e) if is_not_found(&e) => None,
+        // LIBSSH2_FX_NO_SUCH_FILE = 2, LIBSSH2_FX_NO_SUCH_PATH = 10
+        Err(e) if matches!(e.code(), ssh2::ErrorCode::SFTP(2 | 10)) => None,
         Err(e) => return Err(anyhow::anyhow!("stat 失败 {}: {}", path, e)),
     };
-    let is_regular = existing.as_ref().is_none_or(|st| st.is_file());
-    if !is_regular {
-        return write_file_in_place(conn, path, content);
+    if existing.as_ref().is_some_and(|st| !st.is_file()) {
+        return write_file_in_place(conn.sftp()?, path, content);
     }
     // perm 里含文件类型位，只保留权限位
-    let mode = existing
-        .as_ref()
-        .and_then(|st| st.perm)
-        .map(|p| (p & 0o7777) as i32)
-        .unwrap_or(0o644);
+    let perm = existing.and_then(|st| st.perm).map(|p| p & 0o7777);
 
     let tmp = tmp_path_for(target);
-    let sftp = conn.sftp().map_err(sftp_err)?;
-    let mut file = match sftp.open_mode(
-        &tmp,
-        OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::EXCLUSIVE | OpenFlags::TRUNCATE,
-        mode,
-        OpenType::File,
-    ) {
+    let sftp = conn.sftp()?;
+    let flags = OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::EXCLUSIVE | OpenFlags::TRUNCATE;
+    let mut file = match sftp.open_mode(&tmp, flags, perm.unwrap_or(0o644) as i32, OpenType::File) {
         Ok(f) => f,
         Err(e) => {
             debug_log!(
@@ -366,31 +276,27 @@ fn write_file_atomic(conn: &mut ConnSession, path: &str, content: &[u8]) -> Resu
                 tmp.display(),
                 e
             );
-            return write_file_in_place(conn, path, content);
+            return write_file_in_place(sftp, path, content);
         }
     };
-
-    let write_res = file
-        .write_all(content)
-        .map_err(|e| anyhow::anyhow!("写入失败 {}: {}", path, e))
-        .and_then(|_| {
-            // fsync 需要服务端支持 fsync@openssh.com；不支持时忽略
-            let _ = file.fsync();
-            close_sftp_file(&mut file).map_err(|e| anyhow::anyhow!("关闭文件失败 {}: {}", path, e))
-        });
+    let written = file.write_all(content).map_err(write_err).and_then(|_| {
+        // fsync 需要服务端支持 fsync@openssh.com；不支持时忽略
+        let _ = file.fsync();
+        close_sftp_file(&mut file).map_err(close_err)
+    });
     drop(file);
-    if let Err(e) = write_res {
+    if let Err(e) = written {
         let _ = sftp.unlink(&tmp);
         return Err(e);
     }
 
     // 保留原文件权限（open_mode 的 mode 会被远端 umask 削减）
-    if let Some(perm) = existing.as_ref().and_then(|st| st.perm) {
+    if let Some(perm) = perm {
         let st = FileStat {
             size: None,
             uid: None,
             gid: None,
-            perm: Some(perm & 0o7777),
+            perm: Some(perm),
             atime: None,
             mtime: None,
         };
@@ -401,421 +307,233 @@ fn write_file_atomic(conn: &mut ConnSession, path: &str, content: &[u8]) -> Resu
 
     // rename 覆盖：SFTP v3（OpenSSH）不支持 overwrite flag，目标存在时会失败；
     // 依次回退到远端 `mv -f`（同目录 rename(2)，原子）、再到 unlink + rename。
-    let renamed = sftp
-        .rename(
-            &tmp,
-            target,
-            Some(RenameFlags::OVERWRITE | RenameFlags::ATOMIC | RenameFlags::NATIVE),
-        )
-        .is_ok();
-    let renamed = renamed || {
-        let tmp_s = tmp.to_string_lossy().to_string();
-        let mv = format!("mv -f -- {} {}", shell_quote(&tmp_s), shell_quote(path));
-        matches!(exec_status(&conn.session, &mv), Ok(0))
+    let overwrite = RenameFlags::OVERWRITE | RenameFlags::ATOMIC | RenameFlags::NATIVE;
+    let renamed = sftp.rename(&tmp, target, Some(overwrite)).is_ok() || {
+        let mv = format!(
+            "mv -f -- {} {}",
+            shell_quote(&tmp.to_string_lossy()),
+            shell_quote(path)
+        );
+        session::exec(&conn.session, &mv, None).is_ok_and(|o| o.code == 0)
     };
     // 上面借用了 conn.session，重新拿 sftp 句柄
-    let sftp = conn.sftp().map_err(sftp_err)?;
+    let sftp = conn.sftp()?;
     let renamed = renamed || {
         let _ = sftp.unlink(target);
         sftp.rename(&tmp, target, None).is_ok()
     };
     if !renamed {
         let _ = sftp.unlink(&tmp);
-        return Err(anyhow::anyhow!("写入失败 {}: 无法将临时文件重命名为目标", path));
+        return Err(anyhow::anyhow!(
+            "写入失败 {}: 无法将临时文件重命名为目标",
+            path
+        ));
     }
     Ok(())
 }
 
-/// 旧路径：截断目标后原地写。仅在原子写不可用时使用。
-fn write_file_in_place(conn: &mut ConnSession, path: &str, content: &[u8]) -> Result<(), anyhow::Error> {
-    let sftp = conn
-        .sftp()
-        .map_err(|e| anyhow::anyhow!("SFTP 初始化失败: {}", e))?;
-    let mut remote_file = sftp
+/// 截断目标后原地写。仅在原子写不可用时使用。
+fn write_file_in_place(sftp: &Sftp, path: &str, content: &[u8]) -> anyhow::Result<()> {
+    let mut file = sftp
         .create(Path::new(path))
         .map_err(|e| anyhow::anyhow!("无法创建远程文件 {}: {}", path, e))?;
-    remote_file
-        .write_all(content)
+    file.write_all(content)
         .map_err(|e| anyhow::anyhow!("写入失败 {}: {}", path, e))?;
-    close_sftp_file(&mut remote_file)
-        .map_err(|e| anyhow::anyhow!("关闭文件失败 {}: {}", path, e))?;
-    Ok(())
+    close_sftp_file(&mut file).map_err(|e| anyhow::anyhow!("关闭文件失败 {}: {}", path, e))
 }
 
 /// 显式 close 并检查错误（Drop 时的 close 会吞掉错误）；EAGAIN 时重试
 fn close_sftp_file(file: &mut ssh2::File) -> Result<(), ssh2::Error> {
-    let mut attempts = 0;
-    loop {
+    for _ in 0..100 {
         match file.close() {
-            Err(e) if e.code() == ssh2::ErrorCode::Session(-37) && attempts < 100 => {
-                attempts += 1;
+            Err(e) if e.code() == ssh2::ErrorCode::Session(-37) => {
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
             r => return r,
         }
     }
-}
-
-fn is_not_found(e: &ssh2::Error) -> bool {
-    // LIBSSH2_FX_NO_SUCH_FILE = 2, LIBSSH2_FX_NO_SUCH_PATH = 10
-    matches!(e.code(), ssh2::ErrorCode::SFTP(2) | ssh2::ErrorCode::SFTP(10))
+    file.close()
 }
 
 /// 同目录的隐藏临时文件名：`.<name>.zero-tmp-<pid>-<nanos>`
 fn tmp_path_for(target: &Path) -> PathBuf {
     let name = target
         .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| "file".to_string());
+        .map_or_else(|| "file".into(), |n| n.to_string_lossy());
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.subsec_nanos())
-        .unwrap_or(0);
+        .map_or(0, |d| d.subsec_nanos());
     let tmp_name = format!(".{}.zero-tmp-{}-{}", name, std::process::id(), nanos);
-    match target.parent() {
-        Some(p) => p.join(tmp_name),
-        None => PathBuf::from(tmp_name),
-    }
-}
-
-/// 在会话上执行一条短命令，返回退出码（blocking 模式，wait_close 后读取）
-fn exec_status(session: &ssh2::Session, cmd: &str) -> Result<i32, anyhow::Error> {
-    let mut ch = session.channel_session()?;
-    ch.exec(cmd)?;
-    let mut sink = Vec::new();
-    let _ = ch.read_to_end(&mut sink);
-    ch.wait_close()?;
-    Ok(ch.exit_status()?)
-}
-
-/// 对某连接的目录缓存执行操作（缓存不存在时 no-op）
-fn with_cache(state: &Arc<Mutex<DaemonState>>, key: &str, f: impl FnOnce(&mut ProjectCache)) {
-    let mut state_lock = state.lock_ok();
-    if let Some(cache) = state_lock.caches.get_mut(key) {
-        f(cache);
-    }
+    target.with_file_name(tmp_name)
 }
 
 // =============================================================================
-// read_dir — SFTP 读目录（带缓存）
+// 目录
 // =============================================================================
 
-pub fn handle_read_dir(
-    user: &str,
-    host: &str,
-    port: u16,
-    path: &str,
-    state: &Arc<Mutex<DaemonState>>,
-) -> Result<Value, anyhow::Error> {
-    let key = DaemonState::connection_key(user, host, port);
-    let path_buf = PathBuf::from(path);
-
-    // 先检查缓存，命中则直接返回
-    {
-        let state_lock = state.lock_ok();
-        if let Some(cache) = state_lock.caches.get(&key) {
-            if let Some(entries) = cache.get(&path_buf) {
-                return Ok(entries_to_msgpack(entries));
-            }
-        }
-    }
-
-    let dir_entries = DaemonState::with_conn(state, user, host, port, |conn| {
-        let sftp = conn
-            .sftp()
-            .map_err(|e| anyhow::anyhow!("SFTP 初始化失败: {}", e))?;
-        let sftp_entries = sftp
-            .readdir(Path::new(path))
-            .map_err(|e| anyhow::anyhow!("读目录失败 {}: {}", path, e))?;
-
-        let mut entries = Vec::new();
-        for (p, stat) in sftp_entries {
-            let name = p
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or("")
-                .to_string();
-            if name == "." || name == ".." {
-                continue;
-            }
-            let file_type = if stat.is_dir() { "directory" } else { "file" };
-            entries.push(DirEntry {
+/// SFTP readdir → DirEntry 列表（去掉 . / ..）
+fn list_dir(sftp: &Sftp, path: &Path) -> Result<Vec<DirEntry>, ssh2::Error> {
+    Ok(sftp
+        .readdir(path)?
+        .into_iter()
+        .filter_map(|(p, stat)| {
+            let name = p.file_name()?.to_str()?.to_string();
+            (name != "." && name != "..").then(|| DirEntry {
                 name,
-                file_type: file_type.to_string(),
-            });
-        }
-        Ok(entries)
+                is_dir: stat.is_dir(),
+            })
+        })
+        .collect())
+}
+
+/// 返回 [{ name, type = "directory" | "file" }]
+fn entries_to_value(entries: &[DirEntry]) -> Value {
+    Value::Array(
+        entries
+            .iter()
+            .map(|e| {
+                map([
+                    ("name", Value::from(e.name.as_str())),
+                    ("type", Value::from(file_type(e.is_dir))),
+                ])
+            })
+            .collect(),
+    )
+}
+
+fn file_type(is_dir: bool) -> &'static str {
+    if is_dir {
+        "directory"
+    } else {
+        "file"
+    }
+}
+
+pub fn read_dir(t: &Target, path: &str, state: &SharedState) -> anyhow::Result<Value> {
+    let path_buf = PathBuf::from(path);
+    if let Some(entries) = state
+        .lock_ok()
+        .caches
+        .get(&t.key())
+        .and_then(|c| c.get(&path_buf))
+    {
+        return Ok(entries_to_value(entries));
+    }
+    let entries = with_sftp(state, t, |sftp| {
+        list_dir(sftp, &path_buf).map_err(|e| anyhow::anyhow!("读目录失败 {}: {}", path, e))
     })?;
-
-    let result = entries_to_msgpack(&dir_entries);
-
-    with_cache(state, &key, |c| c.insert(path_buf, dir_entries));
-
+    let result = entries_to_value(&entries);
+    with_cache(state, t, |c| c.insert(path_buf, entries));
     Ok(result)
 }
 
-// =============================================================================
-// stat — 查询远程路径类型 (file / directory)
-// =============================================================================
-
-pub fn handle_stat(
-    user: &str,
-    host: &str,
-    port: u16,
-    path: &str,
-    state: &Arc<Mutex<DaemonState>>,
-) -> Result<Value, anyhow::Error> {
-    DaemonState::with_conn(state, user, host, port, |conn| {
-        let sftp = conn
-            .sftp()
-            .map_err(|e| anyhow::anyhow!("SFTP 初始化失败: {}", e))?;
-        let stat = sftp
+/// 返回 "directory" | "file"
+pub fn stat(t: &Target, path: &str, state: &SharedState) -> anyhow::Result<Value> {
+    with_sftp(state, t, |sftp| {
+        let st = sftp
             .stat(Path::new(path))
             .map_err(|e| anyhow::anyhow!("stat 失败 {}: {}", path, e))?;
-        let file_type = if stat.is_dir() { "directory" } else { "file" };
-        Ok(Value::String(file_type.into()))
+        Ok(Value::from(file_type(st.is_dir())))
     })
 }
 
-// =============================================================================
-// scan_project — 递归预扫描目录树并填充缓存
-// =============================================================================
-// 使用栈实现广度优先扫描，限制最大递归深度为 3 层，
-// 跳过隐藏目录（.git, .cache 等）防止不必要的扫描。
-
-pub fn handle_scan_project(
-    user: &str,
-    host: &str,
-    port: u16,
-    root_path: &str,
-    state: &Arc<Mutex<DaemonState>>,
-) -> Result<Value, anyhow::Error> {
-    let key = DaemonState::connection_key(user, host, port);
-    let max_depth = 3;
-    let root_path = root_path.to_string();
-
-    let scanned: HashMap<PathBuf, Vec<DirEntry>> =
-        DaemonState::with_conn(state, user, host, port, |conn| {
-            let sftp = conn
-                .sftp()
-                .map_err(|e| anyhow::anyhow!("SFTP 初始化失败: {}", e))?;
-
-            let mut scanned: HashMap<PathBuf, Vec<DirEntry>> = HashMap::new();
-            let mut stack: Vec<(PathBuf, usize)> = vec![(PathBuf::from(&root_path), 0)];
-
-            while let Some((current_path, depth)) = stack.pop() {
-                if depth > max_depth {
-                    continue;
-                }
-                if scanned.contains_key(&current_path) {
-                    continue;
-                }
-
-                let sftp_entries = match sftp.readdir(&current_path) {
-                    Ok(entries) => entries,
-                    Err(_) => continue, // 权限不足等错误跳过；连接断开会在下次 sftp() 时由 with_conn 捕获
-                };
-
-                let mut dir_entries = Vec::new();
-                for (p, stat) in sftp_entries {
-                    let name = p
-                        .file_name()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("")
-                        .to_string();
-                    if name == "." || name == ".." {
-                        continue;
-                    }
-                    let is_dir = stat.is_dir();
-                    let file_type = if is_dir { "directory" } else { "file" };
-                    dir_entries.push(DirEntry {
-                        name: name.clone(),
-                        file_type: file_type.to_string(),
-                    });
-                    if is_dir && !name.starts_with('.') {
-                        stack.push((current_path.join(&name), depth + 1));
-                    }
-                }
-
-                scanned.insert(current_path, dir_entries);
+/// 预扫描目录树（最多 3 层，跳过隐藏目录）并填充缓存
+pub fn scan_project(t: &Target, root: &str, state: &SharedState) -> anyhow::Result<Value> {
+    const MAX_DEPTH: usize = 3;
+    let scanned = with_sftp(state, t, |sftp| {
+        let mut scanned: HashMap<PathBuf, Vec<DirEntry>> = HashMap::new();
+        let mut stack = vec![(PathBuf::from(root), 0)];
+        while let Some((dir, depth)) = stack.pop() {
+            if depth > MAX_DEPTH || scanned.contains_key(&dir) {
+                continue;
             }
+            // 权限不足等错误跳过；连接断开会在下次操作时由 with_conn 捕获
+            let Ok(entries) = list_dir(sftp, &dir) else {
+                continue;
+            };
+            for e in entries
+                .iter()
+                .filter(|e| e.is_dir && !e.name.starts_with('.'))
+            {
+                stack.push((dir.join(&e.name), depth + 1));
+            }
+            scanned.insert(dir, entries);
+        }
+        Ok(scanned)
+    })?;
 
-            Ok(scanned)
-        })?;
-
-    with_cache(state, &key, |cache| {
-        let count = scanned.len();
+    debug_log!("Daemon: scan_project 完成，缓存了 {} 个目录", scanned.len());
+    with_cache(state, t, |cache| {
         for (path, entries) in scanned {
             cache.insert(path, entries);
         }
-        debug_log!("Daemon: scan_project 完成，缓存了 {} 个目录", count);
     });
-
     Ok(Value::Boolean(true))
 }
 
 // =============================================================================
-// mkdir — 创建远程目录
+// 增删改
 // =============================================================================
 
-pub fn handle_mkdir(
-    user: &str,
-    host: &str,
-    port: u16,
-    path: &str,
-    state: &Arc<Mutex<DaemonState>>,
-) -> Result<Value, anyhow::Error> {
-    DaemonState::with_conn(state, user, host, port, |conn| {
-        let sftp = conn
-            .sftp()
-            .map_err(|e| anyhow::anyhow!("SFTP 初始化失败: {}", e))?;
-        sftp.mkdir(Path::new(path), 0o755)
-            .map_err(|e| anyhow::anyhow!("创建目录失败 {}: {}", path, e))?;
-        Ok(())
-    })?;
-
-    let key = DaemonState::connection_key(user, host, port);
-    with_cache(state, &key, |c| c.invalidate_tree(Path::new(path)));
-
+/// 执行一个 SFTP 修改操作，成功后按 invalidate 失效缓存
+fn sftp_mutate(
+    t: &Target,
+    state: &SharedState,
+    op: impl Fn(&Sftp) -> Result<(), ssh2::Error>,
+    describe: impl Fn(ssh2::Error) -> anyhow::Error,
+    invalidate: impl FnOnce(&mut DirCache),
+) -> anyhow::Result<Value> {
+    with_sftp(state, t, |sftp| op(sftp).map_err(&describe))?;
+    with_cache(state, t, invalidate);
     Ok(Value::Boolean(true))
 }
 
-// =============================================================================
-// remove_file — 删除远程文件
-// =============================================================================
-
-pub fn handle_remove_file(
-    user: &str,
-    host: &str,
-    port: u16,
-    path: &str,
-    state: &Arc<Mutex<DaemonState>>,
-) -> Result<Value, anyhow::Error> {
-    DaemonState::with_conn(state, user, host, port, |conn| {
-        let sftp = conn
-            .sftp()
-            .map_err(|e| anyhow::anyhow!("SFTP 初始化失败: {}", e))?;
-        sftp.unlink(Path::new(path))
-            .map_err(|e| anyhow::anyhow!("删除文件失败 {}: {}", path, e))?;
-        Ok(())
-    })?;
-
-    let key = DaemonState::connection_key(user, host, port);
-    with_cache(state, &key, |c| c.invalidate_parent(Path::new(path)));
-
-    Ok(Value::Boolean(true))
+pub fn mkdir(t: &Target, path: &str, state: &SharedState) -> anyhow::Result<Value> {
+    let p = Path::new(path);
+    sftp_mutate(
+        t,
+        state,
+        |sftp| sftp.mkdir(p, 0o755),
+        |e| anyhow::anyhow!("创建目录失败 {}: {}", path, e),
+        |c| c.invalidate_tree(p),
+    )
 }
 
-// =============================================================================
-// remove_dir — 删除远程目录
-// =============================================================================
-
-pub fn handle_remove_dir(
-    user: &str,
-    host: &str,
-    port: u16,
-    path: &str,
-    state: &Arc<Mutex<DaemonState>>,
-) -> Result<Value, anyhow::Error> {
-    DaemonState::with_conn(state, user, host, port, |conn| {
-        let sftp = conn
-            .sftp()
-            .map_err(|e| anyhow::anyhow!("SFTP 初始化失败: {}", e))?;
-        sftp.rmdir(Path::new(path))
-            .map_err(|e| anyhow::anyhow!("删除目录失败 {}: {}", path, e))?;
-        Ok(())
-    })?;
-
-    let key = DaemonState::connection_key(user, host, port);
-    with_cache(state, &key, |c| c.invalidate_tree(Path::new(path)));
-
-    Ok(Value::Boolean(true))
+pub fn remove_file(t: &Target, path: &str, state: &SharedState) -> anyhow::Result<Value> {
+    let p = Path::new(path);
+    sftp_mutate(
+        t,
+        state,
+        |sftp| sftp.unlink(p),
+        |e| anyhow::anyhow!("删除文件失败 {}: {}", path, e),
+        |c| c.invalidate_parent(p),
+    )
 }
 
-// =============================================================================
-// rename — 重命名/移动远程路径
-// =============================================================================
-
-pub fn handle_rename(
-    user: &str,
-    host: &str,
-    port: u16,
-    src: &str,
-    dst: &str,
-    state: &Arc<Mutex<DaemonState>>,
-) -> Result<Value, anyhow::Error> {
-    DaemonState::with_conn(state, user, host, port, |conn| {
-        let sftp = conn
-            .sftp()
-            .map_err(|e| anyhow::anyhow!("SFTP 初始化失败: {}", e))?;
-        sftp.rename(Path::new(src), Path::new(dst), None)
-            .map_err(|e| anyhow::anyhow!("重命名失败 {} -> {}: {}", src, dst, e))?;
-        Ok(())
-    })?;
-
-    // src 子树整体搬走；dst 若是被覆盖的目录，其旧子树缓存同样作废
-    let key = DaemonState::connection_key(user, host, port);
-    with_cache(state, &key, |c| {
-        c.invalidate_tree(Path::new(src));
-        c.invalidate_tree(Path::new(dst));
-    });
-
-    Ok(Value::Boolean(true))
+pub fn remove_dir(t: &Target, path: &str, state: &SharedState) -> anyhow::Result<Value> {
+    let p = Path::new(path);
+    sftp_mutate(
+        t,
+        state,
+        |sftp| sftp.rmdir(p),
+        |e| anyhow::anyhow!("删除目录失败 {}: {}", path, e),
+        |c| c.invalidate_tree(p),
+    )
 }
 
-// =============================================================================
-// exec_remote — 在远端执行命令并返回 stdout
-// =============================================================================
-// 用于轻量级探测，如 `which python3`。
-// 注意：复用同一个 libssh2 Session，与 SFTP 操作通过 Mutex 互斥。
-
-pub fn handle_exec_remote(
-    user: &str,
-    host: &str,
-    port: u16,
-    cmd: &str,
-    state: &Arc<Mutex<DaemonState>>,
-) -> Result<Value, anyhow::Error> {
-    DaemonState::with_conn(state, user, host, port, |conn| {
-        let mut channel = conn
-            .session
-            .channel_session()
-            .map_err(|e| anyhow::anyhow!("channel_session 失败: {}", e))?;
-        channel
-            .exec(cmd)
-            .map_err(|e| anyhow::anyhow!("exec 失败: {}", e))?;
-
-        let mut stdout = String::new();
-        channel
-            .read_to_string(&mut stdout)
-            .map_err(|e| anyhow::anyhow!("读取 stdout 失败: {}", e))?;
-        channel.wait_close().ok();
-
-        Ok(Value::String(stdout.trim().to_string().into()))
-    })
-}
-
-// =============================================================================
-// 辅助函数
-// =============================================================================
-
-/// 将 DirEntry 列表转换为 Msgpack 数组格式
-pub fn entries_to_msgpack(entries: &[DirEntry]) -> Value {
-    let mut result = Vec::new();
-    for entry in entries {
-        let map = vec![
-            (
-                Value::String("name".into()),
-                Value::String(entry.name.clone().into()),
-            ),
-            (
-                Value::String("type".into()),
-                Value::String(entry.file_type.clone().into()),
-            ),
-        ];
-        result.push(Value::Map(map));
-    }
-    Value::Array(result)
+pub fn rename(t: &Target, src: &str, dst: &str, state: &SharedState) -> anyhow::Result<Value> {
+    let (s, d) = (Path::new(src), Path::new(dst));
+    sftp_mutate(
+        t,
+        state,
+        |sftp| sftp.rename(s, d, None),
+        |e| anyhow::anyhow!("重命名失败 {} -> {}: {}", src, dst, e),
+        // src 子树整体搬走；dst 若是被覆盖的目录，其旧子树缓存同样作废
+        |c| {
+            c.invalidate_tree(s);
+            c.invalidate_tree(d);
+        },
+    )
 }
 
 #[cfg(test)]
@@ -833,23 +551,21 @@ mod tests {
     fn parse_fetch_paths_payload_preserves_marker_like_content() {
         let content = b"hello <<<Z_END>>> still content\n";
         let payload = record("/tmp/a.py", "OK", content.len(), content);
-
         let records = parse_fetch_paths_payload(&payload).expect("payload parses");
-
-        assert_eq!(records.len(), 1);
-        match &records[0] {
-            FetchPathRecord::File { path, content } => {
-                assert_eq!(path, "/tmp/a.py");
-                assert_eq!(content, b"hello <<<Z_END>>> still content\n");
-            }
-            other => panic!("unexpected record: {:?}", other),
-        }
+        assert_eq!(
+            records,
+            vec![FetchPathRecord::File {
+                path: "/tmp/a.py".into(),
+                content: content.to_vec()
+            }]
+        );
     }
 
     #[test]
     fn parse_fetch_paths_payload_keeps_non_utf8_bytes() {
         let mut payload = record("/tmp/bin", "OK", 2, &[0xff, 0xfe]);
         payload.extend(record("/tmp/gone", "MISSING", 0, b""));
+        payload.extend(record("/tmp/big", "TOOBIG", 99, b""));
 
         let records = parse_fetch_paths_payload(&payload).expect("payload parses");
 
@@ -863,8 +579,20 @@ mod tests {
                 FetchPathRecord::Missing {
                     path: "/tmp/gone".into()
                 },
+                FetchPathRecord::TooBig {
+                    path: "/tmp/big".into(),
+                    size: 99
+                },
             ]
         );
+    }
+
+    #[test]
+    fn parse_fetch_paths_payload_rejects_truncated_frames() {
+        let mut payload = record("/tmp/a", "OK", 10, b"short");
+        assert!(parse_fetch_paths_payload(&payload).is_err());
+        payload.truncate(3);
+        assert!(parse_fetch_paths_payload(&payload).is_err());
     }
 
     #[test]

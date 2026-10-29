@@ -1,39 +1,23 @@
 // =============================================================================
-// cmd/spec.rs — 远程命令 / 连接目标 描述
+// cmd/spec.rs — 远程命令描述
 // =============================================================================
 
+use crate::session::shell_quote;
+use rmpv::Value;
 use std::time::Duration;
 
-/// 远程连接目标三元组
-#[derive(Debug, Clone)]
-pub struct ConnTarget {
-    pub user: String,
-    pub host: String,
-    pub port: u16,
-}
-
-impl ConnTarget {
-    pub fn new(user: impl Into<String>, host: impl Into<String>, port: u16) -> Self {
-        Self {
-            user: user.into(),
-            host: host.into(),
-            port,
-        }
-    }
-
-    /// 与 DaemonState::connection_key 同样格式
-    pub fn key(&self) -> String {
-        format!("{}@{}:{}", self.user, self.host, self.port)
-    }
-}
-
-/// 远程命令规约
+/// 远程命令规约（来自 RPC 的 spec map）
+///
+///   argv:       string[]               (必填)
+///   env:        [[k,v], [k,v], ...]    (可选)
+///   cwd:        string                 (可选)
+///   stdin:      bytes/string           (可选，一次性写入后 send_eof)
+///   timeout_ms: integer                (可选，仅 cmd_sync)
+///   pty:        bool                   (可选，仅 cmd_stream)
 ///
 /// argv[0] 是命令名（远端 PATH 查找），argv[1..] 是参数。**不要把整条 shell 命令
 /// 拼成一个字符串塞 argv[0]**——除非确实需要 sh -c 的功能（环境变量展开、管道）。
-/// 远端实际跑的是 `sh -c 'echo $$ >&2; exec "$@"' -- argv[0] argv[1] ...`，
-/// 头一行 stderr 抓出 PID 用于 cancel 时 kill。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct RemoteCommand {
     pub argv: Vec<String>,
     pub env: Vec<(String, String)>,
@@ -44,118 +28,127 @@ pub struct RemoteCommand {
 }
 
 impl RemoteCommand {
-    pub fn new<I, S>(argv: I) -> Self
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
-    {
-        Self {
-            argv: argv.into_iter().map(|s| s.into()).collect(),
-            env: Vec::new(),
-            cwd: None,
-            stdin: None,
-            timeout: None,
-            pty: false,
+    pub fn from_value(spec: &Value) -> anyhow::Result<Self> {
+        let map = spec.as_map().ok_or(anyhow::anyhow!("spec must be a map"))?;
+        let mut cmd = Self::default();
+        for (k, v) in map {
+            match k.as_str().unwrap_or("") {
+                "argv" => {
+                    for item in v.as_array().ok_or(anyhow::anyhow!("argv must be array"))? {
+                        let s = item
+                            .as_str()
+                            .ok_or(anyhow::anyhow!("argv item must be string"))?;
+                        cmd.argv.push(s.to_string());
+                    }
+                }
+                // 格式不对的 env 项静默忽略
+                "env" => {
+                    for pair in v.as_array().into_iter().flatten() {
+                        if let Some([k, val]) = pair.as_array().map(Vec::as_slice) {
+                            if let (Some(k), Some(val)) = (k.as_str(), val.as_str()) {
+                                cmd.env.push((k.to_string(), val.to_string()));
+                            }
+                        }
+                    }
+                }
+                "cwd" => cmd.cwd = v.as_str().map(str::to_string),
+                "stdin" => {
+                    cmd.stdin = match v {
+                        Value::String(s) => Some(s.as_bytes().to_vec()),
+                        Value::Binary(b) => Some(b.clone()),
+                        _ => None,
+                    }
+                }
+                "timeout_ms" => cmd.timeout = v.as_u64().map(Duration::from_millis),
+                "pty" => cmd.pty = v.as_bool().unwrap_or(false),
+                _ => {}
+            }
         }
+        if cmd.argv.is_empty() {
+            return Err(anyhow::anyhow!("spec.argv is empty"));
+        }
+        Ok(cmd)
     }
 
-    #[cfg(test)]
-    pub fn env(mut self, k: impl Into<String>, v: impl Into<String>) -> Self {
-        self.env.push((k.into(), v.into()));
-        self
-    }
-
-    #[cfg(test)]
-    pub fn cwd(mut self, cwd: impl Into<String>) -> Self {
-        self.cwd = Some(cwd.into());
-        self
-    }
-
-    pub fn timeout_ms(mut self, ms: u64) -> Self {
-        self.timeout = Some(Duration::from_millis(ms));
-        self
-    }
-
-    /// 把 argv + env + cwd 拼成发到远端的 shell 命令字符串。
-    ///
-    /// 最终远端实际 exec 的形式：
+    /// 把 argv + env + cwd 拼成发到远端的 shell 命令字符串：
     ///
     /// ```sh
-    /// cd '<cwd>' && export 'KEY'='VAL' ... && (echo "ZERO_PID:$$" >&2; exec '<argv0>' '<argv1>' ...)
+    /// cd '<cwd>' && export 'KEY'='VAL' && sh -c 'echo "ZERO_PID:$$" >&2; exec "$@"' -- '<argv0>' ...
     /// ```
     ///
-    /// `wrap_for_pid=true` 时插入 `echo "ZERO_PID:$$"` 行，给 cancel 提取远端 PID 用；
+    /// `wrap_for_pid=true` 时经 `sh -c` 先把 PID 打到 stderr 头一行，给 cancel 用；
     /// `false` 时为纯净执行（不污染 stderr）。
     pub fn to_shell_command(&self, wrap_for_pid: bool) -> String {
-        let mut prefix = String::new();
+        let mut s = String::new();
         if let Some(cwd) = &self.cwd {
-            prefix.push_str(&format!("cd {} && ", shell_quote(cwd)));
+            s.push_str(&format!("cd {} && ", shell_quote(cwd)));
         }
         for (k, v) in &self.env {
-            prefix.push_str(&format!("export {}={} && ", shell_quote(k), shell_quote(v)));
+            s.push_str(&format!("export {}={} && ", shell_quote(k), shell_quote(v)));
         }
-
-        let argv_quoted: Vec<String> = self.argv.iter().map(|s| shell_quote(s)).collect();
-        let argv_joined = argv_quoted.join(" ");
-
         if wrap_for_pid {
-            format!(
-                "{}sh -c 'echo \"ZERO_PID:$$\" >&2; exec \"$@\"' -- {}",
-                prefix, argv_joined
-            )
-        } else {
-            format!("{}{}", prefix, argv_joined)
+            s.push_str("sh -c 'echo \"ZERO_PID:$$\" >&2; exec \"$@\"' -- ");
         }
+        let argv: Vec<String> = self.argv.iter().map(|a| shell_quote(a)).collect();
+        s.push_str(&argv.join(" "));
+        s
     }
-}
-
-/// 单引号包裹，内部 ' 转成 '\''
-pub fn shell_quote(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('\'');
-    for ch in s.chars() {
-        if ch == '\'' {
-            out.push_str("'\\''");
-        } else {
-            out.push(ch);
-        }
-    }
-    out.push('\'');
-    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn shell_quote_basic() {
-        assert_eq!(shell_quote("hello"), "'hello'");
-        assert_eq!(shell_quote("it's"), "'it'\\''s'");
-        assert_eq!(shell_quote("a b"), "'a b'");
+    fn spec(pairs: Vec<(&str, Value)>) -> Value {
+        Value::Map(
+            pairs
+                .into_iter()
+                .map(|(k, v)| (Value::from(k), v))
+                .collect(),
+        )
+    }
+
+    fn argv(items: &[&str]) -> Value {
+        Value::Array(items.iter().map(|s| Value::from(*s)).collect())
     }
 
     #[test]
     fn cmd_basic() {
-        let c = RemoteCommand::new(vec!["echo", "hi"]);
-        let s = c.to_shell_command(false);
-        assert_eq!(s, "'echo' 'hi'");
+        let c = RemoteCommand::from_value(&spec(vec![("argv", argv(&["echo", "hi"]))])).unwrap();
+        assert_eq!(c.to_shell_command(false), "'echo' 'hi'");
     }
 
     #[test]
     fn cmd_with_pid_wrap() {
-        let c = RemoteCommand::new(vec!["sleep", "5"]);
+        let c = RemoteCommand::from_value(&spec(vec![("argv", argv(&["sleep", "5"]))])).unwrap();
         let s = c.to_shell_command(true);
         assert!(s.contains("ZERO_PID:$$"));
-        assert!(s.contains("'sleep' '5'"));
+        assert!(s.ends_with("-- 'sleep' '5'"));
     }
 
     #[test]
-    fn cmd_with_env_cwd() {
-        let c = RemoteCommand::new(vec!["pwd"])
-            .cwd("/tmp")
-            .env("FOO", "bar");
-        let s = c.to_shell_command(false);
-        assert!(s.starts_with("cd '/tmp' && export 'FOO'='bar' && "));
+    fn cmd_with_env_cwd_stdin_timeout() {
+        let c = RemoteCommand::from_value(&spec(vec![
+            ("argv", argv(&["pwd"])),
+            ("cwd", Value::from("/tmp")),
+            (
+                "env",
+                Value::Array(vec![argv(&["FOO", "bar"]), argv(&["bad"])]),
+            ),
+            ("stdin", Value::Binary(vec![0xff])),
+            ("timeout_ms", Value::from(1500)),
+        ]))
+        .unwrap();
+        assert!(c
+            .to_shell_command(false)
+            .starts_with("cd '/tmp' && export 'FOO'='bar' && "));
+        assert_eq!(c.stdin.as_deref(), Some(&[0xff][..]));
+        assert_eq!(c.timeout, Some(Duration::from_millis(1500)));
+    }
+
+    #[test]
+    fn spec_requires_argv() {
+        assert!(RemoteCommand::from_value(&spec(vec![])).is_err());
+        assert!(RemoteCommand::from_value(&Value::from("x")).is_err());
     }
 }
