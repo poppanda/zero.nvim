@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Phase 2A 端到端 smoke 测试
+# gitsigns 远端端到端 smoke（需要真实 SSH 主机）
 # 用法:
-#   bash scripts/smoke_phase2a.sh <user> <host> <port> <remote_path>
+#   bash scripts/smoke_gitsigns_remote.sh <user> <host> <port> <remote_path>
 #   或通过环境变量:
 #   ZERO_TEST_USER=me ZERO_TEST_HOST=dev.example.com [ZERO_TEST_PORT=22] \
-#   ZERO_TEST_PATH=/home/me/repo/file.c bash scripts/smoke_phase2a.sh
+#   ZERO_TEST_PATH=/home/me/repo/file.c bash scripts/smoke_gitsigns_remote.sh
 # 可选: ZERO_GITSIGNS_ROOT=/path/to/gitsigns-fork（默认 ../gitsigns.nvim）
 set -e
 
@@ -21,4 +21,4 @@ if [ "$#" -eq 0 ] && { [ -z "${ZERO_TEST_USER:-}" ] || [ -z "${ZERO_TEST_HOST:-}
 fi
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-exec nvim --headless -u NONE -l "$ROOT/scripts/smoke_phase2a.lua" "$@"
+exec nvim --headless -u NONE -l "$ROOT/scripts/smoke_gitsigns_remote.lua" "$@"

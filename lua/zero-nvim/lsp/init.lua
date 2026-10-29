@@ -1,9 +1,8 @@
 --- 远端 LSP：经 daemon 的 TCP proxy 启动 zero-<key> client，负责自动启动 /
---- 附着 / 停止 / 自动重启与长期断网后的退避重连。
+--- 附着 / 停止；退出后的自动重启与退避重连见 lsp/restart.lua。
 local remote = require("zero-nvim.remote")
 local uri = require("zero-nvim.uri")
 local log = require("zero-nvim.log")
-local util = require("zero-nvim.util")
 local manager = require("zero-nvim.project.manager")
 local client_select = require("zero-nvim.lsp.client_select")
 local restart = require("zero-nvim.lsp.restart")
@@ -15,9 +14,7 @@ local M = {}
 local starting = {}
 local lsp_probe_unsupported_warned = false
 
-M.client_name = client_select.client_name
---- 一个 (server, remote, root) 的唯一 key（启动锁 / dormant 表共用）。
-M.client_key = client_select.client_key
+local client_name = client_select.client_name
 
 --- Default command for a project LSP entry: its `cmd`, else {key, "--stdio"}.
 --- Always returns a fresh copy (callers may mutate / keep it).
@@ -37,7 +34,7 @@ end
 ---@param project_config? table
 ---@param name string
 ---@return string
-function M.resolve_server_key(project_config, name)
+local function resolve_server_key(project_config, name)
     local lsp = project_config and project_config.lsp
     if type(lsp) ~= "table" or not name then return name end
     if lsp[name] then return name end
@@ -77,49 +74,7 @@ function M.mason_bins(user, host, port)
     return cache.mason_bins or {}
 end
 
---- Command-line completion: mason bins of the current buffer's remote.
----@param arg_lead string
----@return string[]
-function M.complete_mason_bins(arg_lead)
-    local out = {}
-    for _, name in ipairs(M.mason_bins(uri.parse(vim.api.nvim_buf_get_name(0)))) do
-        if name:find(arg_lead, 1, true) == 1 then table.insert(out, name) end
-    end
-    return out
-end
-
 -- ───── 内部工具 ─────────────────────────────────────────────────────────────
-
-local TRANSPORT_ERROR_PATTERNS = { "read_error", "write_error", "econnreset", "epipe", "connection reset", "closed", "eof" }
-
-local function is_transport_error(code, err)
-    -- Prefer the symbolic name. err text varies wildly across transports
-    -- (TCP socket vs ssh subprocess vs LSP proxy) and is unreliable for
-    -- string matching alone — Neovim normalises the rpc-layer cause via
-    -- vim.lsp.client_errors.
-    if type(code) == "number" and vim.lsp.client_errors then
-        local name = vim.lsp.client_errors[code]
-        if name == "READ_ERROR" or name == "WRITE_ERROR"
-            or name == "SERVER_REQUEST_HANDLER_ERROR"
-            or name == "NOTIFICATION_HANDLER_ERROR" then
-            return true
-        end
-    end
-    local msg = (tostring(code or "") .. " " .. tostring(err or "")):lower()
-    for _, pat in ipairs(TRANSPORT_ERROR_PATTERNS) do
-        if msg:find(pat, 1, true) then return true end
-    end
-    return false
-end
-
-local function attached_buffers(client_id)
-    local attached = {}
-    local client = vim.lsp.get_client_by_id(client_id)
-    for b in pairs(client and client.attached_buffers or {}) do
-        if vim.api.nvim_buf_is_valid(b) then table.insert(attached, b) end
-    end
-    return attached
-end
 
 --- Attach `client_id` to `buf` unless already attached.
 ---@return boolean attached_now
@@ -127,29 +82,6 @@ local function attach(buf, client_id)
     if not vim.api.nvim_buf_is_valid(buf) then return false end
     if #vim.lsp.get_clients({ bufnr = buf, id = client_id }) > 0 then return false end
     return (pcall(vim.lsp.buf_attach_client, buf, client_id))
-end
-
---- 重启 / 退避恢复成功后：停掉同 (server, remote, root) 的旧 client，并把
---- 原来附着的 buffer 挂到新 client 上。
----@return integer count reattached buffers
-local function adopt_replacement(entry, new_id, attached)
-    local tkey = uri.target_key(entry.user, entry.host, entry.port)
-    for _, client in ipairs(vim.lsp.get_clients({ name = M.client_name(entry.server_name) })) do
-        if client.id ~= new_id and client.config
-            and client.config._zero_target == tkey
-            and client.config.root_dir == entry.root_dir then
-            restart.mark_stale_exit(client.id)
-            pcall(client.stop, true)
-        end
-    end
-    local count = 0
-    for _, b in ipairs(attached or {}) do
-        if vim.api.nvim_buf_is_valid(b) then
-            pcall(vim.lsp.buf_attach_client, b, new_id)
-            count = count + 1
-        end
-    end
-    return count
 end
 
 --- Build LSP client capabilities with workspace/didChangeWatchedFiles disabled
@@ -226,64 +158,16 @@ function M.preflight(user, host, port, cmd_args)
     return false, "LSP preflight failed: " .. msg
 end
 
--- ───── 启动 / 自动重启 / 退避重连 ───────────────────────────────────────────
--- ensure_lsp_client → on_exit → restart_from_entry → ensure_lsp_client /
--- schedule_revive 互相递归，靠这两个前向声明解开。
-local ensure_lsp_client, schedule_revive
-
-local function restart_with_entry(entry)
-    return ensure_lsp_client(entry.user, entry.host, entry.port, entry.root_dir,
-        entry.server_name, entry.cmd_args, entry.settings, { force_new = true })
-end
-
---- 快速重启：最多 MAX_RESTART_ATTEMPTS 次（间隔递增），之后转入慢速退避。
-local function restart_from_entry(client_id, entry, attached, reason)
-    restart.remove_active(client_id)
-    -- 用户主动停的 / 无 entry：只消费标记，不重启
-    if restart.consume_intentional_stop(client_id) or not entry then return end
-
-    local lsp_name = M.client_name(entry.server_name)
-    if entry.attempts >= restart.MAX_RESTART_ATTEMPTS then
-        -- 快速重启上限到了 → 改走慢速指数退避。覆盖长期断网/笔记本休眠：
-        -- 用户从外面回来 ~30min 之内任意时刻都能自愈，而不是死掉等手动救。
-        vim.schedule(function()
-            log.warn(string.format("LSP '%s' 已快速重启 %d 次仍失败，转入退避重试", lsp_name, entry.attempts))
-        end)
-        entry.attempts = 0 -- 重置：退避循环用自己的尝试计数
-        schedule_revive(entry, attached, 0)
-        return
-    end
-
-    entry.attempts = entry.attempts + 1
-    vim.defer_fn(function()
-        log.info(string.format("LSP '%s' %s，自动重启 (第 %d 次)...", lsp_name, reason, entry.attempts))
-        local new_id, err = restart_with_entry(entry)
-        if not new_id then
-            -- 返回 nil 多半是 daemon RPC 失败（网络断了 / ssh 连不上）。
-            -- 继续走快速循环也是徒劳，直接转入慢速退避。
-            log.warn(string.format("LSP '%s' 重启失败 (%s)，转入退避重试", lsp_name, tostring(err)))
-            schedule_revive(entry, attached, 0)
-            return
-        end
-        local new_entry = restart.entry(new_id)
-        if new_entry then new_entry.attempts = entry.attempts end
-        local n = adopt_replacement(entry, new_id, attached)
-        if n > 0 then
-            log.info(string.format("LSP '%s' 已恢复，重新附着 %d 个 buffer", lsp_name, n))
-        end
-    end, 500 * entry.attempts)
-end
-
 --- Start a remote LSP client for `root_dir`, or return the existing one's id.
 --- Buffer-less by design: prewarm and FileType-autostart both go through here.
 ---@param opts? { force_new?: boolean }
 ---@return integer? client_id
 ---@return string? err "STARTING" when another start is in flight
-ensure_lsp_client = function(user, host, port, root_dir, server_name, cmd_args, settings, opts)
+local function ensure_lsp_client(user, host, port, root_dir, server_name, cmd_args, settings, opts)
     root_dir = client_select.norm_root(root_dir)
-    local lsp_name = M.client_name(server_name)
+    local lsp_name = client_name(server_name)
     local tkey = uri.target_key(user, host, port)
-    local lock_key = M.client_key(server_name, user, host, port, root_dir)
+    local lock_key = client_select.client_key(server_name, user, host, port, root_dir)
 
     -- Reuse an active client on the SAME remote whose root_dir already covers
     -- root_dir (exact match preferred; otherwise the most-specific ancestor).
@@ -347,38 +231,9 @@ ensure_lsp_client = function(user, host, port, root_dir, server_name, cmd_args, 
         end,
         on_exit = function(code, signal, id)
             clear_lock()
-            local action = restart.resolve_exit(id, restart.entry(id), attached_buffers(id), code)
-            if action.kind == "notify_exit" then
-                vim.schedule(function()
-                    log.notify(string.format("LSP '%s' exited (code=%s, signal=%s)",
-                            lsp_name, tostring(code), tostring(signal)),
-                        action.level == "warn" and vim.log.levels.WARN or vim.log.levels.INFO)
-                end)
-            elseif action.kind == "restart" then
-                -- resolve_exit deliberately restarts registered clients even on
-                -- code=0: idle SSH disconnects can look like clean EOF locally.
-                restart_from_entry(id, action.entry, action.attached, action.reason)
-            end
+            restart.on_exit(id, lsp_name, code, signal)
         end,
-        on_error = function(code, err)
-            if client_id and is_transport_error(code, err)
-                and restart.queue_transport_restart(client_id, restart.entry(client_id),
-                    attached_buffers(client_id), "连接断开") then
-                local client = vim.lsp.get_client_by_id(client_id)
-                if client then pcall(client.stop, true) end
-                -- on_exit 正常会消费 pending；3s 内没等到 exit 就自己重启
-                vim.defer_fn(function()
-                    local action = restart.resolve_transport_fallback(client_id)
-                    if action.kind == "restart" then
-                        restart_from_entry(client_id, action.entry, action.attached, action.reason)
-                    end
-                end, 3000)
-                return
-            end
-            vim.schedule(function()
-                log.error(string.format("LSP '%s' error (code=%s): %s", lsp_name, tostring(code), tostring(err)))
-            end)
-        end,
+        on_error = function(code, err) restart.on_error(client_id, lsp_name, code, err) end,
     })
 
     if not client_id then
@@ -386,8 +241,7 @@ ensure_lsp_client = function(user, host, port, root_dir, server_name, cmd_args, 
         return nil, "vim.lsp.start_client returned nil"
     end
 
-    -- Register restart metadata; on_exit uses it to restart and on_init resets
-    -- attempts. Each automatic restart increments attempts until the limit.
+    -- 重启元数据：on_exit 据此自动重启，on_init 复位 attempts。
     restart.track(client_id, {
         user = user,
         host = host,
@@ -406,94 +260,10 @@ ensure_lsp_client = function(user, host, port, root_dir, server_name, cmd_args, 
     return client_id
 end
 
--- ───── 长期断网后的慢速重连 ────────────────────────────────────────────────
--- 设计点：
---   • 上限：started_at 起累计 MAX_DORMANT_SECS 后彻底休眠 — 防止长期挂着
---     空发 RPC。`:ZeroLspRestart` 会清掉 started_at，相当于重新开始计时。
---   • 取消语义：revive_dormant_now 把 dormant entry 清掉先于重排，
---     保证旧 timer 即便已经进入回调也能在头部检查时早返回。
-
-local function do_revive_attempt(entry, attached, prior_attempts)
-    local new_id = restart_with_entry(entry)
-    if not new_id then
-        schedule_revive(entry, attached, prior_attempts)
-        return
-    end
-    restart.clear_dormant(restart.dormant_key_for(entry))
-    adopt_replacement(entry, new_id, attached)
-    vim.schedule(function()
-        log.info(string.format("LSP '%s' 已恢复 (退避第 %d 次)", M.client_name(entry.server_name), prior_attempts + 1))
-    end)
-end
-
-schedule_revive = function(entry, attached, prior_attempts)
-    local key = restart.dormant_key_for(entry)
-    local existing = restart.get_dormant(key)
-    if existing then util.close_timer(existing.timer) end
-
-    local started_at = (existing and existing.started_at) or os.time()
-    local elapsed = os.time() - started_at
-    if elapsed >= restart.MAX_DORMANT_SECS then
-        restart.clear_dormant(key)
-        vim.schedule(function()
-            log.error(string.format(
-                "LSP 'zero-%s' 已重试 %d 分钟仍未恢复，进入休眠。`:ZeroLspRestart` 可手动唤起。",
-                entry.server_name, math.floor(elapsed / 60)))
-        end)
-        return
-    end
-
-    local attempts = (prior_attempts or 0) + 1
-    local delay_ms = restart.BACKOFF_SECS[math.min(attempts, #restart.BACKOFF_SECS)] * 1000
-    local timer = vim.defer_fn(function()
-        local d = restart.get_dormant(key)
-        if not d then return end -- canceled by revive_dormant_now or success elsewhere
-        d.timer = nil
-        do_revive_attempt(entry, d.attached, attempts)
-    end, delay_ms)
-
-    restart.set_dormant(key, {
-        entry = entry,
-        attached = attached,
-        attempts = attempts,
-        started_at = started_at,
-        timer = timer,
-    })
-
-    -- 进入退避时打一条 INFO，避免静默重试。
-    if prior_attempts == 0 then
-        vim.schedule(function()
-            log.info(string.format("LSP 'zero-%s' 进入退避重连 (%d-60s 间隔，最多 %d 分钟)",
-                entry.server_name, restart.BACKOFF_SECS[1], math.floor(restart.MAX_DORMANT_SECS / 60)))
-        end)
-    end
-end
-
---- Cancel pending backoff timers and fire all dormant retries immediately.
---- Hook to VimResume / FocusGained / :ZeroLspRestart — when the user comes
---- back to a suspended laptop, network is usually up by the time the autocmd
---- fires, so we shouldn't wait out the backoff.
----@return integer count number of dormant entries revived
-function M.revive_dormant_now()
-    local count = 0
-    for _, key in ipairs(restart.dormant_keys()) do
-        local d = restart.get_dormant(key)
-        if d then
-            -- 清掉 dormant entry，让 old timer 的回调如果跑到了能在头部早返回，
-            -- 也让 schedule_revive 把 started_at 当作 now 重新计时（用户回来 →
-            -- 30min 时窗刷新）。
-            restart.clear_dormant(key)
-            vim.defer_fn(function() do_revive_attempt(d.entry, d.attached, 0) end, 50)
-            count = count + 1
-        end
-    end
-    return count
-end
-
----@return integer count
-function M.dormant_count()
-    return restart.dormant_count()
-end
+restart.set_starter(function(e)
+    return ensure_lsp_client(e.user, e.host, e.port, e.root_dir, e.server_name, e.cmd_args, e.settings,
+        { force_new = true })
+end)
 
 -- ───── 对外入口 ─────────────────────────────────────────────────────────────
 
@@ -525,7 +295,7 @@ function M.start_lsp(bufnr, cmd_args, settings, opts)
     if project_config == nil then
         project_config = select(2, manager.match_project(host, path, user, port))
     end
-    local server_name = opts.server_key or M.resolve_server_key(project_config, cmd_args[1])
+    local server_name = opts.server_key or resolve_server_key(project_config, cmd_args[1])
 
     local root_dir = opts.root_dir
     if not root_dir then
@@ -549,7 +319,7 @@ function M.start_lsp(bufnr, cmd_args, settings, opts)
         end
     end
 
-    local lsp_name = M.client_name(server_name)
+    local lsp_name = client_name(server_name)
     local client_id, err = ensure_lsp_client(user, host, port, root_dir, server_name, cmd_args, settings)
     if client_id then
         if attach(bufnr, client_id) then
@@ -607,7 +377,7 @@ function M.autostart(buf, ft)
     if not project_config or type(project_config.lsp) ~= "table" then return end
 
     for server_name, server_cfg in pairs(project_config.lsp) do
-        local lsp_name = M.client_name(server_name)
+        local lsp_name = client_name(server_name)
         if not server_cfg.filetypes then
             log.warn(string.format("LSP %s is configured but missing 'filetypes' array, skipping auto-start", server_name))
         elseif vim.tbl_contains(server_cfg.filetypes, ft)
@@ -662,7 +432,7 @@ end
 function M.stop(arg, bufnr)
     local clients
     if arg and arg ~= "" then
-        clients = vim.lsp.get_clients({ name = arg:match("^zero%-") and arg or M.client_name(arg) })
+        clients = vim.lsp.get_clients({ name = arg:match("^zero%-") and arg or client_name(arg) })
     else
         clients = vim.tbl_filter(function(c) return c.name:match("^zero%-") ~= nil end,
             vim.lsp.get_clients({ bufnr = bufnr or vim.api.nvim_get_current_buf() }))

@@ -1,5 +1,5 @@
 --- :ZeroSearchMini：当前 buffer 内的字面查找 / 替换（右下角小浮窗）。
-local ui = require("zero-nvim.search_mini.view")
+local view = require("zero-nvim.search_mini.view")
 local log = require("zero-nvim.log")
 
 local M = {}
@@ -10,7 +10,7 @@ local state = {
 
 local per_buf_queries = {}
 
-M.MAX_MATCHES = 2000
+local MAX_MATCHES = 2000
 
 --- 把用户输入转成 vim 正则：very-nomagic（\V）下只有 `\` 是特殊字符，
 --- `[` `.` `*` `~` `/` 全部按字面匹配。
@@ -18,7 +18,7 @@ M.MAX_MATCHES = 2000
 ---@param opts { case_sensitive?: boolean, whole_word?: boolean }
 ---@param min_col? integer  0-based 字节列：要求匹配起点 >= min_col
 ---@return string
-function M._build_pattern(query, opts, min_col)
+local function build_pattern(query, opts, min_col)
     local body = (query:gsub("\\", "\\\\"))
     if opts.whole_word then
         body = "\\<" .. body .. "\\>"
@@ -37,8 +37,8 @@ end
 --- 所以同一行的后续匹配改为整行匹配 + `\%>Nc` 列约束。
 ---@return table[]? matches  { lnum, col, end_col, text }；pattern 非法返回 nil
 function M._find_matches(buf, query, opts, max)
-    max = max or M.MAX_MATCHES
-    local ok, base = pcall(vim.regex, M._build_pattern(query, opts))
+    max = max or MAX_MATCHES
+    local ok, base = pcall(vim.regex, build_pattern(query, opts))
     if not ok then return nil end
 
     local matches = {}
@@ -52,7 +52,7 @@ function M._find_matches(buf, query, opts, max)
             table.insert(matches, { lnum = i, col = s, end_col = e, text = line_text })
             if #matches >= max then return matches end
             if e >= #line_text then break end
-            local ok2, next_re = pcall(vim.regex, M._build_pattern(query, opts, e))
+            local ok2, next_re = pcall(vim.regex, build_pattern(query, opts, e))
             if not ok2 then break end
             regex = next_re
         end
@@ -77,7 +77,7 @@ local function execute_search()
     elseif state.selected_index == 0 or state.selected_index > #matches then
         state.selected_index = 1
     end
-    ui.render_results(state)
+    view.render_results(state)
 end
 
 local function do_replace()
@@ -97,7 +97,7 @@ end
 local function select(idx)
     if idx < 1 or idx > #state.matches then return false end
     state.selected_index = idx
-    ui.jump_to_match(state)
+    view.jump_to_match(state)
     return true
 end
 
@@ -109,11 +109,11 @@ end
 --- 挂上两个 buffer 的按键
 local function setup_keymaps()
     local input_buf, results_buf = state.input_buf, state.results_buf
-    local function close() ui.close_ui(state) end
+    local function close() view.close_ui(state) end
     local function toggle(field)
         return function()
             state[field] = not state[field]
-            ui.render_input(state)
+            view.render_input(state)
             execute_search()
         end
     end
@@ -124,7 +124,7 @@ local function setup_keymaps()
         vim.keymap.set("n", "<Esc>", close, o)
         vim.keymap.set({ "i", "n" }, "<C-c>", toggle("case_sensitive"), o)
         vim.keymap.set({ "i", "n" }, "<C-w>", toggle("whole_word"), o)
-        vim.keymap.set({ "i", "n" }, "<C-r>", function() ui.toggle_replace(state) end, o)
+        vim.keymap.set({ "i", "n" }, "<C-r>", function() view.toggle_replace(state) end, o)
     end
 
     local input_maps = {
@@ -210,7 +210,7 @@ local function attach_input(session)
             end)
             session.timer:start(150, 0, vim.schedule_wrap(function()
                 if not session.active then return end
-                ui.render_input(session)
+                view.render_input(session)
                 execute_search()
             end))
         end,
@@ -231,7 +231,7 @@ function M.open()
         return
     end
 
-    if state.active then ui.close_ui(state) end
+    if state.active then view.close_ui(state) end
 
     local query = per_buf_queries[source_buf] or ""
     if query == "" then query = vim.fn.expand("<cword>") end
@@ -248,7 +248,7 @@ function M.open()
         ns_id = vim.api.nvim_create_namespace("ZeroSearchMini"),
     }
 
-    ui.create_ui(state)
+    view.create_ui(state)
     if query ~= "" then
         vim.api.nvim_buf_set_lines(state.input_buf, 0, -1, false, { query })
         vim.api.nvim_win_set_cursor(state.input_win, { 1, #query })
@@ -256,7 +256,7 @@ function M.open()
     setup_keymaps()
     attach_input(state)
 
-    ui.render_input(state)
+    view.render_input(state)
     execute_search()
     vim.cmd("startinsert!")
 end

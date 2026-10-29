@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Phase 3A 本地 headless smoke（不连远端，只验证 fork neogit 的 backends 抽象 +
+# neogit fork backend 本地 headless smoke（不连远端，只验证 fork neogit 的 backends 抽象 +
 # zero-nvim 端 backend 注册路径）
 #
-# 用法: bash scripts/smoke_phase3a.sh
+# 用法: bash scripts/smoke_neogit_backend.sh
 #
 # 环境变量（可选）：
 #   ZERO_NEOGIT_ROOT  fork neogit 路径（默认 <repo>/../neogit）
@@ -25,4 +25,4 @@ exec nvim --headless --clean -u NONE \
     --cmd "set rtp+=$ROOT" \
     --cmd "set rtp+=$NEOGIT_FORK" \
     --cmd "set rtp+=$PLENARY" \
-    -l "$ROOT/scripts/smoke_phase3a.lua"
+    -l "$ROOT/scripts/smoke_neogit_backend.lua"

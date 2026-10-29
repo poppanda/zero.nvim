@@ -128,4 +128,34 @@ if fallback.kind ~= "restart" or fallback.attached[1] ~= 303 then
     error("expected transport fallback restart, got " .. vim.inspect(fallback))
 end
 
+-- on_exit → 快速重启经注入的 starter；starter 失败 → 进入退避（dormant），
+-- revive_dormant_now 立即重试并清空 dormant 表。
+restart._reset_for_tests()
+vim.notify = function() end
+local started = {}
+local next_id = nil
+restart.set_starter(function(e)
+    table.insert(started, e)
+    return next_id, "offline"
+end)
+local live = vim.tbl_extend("force", entry, { attempts = 0 })
+restart.track(21, live)
+restart.on_exit(21, "zero-pyright", 1, 0)
+vim.wait(1000, function() return #started == 1 end)
+if #started ~= 1 or started[1] ~= live then
+    error("expected on_exit to restart through the starter, got " .. #started)
+end
+if restart.dormant_count() ~= 1 then
+    error("failed restart should go dormant, got " .. restart.dormant_count())
+end
+next_id = 99
+if restart.revive_dormant_now() ~= 1 or restart.dormant_count() ~= 0 then
+    error("revive_dormant_now should fire and clear dormant entries")
+end
+vim.wait(1000, function() return #started == 2 end)
+if #started ~= 2 then
+    error("expected revive to call the starter again")
+end
+restart._reset_for_tests()
+
 print("LSP restart state test passed")

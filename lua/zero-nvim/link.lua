@@ -74,14 +74,4 @@ function M.run(args)
     end
 end
 
---- :ZeroLink 第一个参数的补全：SSH host alias。
-function M.complete(arg_lead, cmd_line)
-    if #vim.split(cmd_line, "%s+") > 2 then return {} end
-    local out = {}
-    for _, entry in ipairs(ssh_config.parse()) do
-        if vim.startswith(entry.host, arg_lead) then table.insert(out, entry.host) end
-    end
-    return out
-end
-
 return M

@@ -1,7 +1,7 @@
 -- =============================================================================
--- scripts/smoke_phase3a.lua — Phase 3A 本地 headless 校验
+-- scripts/smoke_neogit_backend.lua — neogit fork backend 本地 headless 校验（需要 fork neogit + plenary）
 -- =============================================================================
--- 用法: bash scripts/smoke_phase3a.sh
+-- 用法: bash scripts/smoke_neogit_backend.sh
 --
 -- 不连任何远端、不跑真实 :Neogit；验证：
 --   L1: fork neogit 的 backends.lua API
@@ -139,5 +139,5 @@ ok("unwatch 清理 session")
 
 -- -----------------------------------------------------------------------------
 out("")
-ok("ALL PHASE 3A SMOKE LAYERS PASSED")
+ok("ALL NEOGIT BACKEND SMOKE LAYERS PASSED")
 os.exit(0)

@@ -1,5 +1,5 @@
 --- Remote file content <-> buffer lines conversion, shared by the builtin
---- BufReadCmd/BufWriteCmd handlers (init.lua) and the oil adapter.
+--- BufReadCmd/BufWriteCmd handlers (buffers.lua) and the oil adapter.
 ---
 --- Follows Vim's own read/write semantics as closely as a BufReadCmd can:
 ---   • 'fileformat' 检测：所有行都以 CRLF 结尾 → dos，否则 unix

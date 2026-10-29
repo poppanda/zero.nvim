@@ -212,14 +212,17 @@ M.get_column = function(name)
   return nil
 end
 
---- BufReadPre → 写内容 → filetype → BufReadPost（oil 自己的 BufReadCmd 不会替我们触发）
-local function finish_read(bufnr, bufname, path, res, err)
-  vim.cmd.doautocmd({ args = { "BufReadPre", bufname }, mods = { silent = true } })
-  if not buffers.apply_fetched(bufnr, path, res, err) then return end
+--- filetype（oil 会设成 "oil"）+ BufReadPost —— oil 自己的 BufReadCmd 不会替我们触发。
+local function post_read(bufnr, bufname, path)
   if vim.bo[bufnr].filetype == "" or vim.bo[bufnr].filetype == "oil" then
     buffers.detect_filetype(bufnr, path)
   end
   vim.cmd.doautocmd({ args = { "BufReadPost", bufname }, mods = { silent = true } })
+end
+
+local function apply_read(bufnr, bufname, path, res, err)
+  vim.cmd.doautocmd({ args = { "BufReadPre", bufname }, mods = { silent = true } })
+  if buffers.apply_fetched(bufnr, path, res, err) then post_read(bufnr, bufname, path) end
 end
 
 ---@param bufnr integer
@@ -237,18 +240,14 @@ M.read_file = function(bufnr)
     loading.set_loading(bufnr, false)
     vim.bo[bufnr].modifiable = true
     vim.bo[bufnr].modified = false
-    if vim.bo[bufnr].filetype == "" or vim.bo[bufnr].filetype == "oil" then
-      buffers.detect_filetype(bufnr, url.path)
-    end
-    vim.cmd.doautocmd({ args = { "BufReadPost", bufname }, mods = { silent = true } })
-    return
+    return post_read(bufnr, bufname, url.path)
   end
 
   -- Content prefetched by the LSP-location preload: apply it synchronously
   -- (no extra round-trip, cursor stays where LSP puts it).
   if buffers.has_prefetched(bufname) then
     loading.set_loading(bufnr, false)
-    return finish_read(bufnr, bufname, url.path, buffers.fetch(url.user, url.host, url.port, url.path))
+    return apply_read(bufnr, bufname, url.path, buffers.fetch(url.user, url.host, url.port, url.path))
   end
 
   loading.set_loading(bufnr, true)
@@ -256,7 +255,7 @@ M.read_file = function(bufnr)
     if not vim.api.nvim_buf_is_valid(bufnr) then return end
     local res, err = buffers.fetch(url.user, url.host, url.port, url.path, true)
     loading.set_loading(bufnr, false)
-    finish_read(bufnr, bufname, url.path, res, err)
+    apply_read(bufnr, bufname, url.path, res, err)
   end)
 end
 

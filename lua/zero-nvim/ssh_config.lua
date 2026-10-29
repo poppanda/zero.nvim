@@ -79,7 +79,7 @@ end
 --- 通过 Host alias 查找条目（使用本地解析）
 ---@param name string
 ---@return table|nil
-function M.find_host(name)
+local function find_host(name)
     for _, entry in ipairs(local_parse()) do
         if entry.host == name then return entry end
     end
@@ -95,7 +95,7 @@ function M.resolve(target)
     if resolved then return resolved end
 
     local user, host, port = target:match("^([^@]+)@([^:]+):?(%d*)$")
-    local entry = M.find_host(host or target)
+    local entry = find_host(host or target)
     if not user and not entry then return nil end
     return {
         user = user or entry.user or M.default_user(),

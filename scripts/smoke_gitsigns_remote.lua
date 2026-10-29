@@ -1,13 +1,13 @@
 -- =============================================================================
--- scripts/smoke_phase2a.lua — Phase 2A 端到端烟雾测试
+-- scripts/smoke_gitsigns_remote.lua — gitsigns 远端端到端烟雾测试（需要真实 SSH 主机）
 -- =============================================================================
 -- 用法（参数或环境变量二选一，参数优先）:
---   nvim --headless -u NONE -l scripts/smoke_phase2a.lua \
+--   nvim --headless -u NONE -l scripts/smoke_gitsigns_remote.lua \
 --     <user> <host> <port> <remote_path>
 --
 --   ZERO_TEST_USER=me ZERO_TEST_HOST=dev.example.com ZERO_TEST_PORT=22 \
 --   ZERO_TEST_PATH=/home/me/repo/file.c \
---     nvim --headless -u NONE -l scripts/smoke_phase2a.lua
+--     nvim --headless -u NONE -l scripts/smoke_gitsigns_remote.lua
 --
 -- 依赖 gitsigns fork：ZERO_GITSIGNS_ROOT（默认 ../gitsigns.nvim，相对仓库根）
 --
@@ -16,8 +16,8 @@
 --   L2: cmd.stream 直连 + git   —— 验证远端 PATH + git
 --   L3: backend.system          —— 验证 gitsigns→daemon 适配
 --   L4: gitsigns.attach          —— 验证完整 attach 流程
---   L5: backend.system + stdin  —— Phase 2B：写命令链路（cat - 回显校验）
---   L6: backend.system + 流式回调 —— Phase 2B：blame --incremental 回调契约
+--   L5: backend.system + stdin  —— 写命令链路（cat - 回显校验）
+--   L6: backend.system + 流式回调 —— blame --incremental 回调契约
 --
 -- 每层只在前一层通过后才跑。任何一层卡住 / 报错都会立刻打 FAIL 并退出。
 
@@ -35,9 +35,9 @@ local PORT        = tonumber(param(3, "ZERO_TEST_PORT") or "22")
 local REMOTE_PATH = param(4, "ZERO_TEST_PATH")
 if not USER or not HOST or not PORT or not REMOTE_PATH then
     io.stderr:write(table.concat({
-        "usage: nvim --headless -u NONE -l scripts/smoke_phase2a.lua <user> <host> <port> <remote_path>",
+        "usage: nvim --headless -u NONE -l scripts/smoke_gitsigns_remote.lua <user> <host> <port> <remote_path>",
         "   or: ZERO_TEST_USER=... ZERO_TEST_HOST=... [ZERO_TEST_PORT=22] ZERO_TEST_PATH=... \\",
-        "       nvim --headless -u NONE -l scripts/smoke_phase2a.lua",
+        "       nvim --headless -u NONE -l scripts/smoke_gitsigns_remote.lua",
         "missing: " .. table.concat(vim.tbl_filter(function(x) return x ~= "" end, {
             USER and "" or "user(ZERO_TEST_USER)",
             HOST and "" or "host(ZERO_TEST_HOST)",
@@ -288,7 +288,7 @@ do
 end
 
 -- -----------------------------------------------------------------------------
--- L5: backend.system + stdin (Phase 2B 写命令链路前置)
+-- L5: backend.system + stdin
 -- -----------------------------------------------------------------------------
 header("L5: backend.system + stdin (cat - 回显校验)")
 
@@ -331,7 +331,7 @@ do
 end
 
 -- -----------------------------------------------------------------------------
--- L6: backend.system + 流式 stdout 回调 (Phase 2B blame 路径契约)
+-- L6: backend.system + 流式 stdout 回调
 -- -----------------------------------------------------------------------------
 header("L6: backend.system + opts.stdout 流式回调 (blame --incremental)")
 

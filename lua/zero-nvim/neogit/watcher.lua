@@ -10,8 +10,8 @@
 --       注册中的 watch session 时才发。focus 不在 nvim 上时 vim 自己不调度。
 --
 -- 单一 watcher 模块支撑多个 watch session（多个远端 repo 同时打开 :Neogit）：
--- start() 注册 session，autocmd / poll 触发时 fan-out 到所有匹配 git_dir 的
--- session 的 on_event。
+-- start() 注册 session，autocmd / poll 触发时 fan-out 到所有 session 的 on_event
+-- （不区分 git_dir：远端无法知道哪个仓库变了，neogit 自己的 refresh 很便宜）。
 
 local util = require("zero-nvim.util")
 local log = require("zero-nvim.log")

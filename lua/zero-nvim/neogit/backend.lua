@@ -14,6 +14,7 @@ local cmd = require("zero-nvim.cmd")
 local log = require("zero-nvim.log")
 local util = require("zero-nvim.util")
 local buffer_io = require("zero-nvim.buffer_io")
+local watcher = require("zero-nvim.neogit.watcher")
 
 --- 非 string（旧 daemon 的 vim.Blob 等）一律按字节转成 Lua string。
 --- Blob 直接喂 vim.split 会得到 Blob 切片，传给 fnamemodify 触发 E976。
@@ -74,12 +75,7 @@ function M.paths(ctx, dir)
             is_inside_worktree = false,
         }
     end
-    local lines = vim.split(res.stdout, "\n", { plain = true })
-    -- 过滤空尾行
-    local clean = {}
-    for _, l in ipairs(lines) do
-        if l ~= "" then clean[#clean + 1] = l end
-    end
+    local clean = vim.split(res.stdout, "\n", { plain = true, trimempty = true })
     if #clean < 4 then
         return nil, "rev-parse 输出行数 < 4: " .. tostring(res.stdout)
     end
@@ -118,7 +114,7 @@ end
 --- 要么 libssh2 内部某条非线程安全路径炸掉 daemon。
 ---
 --- 序列化后：6 条命令一个接一个跑，代价是 6×SSH RTT 总和（≈600ms-1s）但稳定。
---- 后续 phase 可以做 daemon 端 session pool + 队列，再放开并发。
+--- 以后可以做 daemon 端 session pool + 队列，再放开并发。
 ---@type table<string, { running: boolean, queue: function[] }>
 local target_gates = {}
 
@@ -162,11 +158,6 @@ end
 --- backend.spawn(opts, cb) 接口拿不到 ctx，所以 fork 内 process.lua 把 ctx 加
 --- 在第三个参数。这是 backend 接口的一处增补，对其他 backend 无害（它们可以
 --- 忽略这个参数）。
----
---- 当前依赖 cmd.stream 的能力：stdin 一次性传入、stdout/stderr 流式回调、cancel。
---- 增量 stdin 写入（Process:send 在 spawn 后追加字节）走 noop——daemon 端
---- cmd_stdin_write RPC 还没实现（Phase 3B 计划）。Phase 3A 范围里 status / log /
---- branch / diff 这些只读命令都不需要增量 stdin，足够。
 ---@param opts table   { cmd, cwd, env, pty, stdin }
 ---@param cb   table   { on_stdout, on_stderr, on_exit }
 ---@param ctx  table   { target, path, id }
@@ -195,39 +186,23 @@ function M.spawn(opts, cb, ctx)
     -- 调用缓存下来，real_sid 一旦绑定就重放给 daemon。
     local real_sid = nil
     local cancelled = false
-    local stdin_queue = {} -- 元素：{kind="write", data=...} 或 {kind="close"}
     local stdin_closed = false
+    local stdin_pending = {} -- real_sid 就绪前排队的 fun(sid)
 
-    -- 把 queue 一次性 flush 给 daemon
-    local function flush_stdin_queue(sid)
-        for _, msg in ipairs(stdin_queue) do
-            if msg.kind == "write" then
-                cmd.write_stdin(sid, msg.data)
-            elseif msg.kind == "close" then
-                cmd.close_stdin(sid)
-            end
-        end
-        stdin_queue = {}
+    local function to_stdin(fn)
+        if real_sid then fn(real_sid) else table.insert(stdin_pending, fn) end
     end
 
     local handle = {
         id = gen_handle_id(),
         send = function(_self, text)
             if stdin_closed then return end
-            if real_sid then
-                cmd.write_stdin(real_sid, text)
-            else
-                table.insert(stdin_queue, { kind = "write", data = text })
-            end
+            to_stdin(function(sid) cmd.write_stdin(sid, text) end)
         end,
         close_stdin = function(_self)
             if stdin_closed then return end
             stdin_closed = true
-            if real_sid then
-                cmd.close_stdin(real_sid)
-            else
-                table.insert(stdin_queue, { kind = "close" })
-            end
+            to_stdin(cmd.close_stdin)
         end,
         stop = function(_self)
             cancelled = true
@@ -302,10 +277,9 @@ function M.spawn(opts, cb, ctx)
                 release_once()
             end))
         end
-        -- 把 spawn-before-real_sid 期间排队的 stdin write/close 一次性回放
-        if #stdin_queue > 0 then
-            flush_stdin_queue(real_sid)
-        end
+        -- 把 spawn-before-real_sid 期间排队的 stdin write/close 按序回放
+        for _, fn in ipairs(stdin_pending) do fn(real_sid) end
+        stdin_pending = {}
     end
 
     -- actually_spawn 自身抛错也要释放 gate
@@ -327,17 +301,10 @@ function M.spawn(opts, cb, ctx)
     return handle
 end
 
---- watch：远端 .git/ 监听。Phase 3A 用事件触发模型——不连远端 inotify，
---- 仅在 BufWritePost / FocusGained / 用户 :Neogit refresh 时跑回调，足够
---- 覆盖"自己改完保存 / 切回 nvim 窗口"两条最常见的 HEAD 可能变路径。
---- 进阶版（Phase 3C）：cmd.stream 跑远端 inotifywait 长流式命令推送事件。
----@param ctx       table
----@param git_dir   string  远端 .git/ 路径（informational only，不真去监听文件系统）
----@param on_event  fun(filename: string?)
----@return function unwatch
-function M.watch(ctx, git_dir, on_event)
-    return require("zero-nvim.neogit.watcher").start(ctx, git_dir, on_event)
-end
+--- watch：远端 .git/ 监听。事件触发模型——不连远端 inotify，仅在
+--- BufEnter / BufWritePost / FocusGained（+ 可选轮询）时跑回调，详见 watcher.lua。
+--- 签名 (ctx, git_dir, on_event) -> unwatch
+M.watch = watcher.start
 
 ---@param opts table?  { watcher? = { debounce_ms?, poll_ms? } }
 function M.setup(opts)
@@ -359,7 +326,7 @@ function M.setup(opts)
     })
 
     -- watcher 子模块 setup：debounce/poll 等参数透传
-    require("zero-nvim.neogit.watcher").setup(opts.watcher)
+    watcher.setup(opts.watcher)
 end
 
 return M

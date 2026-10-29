@@ -10,8 +10,9 @@ local buffers = require("zero-nvim.buffers")
 local link = require("zero-nvim.link")
 local locations = require("zero-nvim.lsp.locations")
 
--- LSP 模块较重（project / restart 等），用到时再加载
+-- LSP 模块较重，用到时再加载
 local function lsp() return require("zero-nvim.lsp") end
+local function lsp_restart() return require("zero-nvim.lsp.restart") end
 
 -- ---------------------------------------------------------------------------
 -- 命令
@@ -19,6 +20,12 @@ local function lsp() return require("zero-nvim.lsp") end
 
 local function filter_prefix(items, lead)
     return vim.tbl_filter(function(s) return vim.startswith(s, lead) end, items)
+end
+
+--- 第一个参数的补全：当前 buffer 所在远端的 mason bins。
+local function complete_mason_bins(lead, line)
+    if #vim.split(line, "%s+") > 2 then return {} end
+    return filter_prefix(lsp().mason_bins(uri.parse(vim.api.nvim_buf_get_name(0))), lead)
 end
 
 local function zero_lsp_add(cmd_opts)
@@ -59,7 +66,11 @@ local commands = {
         function(o) link.run(o.fargs) end,
         nargs = "*",
         desc = "Connect to remote server via SSH config",
-        complete = link.complete,
+        complete = function(lead, line)
+            if #vim.split(line, "%s+") > 2 then return {} end
+            local hosts = vim.tbl_map(function(e) return e.host end, require("zero-nvim.ssh_config").parse())
+            return filter_prefix(hosts, lead)
+        end,
     },
     ZeroProject = {
         zero_project,
@@ -90,10 +101,7 @@ local commands = {
         function(o) lsp().start_lsp(0, o.fargs, nil) end,
         nargs = "+",
         desc = "Start remote LSP via TCP proxy (e.g. :ZeroLspStart basedpyright --stdio)",
-        complete = function(lead, line)
-            if #vim.split(line, "%s+") > 2 then return {} end
-            return lsp().complete_mason_bins(lead)
-        end,
+        complete = complete_mason_bins,
     },
     -- 停掉 Neovim 侧 client 会关闭 TCP socket，daemon 那边的 ssh 子进程随之退出。
     ZeroLspStop = {
@@ -117,7 +125,7 @@ local commands = {
     -- 立刻让所有 dormant LSP（退避重试中）重试一次，并复位 30 分钟时窗。
     ZeroLspRestart = {
         function()
-            local count = lsp().revive_dormant_now()
+            local count = lsp_restart().revive_dormant_now()
             if count > 0 then
                 log.info(string.format("kicked %d dormant LSP%s", count, count == 1 and "" or "s"))
             else
@@ -131,7 +139,7 @@ local commands = {
         zero_lsp_add,
         nargs = "?",
         desc = "Add an LSP server to the current project (interactive)",
-        complete = function(lead) return lsp().complete_mason_bins(lead) end,
+        complete = complete_mason_bins,
     },
 }
 
@@ -165,7 +173,7 @@ local function setup_lsp_autocmds(group)
     vim.api.nvim_create_autocmd({ "VimResume", "FocusGained" }, {
         group = group,
         callback = function()
-            if lsp().dormant_count() > 0 then lsp().revive_dormant_now() end
+            lsp_restart().revive_dormant_now()
         end,
     })
 end

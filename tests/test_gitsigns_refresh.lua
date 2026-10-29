@@ -1,8 +1,8 @@
 -- =============================================================================
--- scripts/smoke_phase2c.lua — Phase 2C 本地 headless 校验
+-- tests/test_gitsigns_refresh.lua — gitsigns refresh 模块本地 headless 校验
 -- =============================================================================
 -- 用法:
---   nvim --headless -u NONE -l scripts/smoke_phase2c.lua
+--   bash scripts/run_tests.sh tests/test_gitsigns_refresh.lua
 --
 -- 不连任何远端，只验证 refresh 模块的 autocmd 注册 + debounce + in-flight gate +
 -- 轮询 timer 行为。:Gitsigns refresh 用 monkey-patch 抓调用次数，不真的跑
@@ -174,5 +174,5 @@ end
 
 -- -----------------------------------------------------------------------------
 out("")
-ok("ALL PHASE 2C SMOKE LAYERS PASSED")
+ok("test_gitsigns_refresh: ok")
 os.exit(0)

@@ -48,10 +48,21 @@ function M.system(argv, opts, ctx, gitsigns_on_exit)
         stdin = table.concat(stdin, "\n") .. "\n"
     end
 
-    local stdout_cb = type(opts.stdout) == "function" and opts.stdout or nil
-    local stderr_cb = type(opts.stderr) == "function" and opts.stderr or nil
-
-    local stdout_chunks, stderr_chunks = {}, {}
+    -- 流式回调（opts.stdout/.stderr 是函数）直接转发；否则累积到 SystemCompleted
+    local kinds = { "stdout", "stderr" }
+    local stream_cb, chunks = {}, { stdout = {}, stderr = {} }
+    for _, kind in ipairs(kinds) do
+        if type(opts[kind]) == "function" then stream_cb[kind] = opts[kind] end
+    end
+    -- 流式回调用 nil 收尾——blame 的 coroutine reader 靠这个跳出 yield。
+    local function close_streams()
+        for _, kind in ipairs(kinds) do
+            if stream_cb[kind] then stream_cb[kind](nil, nil) end
+        end
+    end
+    local function collected(kind)
+        return stream_cb[kind] and "" or table.concat(chunks[kind])
+    end
 
     local _, err = cmd.stream(ctx.target, {
         argv = cmd.with_remote_path(argv),
@@ -61,27 +72,18 @@ function M.system(argv, opts, ctx, gitsigns_on_exit)
         timeout_ms = opts.timeout and (opts.timeout * 1000) or nil,
     }, {
         on_event = function(ev)
-            if ev.kind == "stdout" then
-                if stdout_cb then
-                    stdout_cb(nil, ev.text)
-                else
-                    stdout_chunks[#stdout_chunks + 1] = ev.text
-                end
-            elseif ev.kind == "stderr" then
-                if stderr_cb then
-                    stderr_cb(nil, ev.text)
-                else
-                    stderr_chunks[#stderr_chunks + 1] = ev.text
-                end
+            local cb = stream_cb[ev.kind]
+            if cb then
+                cb(nil, ev.text)
+            elseif chunks[ev.kind] then
+                table.insert(chunks[ev.kind], ev.text)
             end
         end,
         on_exit = function(code, signal, reason, _dur)
-            -- 流式回调用 nil 收尾——blame 的 coroutine reader 靠这个跳出 yield。
-            if stdout_cb then stdout_cb(nil, nil) end
-            if stderr_cb then stderr_cb(nil, nil) end
+            close_streams()
             gitsigns_on_exit({
-                stdout = stdout_cb and "" or table.concat(stdout_chunks),
-                stderr = stderr_cb and "" or table.concat(stderr_chunks),
+                stdout = collected("stdout"),
+                stderr = collected("stderr"),
                 -- aborted（比如 buffer wipeout 触发取消）→ 用 -1 让 gitsigns ignore_error 路径处理；
                 -- 正常退出走 daemon 报告的 code。
                 code = reason and -1 or (code or 0),
@@ -94,8 +96,7 @@ function M.system(argv, opts, ctx, gitsigns_on_exit)
         -- 启动失败（连接没建好、target 不可达等）：直接合成失败 SystemCompleted。
         -- 流式回调也要发 nil，避免 blame 的 coroutine 永远等。
         vim.schedule(function()
-            if stdout_cb then stdout_cb(nil, nil) end
-            if stderr_cb then stderr_cb(nil, nil) end
+            close_streams()
             gitsigns_on_exit({ stdout = "", stderr = tostring(err), code = -1, signal = 0 })
         end)
     end

@@ -81,14 +81,16 @@ function M.browse_path(user, hostname, port, on_confirm, opts)
     local loaded_once = false
     local function load_dir(path)
         current_path = path
-        local entries, err = remote.list_dir(user, hostname, port, path)
-        if not entries then
-            log.error("Failed to read directory — " .. tostring(err))
+        -- 直接 read_dir，不走 remote.list_dir：后者会顺带触发 scan_project
+        -- （深度 3 的后台预取），浏览 / 或 $HOME 时代价太大
+        local ok, entries = remote.request(user, hostname, port, "read_dir", path)
+        if not ok then
+            log.error("Failed to read directory — " .. tostring(entries))
             -- 第一次就失败（多半连不上）：直接关窗
             if not loaded_once then return close() end
         end
         loaded_once = true
-        raw_entries = entries or {}
+        raw_entries = ok and entries or {}
         render()
     end
 

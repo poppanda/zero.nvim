@@ -65,7 +65,7 @@ function M.show_project_picker()
     end
 
     local final_width = math.min(max_width, 100)
-    -- [Fixed] Minimum height 10, Maximum 20
+    -- 高度 10..20 行
     local win_height = math.min(math.max(#names, 10), 20)
 
     local buf, win = float.create({
@@ -80,13 +80,7 @@ function M.show_project_picker()
     vim.api.nvim_set_option_value("buftype", "nofile", { buf = buf })
 
     local function get_selected_name()
-        if #names == 0 then return nil end
-        local cursor = vim.api.nvim_win_get_cursor(win)
-        local idx = cursor[1]
-        if idx >= 1 and idx <= #names then
-            return names[idx]
-        end
-        return nil
+        return names[vim.api.nvim_win_get_cursor(win)[1]]
     end
 
     local function close()
@@ -115,12 +109,8 @@ function M.show_project_picker()
 
     -- Action: Add (Current Buffer)
     vim.keymap.set("n", "<C-a>", function()
-        -- [Fixed] Do NOT close the picker first.
-        -- Just invoke add_current_project which will spawn the prompt float on top.
-        M.add_current_project(context_buf, function()
-            -- Refresh the list by re-opening (simple way to redraw)
-            refresh()
-        end)
+        -- 不先关 picker：名字输入框直接叠在上面，保存后重开列表刷新
+        M.add_current_project(context_buf, refresh)
     end, { buffer = buf, silent = true })
 
     -- Action: Edit
@@ -152,7 +142,7 @@ function M.show_project_picker()
     vim.keymap.set("n", "<C-l>", function()
         local name = get_selected_name()
         if not name then return end
-        local config = projects[name]
+        local config = with_target_defaults(projects[name])
         close()
         require("zero-nvim.lsp.add_wizard").open({
             user = config.user,
@@ -222,23 +212,22 @@ function M.check_health(project_name_or_args)
 
     -- Prepare initial checklist
     local checklist = {
-        { label = "SSH Connection (" .. config.host .. ")", key = "ssh" },
-        { label = "Root Directory (" .. tostring(config.root) .. ")", key = "root" },
+        { label = "SSH Connection (" .. config.host .. ")" },
+        { label = "Root Directory (" .. tostring(config.root) .. ")" },
     }
 
     if config.lsp then
         for srv_name, _ in pairs(config.lsp) do
-            table.insert(checklist, { label = "LSP (" .. srv_name .. ")", key = "lsp_" .. srv_name })
+            table.insert(checklist, { label = "LSP (" .. srv_name .. ")", server = srv_name })
         end
     else
-        table.insert(checklist, { label = "LSP Configuration", key = "lsp_none", status = "SKIP" })
+        table.insert(checklist, { label = "LSP Configuration", skip = true })
     end
 
     -- Convert to display lines
     local lines = {}
     for _, item in ipairs(checklist) do
-        local prefix = (item.status == "SKIP") and "[-] " or "[ ] "
-        table.insert(lines, prefix .. item.label)
+        table.insert(lines, (item.skip and "[-] " or "[ ] ") .. item.label)
     end
 
     -- Open window immediately
@@ -275,9 +264,8 @@ function M.check_health(project_name_or_args)
         local lsp = require("zero-nvim.lsp")
         for i = 3, #checklist do
             local item = checklist[i]
-            if item.status ~= "SKIP" then
-                local srv_name = item.key:gsub("^lsp_", "")
-                local cmd_args = lsp.server_cmd(srv_name, config.lsp[srv_name])
+            if item.server then
+                local cmd_args = lsp.server_cmd(item.server, config.lsp[item.server])
 
                 update_line(i, "[●] " .. item.label .. " (Checking ssh + binary...)")
                 vim.cmd("redraw")

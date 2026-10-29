@@ -14,7 +14,7 @@ local log = require("zero-nvim.log")
 
 local M = {}
 
--- session_id → session table
+-- session_id → session table（test 直接读取，故挂在 M 上）
 M._sessions = {}
 
 local sid_counter = 0
@@ -58,35 +58,21 @@ function M.register(spec)
     }
     M._sessions[sid] = session
 
+    -- 自动 cancel：owner buffer wipeout / owner window closed。
     -- 每个 session 一个 augroup：结束时整组删除，避免 autocmd 随击键无限累积
-    local need_group = (spec.owner_buf and vim.api.nvim_buf_is_valid(spec.owner_buf))
-        or (spec.owner_win and vim.api.nvim_win_is_valid(spec.owner_win))
-    if need_group then
+    local owner_buf = spec.owner_buf and vim.api.nvim_buf_is_valid(spec.owner_buf) and spec.owner_buf
+    local owner_win = spec.owner_win and vim.api.nvim_win_is_valid(spec.owner_win) and spec.owner_win
+    if owner_buf or owner_win then
         session.augroup = vim.api.nvim_create_augroup("ZeroNvimCmdAutoCancel_" .. sid, { clear = true })
-    end
-
-    -- 自动 cancel：buffer wipeout
-    if spec.owner_buf and vim.api.nvim_buf_is_valid(spec.owner_buf) then
-        vim.api.nvim_create_autocmd("BufWipeout", {
-            group = session.augroup,
-            buffer = spec.owner_buf,
-            once = true,
-            callback = function()
-                M.cancel(sid)
-            end,
-        })
-    end
-
-    -- 自动 cancel：window closed
-    if spec.owner_win and vim.api.nvim_win_is_valid(spec.owner_win) then
-        vim.api.nvim_create_autocmd("WinClosed", {
-            group = session.augroup,
-            pattern = tostring(spec.owner_win),
-            once = true,
-            callback = function()
-                M.cancel(sid)
-            end,
-        })
+        local function cancel() M.cancel(sid) end
+        if owner_buf then
+            vim.api.nvim_create_autocmd("BufWipeout",
+                { group = session.augroup, buffer = owner_buf, once = true, callback = cancel })
+        end
+        if owner_win then
+            vim.api.nvim_create_autocmd("WinClosed",
+                { group = session.augroup, pattern = tostring(owner_win), once = true, callback = cancel })
+        end
     end
 
     return sid
@@ -124,7 +110,7 @@ local function finish(s, code, signal, reason, duration_ms)
     safe_call("on_exit", s.on_exit, code, signal, reason, duration_ms)
 end
 
---- 从 daemon 端发起 cancel。仅设置 flag，不立刻清理 _sessions——等 daemon 的
+--- 从 daemon 端发起 cancel。仅设置 flag，不立刻清理 sessions——等 daemon 的
 --- exit/aborted 事件回来再删，才能拿到真实退出信息。
 --- daemon 不在（channel 没了 / notify 失败）时不会再有事件回来，直接本地收尾。
 function M.cancel(sid)

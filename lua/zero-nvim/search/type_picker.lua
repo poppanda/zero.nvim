@@ -4,12 +4,12 @@ local util = require("zero-nvim.util")
 local M = {}
 
 -- ripgrep 内置 type（已排序）；其余类型走 --glob '*.<ext>'
-M.BUILTIN = {
+local BUILTIN = {
     "c", "cpp", "css", "go", "h", "html", "java", "js", "json",
     "lua", "md", "py", "rust", "sh", "sql", "toml", "ts", "txt", "xml", "yaml",
 }
 local builtin_set = {}
-for _, t in ipairs(M.BUILTIN) do builtin_set[t] = true end
+for _, t in ipairs(BUILTIN) do builtin_set[t] = true end
 
 ---@param t string
 ---@return boolean
@@ -35,7 +35,7 @@ function M.open(opts)
     local items = {}
 
     local function rebuild()
-        local all = vim.list_extend(vim.list_extend({}, M.BUILTIN), custom_types)
+        local all = vim.list_extend(vim.list_extend({}, BUILTIN), custom_types)
         table.sort(all)
         items = {}
         for _, t in ipairs(all) do

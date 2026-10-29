@@ -3,7 +3,7 @@
 --- 方便测试 / 提前 require 的模块）。
 local M = {}
 
-M.defaults = {
+local defaults = {
     daemon = {
         path = nil,
         build_type = "debug",
@@ -30,13 +30,13 @@ M.defaults = {
     },
 }
 
-local options = vim.deepcopy(M.defaults)
+local options = vim.deepcopy(defaults)
 local configured = false
 
 ---@param opts? table
 ---@return table options
 function M.setup(opts)
-    options = vim.tbl_deep_extend("force", M.defaults, opts or {})
+    options = vim.tbl_deep_extend("force", defaults, opts or {})
     configured = true
     return options
 end

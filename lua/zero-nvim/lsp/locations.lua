@@ -73,7 +73,7 @@ end
 --- oil's read_file consume the stash) and stay unlisted: BufWinEnter lists
 --- them once the user actually opens one.
 ---@param locations table[]
-function M.preload(locations)
+local function preload(locations)
     if type(locations) ~= "table" then return end
     local needed = collect(locations)
     if #needed == 0 then return end
@@ -126,7 +126,7 @@ function M.install()
 
     local orig_lti = vim.lsp.util.locations_to_items
     vim.lsp.util.locations_to_items = function(locations, offset_encoding)
-        local ok, err = pcall(M.preload, locations)
+        local ok, err = pcall(preload, locations)
         if not ok then log.debug("Preloading LSP locations failed: " .. tostring(err)) end
         resnap_cursor(locations)
         return orig_lti(locations, offset_encoding)
@@ -149,7 +149,7 @@ function M.install()
                     end
                 end
             end
-            pcall(M.preload, locs)
+            pcall(preload, locs)
             return handler(results, ctx)
         end)
     end

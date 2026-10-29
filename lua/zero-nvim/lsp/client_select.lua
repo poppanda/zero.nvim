@@ -19,7 +19,7 @@ function M.client_key(server_key, user, host, port, root_dir)
     return M.client_name(server_key) .. "@" .. uri.target_key(user, host, port) .. ":" .. M.norm_root(root_dir)
 end
 
-function M.root_covers(parent, child)
+local function root_covers(parent, child)
     parent, child = M.norm_root(parent), M.norm_root(child)
     if parent == "" then return false end
     if parent == child then return true end
@@ -59,7 +59,7 @@ function M.select_reusable_client(clients, lsp_name, target, root_dir)
             if croot == root_dir then
                 return client
             end
-            if M.root_covers(croot, root_dir) and #croot > best_len then
+            if root_covers(croot, root_dir) and #croot > best_len then
                 best, best_len = client, #croot
             end
         end

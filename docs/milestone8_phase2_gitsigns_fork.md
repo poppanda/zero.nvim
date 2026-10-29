@@ -356,7 +356,7 @@ require("zero-nvim").setup({
 | 轮询 timer | `lua/zero-nvim/gitsigns/refresh.lua` `configure_poll()` |
 | 默认配置 | `lua/zero-nvim/init.lua` `defaults.gitsigns` |
 | BufReadPost 显式 fire | `lua/zero-nvim/init.lua` `BufNew` autocmd 内 |
-| smoke 入口 | `scripts/smoke_phase2a.{lua,sh}` / `scripts/smoke_phase2c.{lua,sh}` |
+| smoke 入口 | `scripts/smoke_gitsigns_remote.{lua,sh}` / `tests/test_gitsigns_refresh.lua` |
 
 ### Fork 端（`~/Code/Neovim/gitsigns.nvim/`，branch `zero-nvim-backend`）
 
@@ -451,25 +451,25 @@ debounce，导致 debounce 永远不到期。**修法**：轮询路径直接调 
 
 ### Phase 2A 烟雾测试
 
-`scripts/smoke_phase2a.{lua,sh}` — 4 层自下而上验：
+`scripts/smoke_gitsigns_remote.{lua,sh}` — 4 层自下而上验：
 - L1: cmd.stream + echo（daemon notification 通路）
 - L2: cmd.stream + git rev-parse（远端 PATH + git）
 - L3: backend.system（gitsigns→daemon 适配层）
 - L4: 完整 `:edit zero://...` → BufReadCmd → gitsigns attach（cache + #hunks 强校验）
 
 ```bash
-bash scripts/smoke_phase2a.sh <user> <host> <port> <remote_path>
+bash scripts/smoke_gitsigns_remote.sh <user> <host> <port> <remote_path>
 ```
 
 ### Phase 2B smoke 扩展
 
-`scripts/smoke_phase2a.lua` 内新增 L5/L6（同脚本）：
+`scripts/smoke_gitsigns_remote.lua` 内新增 L5/L6（同脚本）：
 - L5: backend.system + `cat -` 用 table stdin（验末尾 \n）
 - L6: backend.system + `git blame --incremental` opts.stdout 流式回调
 
 ### Phase 2C 本地 smoke
 
-`scripts/smoke_phase2c.{lua,sh}` — **不连远端**，纯验 refresh 模块：
+`tests/test_gitsigns_refresh.lua` — **不连远端**，纯验 refresh 模块：
 - L1: setup 装齐 BufEnter / BufWritePost / FocusGained 三个 autocmd
 - L2: BufEnter 触发后 debounce 期内 0 次，过后 1 次
 - L3: 短时间多次 BufEnter 合成 1 次（debounce 合并）
@@ -478,7 +478,7 @@ bash scripts/smoke_phase2a.sh <user> <host> <port> <remote_path>
 - L6: poll_ms > 0 + 有 zero:// 窗口 → timer 触发刷新
 
 ```bash
-bash scripts/smoke_phase2c.sh
+bash scripts/run_tests.sh tests/test_gitsigns_refresh.lua
 ```
 
 ### 性能基线（Phase 2A 实测）

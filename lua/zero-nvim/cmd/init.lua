@@ -103,9 +103,7 @@ function M.stream(target, spec, handlers)
 end
 
 --- 主动取消一条流式 session
-function M.cancel(sid)
-    return exec.cancel(sid)
-end
+M.cancel = exec.cancel
 
 --- notify（不是 request）：避免主线程被远端慢写阻塞；写失败时 daemon 仅打日志。
 local function notify(method, ...)

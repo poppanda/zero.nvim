@@ -1,6 +1,7 @@
 -- Read/write flow against a mocked daemon (no network): canonical buffer
 -- names, single fetch per :edit, load-failure write guard, synchronous
--- writes, range writes, CRLF, NOT_CONNECTED reconnect, batched LSP preload.
+-- writes, range writes, CRLF, NOT_CONNECTED reconnect, batched LSP preload,
+-- alias redirect, append, failed-load re-preload, daemon-exit cleanup, oil-mode guard.
 package.path = package.path .. ";./lua/?.lua;./lua/?/init.lua"
 
 local files = {
@@ -16,7 +17,8 @@ local fail_once = {}
 vim.fn.executable = (function(orig)
     return function(p) if p == "/tmp/zero-test-daemon" then return 1 end return orig(p) end
 end)(vim.fn.executable)
-vim.fn.jobstart = function() return 77 end
+local job_opts
+vim.fn.jobstart = function(_, o) job_opts = o; return 77 end
 vim.rpcnotify = function() end
 vim.notify = function() end
 vim.fn.rpcrequest = function(chan, method, ...)
@@ -140,5 +142,59 @@ end
 check(vim.deep_equal(vim.fn.readfile("zero://u@h:22/f.txt", "", 2), { "Z", "b" }), "readfile max")
 check(vim.deep_equal(vim.fn.readfile("zero://u@h:22/f.txt", "b"), { "Z", "b", "c", "" }), "readfile binary")
 check(not pcall(vim.fn.readfile, "zero://u@h:22/denied2.txt"), "readfile raises on failure")
+
+
+-- 11. non-canonical alias of an open buffer → window moves to the canonical buffer
+vim.cmd("edit zero://u@h:22/f.txt")
+local canon_buf = vim.api.nvim_get_current_buf()
+vim.cmd("edit zero://u@h//f.txt")
+local alias_buf = vim.api.nvim_get_current_buf()
+check(alias_buf ~= canon_buf and vim.b[alias_buf].zero_alias_of == canon_buf, "alias flagged")
+vim.wait(50, function() return not vim.api.nvim_buf_is_valid(alias_buf) end)
+check(vim.api.nvim_get_current_buf() == canon_buf, "window redirected to canonical buffer")
+check(not vim.api.nvim_buf_is_valid(alias_buf), "alias buffer wiped")
+
+-- 12. :w >> appends to the remote content
+vim.cmd("edit zero://u@h:22/f.txt")
+local before = files["/f.txt"]
+vim.cmd("1write >> zero://u@h:22/f.txt")
+check(files["/f.txt"] == before .. "Z\n", "appended: " .. vim.inspect(files["/f.txt"]))
+
+-- 13. LSP preload retries a buffer whose earlier load failed
+fail_once.fetch_path = "Permission denied"
+vim.cmd("edit zero://u@h:22/r3.lua")
+local fbuf = vim.api.nvim_get_current_buf()
+check(vim.b[fbuf].zero_load_failed, "r3 load failed")
+vim.cmd("buffer " .. canon_buf)
+files["/r3.lua"] = "now ok\n"
+vim.lsp.util.locations_to_items({
+    { uri = "zero://u@h:22/r3.lua", range = { start = { line = 0, character = 0 }, ["end"] = { line = 0, character = 1 } } },
+}, "utf-16")
+check(not vim.b[fbuf].zero_load_failed, "failed buffer reloaded by preload")
+check(vim.api.nvim_buf_get_lines(fbuf, 0, -1, false)[1] == "now ok", "reloaded content")
+
+-- 14. daemon exit: per-host state wiped, streams aborted, next request reconnects
+local remote = require("zero-nvim.remote")
+remote.host_cache("u", "h", 22).marker = true
+local aborted
+local exec = require("zero-nvim.cmd.exec")
+local orig_abort = exec.abort_all
+exec.abort_all = function(reason) aborted = reason end
+job_opts.on_exit(77, 1)
+exec.abort_all = orig_abort
+check(aborted and aborted:find("daemon exited", 1, true), "streams aborted")
+check(remote.host_cache("u", "h", 22).marker == nil, "host cache wiped")
+check(not remote.is_connected("u", "h", 22), "connection state wiped")
+local c0 = count("connect")
+remote.request("u", "h", 22, "stat", "/f.txt")
+check(count("connect") == c0 + 1, "reconnect after daemon restart")
+
+-- 15. oil explorer: no BufReadCmd / BufWriteCmd of ours, File{Write,Append}Cmd kept
+zero.setup({ daemon = { path = "/tmp/zero-test-daemon" }, explorer = "oil" })
+local evs = {}
+for _, a in ipairs(vim.api.nvim_get_autocmds({ group = "ZeroNvim", pattern = "zero://*" })) do evs[a.event] = true end
+check(not evs.BufReadCmd and not evs.BufWriteCmd, "oil mode: no BufReadCmd/BufWriteCmd")
+check(evs.FileWriteCmd and evs.FileAppendCmd, "oil mode: range/append writes still handled")
+zero.setup({ daemon = { path = "/tmp/zero-test-daemon" } })
 
 print("remote read/write test passed")

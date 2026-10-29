@@ -17,24 +17,26 @@ local readfile_patched = false
 -- 预取 stash
 -- ---------------------------------------------------------------------------
 
+local function stash_key(name) return uri.normalize(name) or name end
+
 ---@param name string zero:// URI
 ---@param content string
 function M.stash(name, content)
-    prefetched[uri.normalize(name) or name] = content
+    prefetched[stash_key(name)] = content
 end
 
 --- Consume prefetched content for a URI (one-shot).
 ---@return string?
 function M.take_prefetched(name)
-    local canon = uri.normalize(name) or name
-    local content = prefetched[canon]
-    prefetched[canon] = nil
+    local key = stash_key(name)
+    local content = prefetched[key]
+    prefetched[key] = nil
     return content
 end
 
 ---@return boolean
 function M.has_prefetched(name)
-    return prefetched[uri.normalize(name) or name] ~= nil
+    return prefetched[stash_key(name)] ~= nil
 end
 
 -- ---------------------------------------------------------------------------
@@ -217,7 +219,7 @@ end
 
 --- Read handler for a zero:// buffer (BufReadCmd). Canonicalizes the buffer
 --- name first so zero://u@h/p and zero://u@h:22/p share one buffer.
-function M.read_buffer(buf, name)
+local function read_buffer(buf, name)
     local canon = uri.normalize(name)
     if not canon or (canon ~= name and not claim_name(buf, canon)) then return end
     local user, host, port, path = uri.parse(canon)
@@ -382,7 +384,7 @@ function M.setup(group, explorer)
 
     -- 文件内容只在 BufReadCmd 里加载一次；LSP 跳转路径由 lsp/locations.lua 预取。
     if explorer ~= "oil" then
-        on("BufReadCmd", { callback = function(args) M.read_buffer(args.buf, args.match) end })
+        on("BufReadCmd", { callback = function(args) read_buffer(args.buf, args.match) end })
         -- 同步写入：:wq / :x 依赖 BufWriteCmd 返回时 'modified' 已复位，否则 E37。
         on("BufWriteCmd", {
             callback = function(args)

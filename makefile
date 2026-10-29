@@ -1,4 +1,4 @@
-.PHONY: build clean test test-lua test-rust
+.PHONY: build clean test test-lua test-rust smoke-neogit smoke-gitsigns
 
 build:
 	cd daemon && cargo build
@@ -13,3 +13,11 @@ test-rust:
 
 test-lua:
 	bash scripts/run_tests.sh
+
+# 需要 fork neogit（ZERO_NEOGIT_ROOT，默认 ../neogit）+ plenary.nvim
+smoke-neogit:
+	bash scripts/smoke_neogit_backend.sh
+
+# 需要真实远端：ZERO_TEST_USER / ZERO_TEST_HOST / ZERO_TEST_PATH [/ ZERO_TEST_PORT]
+smoke-gitsigns:
+	bash scripts/smoke_gitsigns_remote.sh

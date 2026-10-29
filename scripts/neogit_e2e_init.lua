@@ -1,11 +1,11 @@
 -- =============================================================================
--- scripts/e2e_phase3a_init.lua — Phase 3A 远端 E2E 验证用 minimal init
+-- scripts/neogit_e2e_init.lua — neogit fork 远端手动 E2E 用 minimal init
 -- =============================================================================
 -- 不污染用户日常 nvim 配置：用一个临时数据目录起独立 session，把 fork neogit
 -- + zero-nvim + plenary 全挂上来，user 在里面手动跑 :Neogit cwd=zero://...
 --
 -- 用法：
---   nvim -u <repo>/scripts/e2e_phase3a_init.lua
+--   nvim -u <repo>/scripts/neogit_e2e_init.lua
 --
 -- 可选环境变量：ZERO_NEOGIT_ROOT（默认 <repo>/../neogit）、ZERO_PLENARY_ROOT、
 -- ZERO_DEVICONS_ROOT（默认 lazy.nvim 安装位置）
@@ -13,10 +13,10 @@
 -- 然后在 nvim 里：
 --   :Neogit cwd=zero://USER@HOST:PORT/path/to/remote/repo
 --
--- 关闭：:qa! 即可。配置 / state 都在 /tmp/zero-e2e-3a/，不影响平时用的 nvim。
+-- 关闭：:qa! 即可。配置 / state 都在 /tmp/zero-e2e-neogit/，不影响平时用的 nvim。
 
 -- 1) 临时数据目录（避免污染 ~/.local/share/nvim 之类的真实状态）
-local TMP = "/tmp/zero-e2e-3a"
+local TMP = "/tmp/zero-e2e-neogit"
 vim.fn.mkdir(TMP .. "/data", "p")
 vim.fn.mkdir(TMP .. "/state", "p")
 vim.fn.mkdir(TMP .. "/cache", "p")
@@ -40,7 +40,7 @@ local PATHS = {
 }
 if vim.fn.isdirectory(NEOGIT_ROOT) == 0 then
     vim.schedule(function()
-        vim.notify("e2e_phase3a_init: neogit fork not found at " .. NEOGIT_ROOT .. " (set ZERO_NEOGIT_ROOT)",
+        vim.notify("neogit_e2e_init: neogit fork not found at " .. NEOGIT_ROOT .. " (set ZERO_NEOGIT_ROOT)",
             vim.log.levels.ERROR)
     end)
 end
@@ -60,7 +60,7 @@ require("zero-nvim").setup({
 -- 4) 起 neogit（fork）：默认 setup 即可——zero-nvim.setup 内部已经把 backend
 --    register 到 fork 的 backends registry 上。
 require("neogit").setup({
-    -- 关掉 watcher 也可以；默认是开的，3A 用我们的 backend.watch
+    -- 关掉 watcher 也可以；默认是开的，走 zero 的 backend.watch
     -- filewatcher = { enabled = true },
 })
 
@@ -70,7 +70,7 @@ vim.api.nvim_create_autocmd("VimEnter", {
     callback = function()
         vim.schedule(function()
             local lines = {
-                "================ Phase 3A E2E ================",
+                "================ neogit E2E ================",
                 "fork neogit + zero-nvim 已挂载。",
                 "",
                 "现在执行（替换成你的远端 repo）：",

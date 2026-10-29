@@ -1,5 +1,5 @@
 -- =============================================================================
--- cmd/parsers/init.lua — Parser 协议 & 内置 passthrough parser
+-- cmd/parsers/init.lua — Parser 协议 & 通用行式 parser
 -- =============================================================================
 -- Parser 是把"远端字节流"翻译成"结构化事件"的状态机。
 --
@@ -10,23 +10,10 @@
 --
 -- 纪律：parser 永远不调 vim.api、不持 buffer 引用。纯字节流 → 事件。这是 UI
 -- 复用的前提（同一 parser 既能给搜索 UI 用，也能给"测试运行 + 解析输出"用）。
+--
+-- 不传 parser 时 cmd/exec.lua 直接把 stdout/stderr 原样转成 {kind, text} 事件。
 
 local M = {}
-
---- 透传 parser：stdout/stderr 原样转成 events（默认行为，无需自定义）
-function M.passthrough()
-    return {
-        feed = function(_, bytes)
-            return { { kind = "stdout", text = bytes } }
-        end,
-        feed_err = function(_, bytes)
-            return { { kind = "stderr", text = bytes } }
-        end,
-        finalize = function()
-            return {}
-        end,
-    }
-end
 
 --- 行式 parser：把 stdout 按行切，每行一个 event。跨 chunk 的不完整行会缓存。
 function M.lines()
