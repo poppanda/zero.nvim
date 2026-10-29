@@ -147,6 +147,13 @@ function M.join(dir, name, is_dir)
     return M.normalize_path(p)
 end
 
+--- Strip trailing "/" ("/" itself -> ""), for comparing project / LSP roots.
+---@param path? string
+---@return string
+function M.norm_root(path)
+    return ((path or ""):gsub("/+$", ""))
+end
+
 --- Connection key used for per-remote caches: "user@host:port".
 ---@param user string
 ---@param host string

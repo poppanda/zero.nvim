@@ -1,4 +1,5 @@
 local log = require("zero-nvim.log")
+local util = require("zero-nvim.util")
 
 local M = {}
 
@@ -40,48 +41,6 @@ local function ensure_dir(path)
     if vim.fn.isdirectory(dir) == 0 then
         vim.fn.mkdir(dir, "p")
     end
-end
-
-local is_list = vim.islist or vim.tbl_islist
-
---- Pure-Lua JSON pretty printer (2-space indent, sorted object keys).
---- Scalars / string escaping go through vim.json.encode, so the output is
---- always valid JSON — no shell round-trip (the old `echo | jq` pipeline could
---- mangle backslashes and needed external tools).
----@param v any
----@param indent string
----@return string
-local function pretty(v, indent)
-    if type(v) ~= "table" or v == vim.NIL then
-        return vim.json.encode(v)
-    end
-    local inner = indent .. "  "
-    local parts = {}
-    if next(v) == nil then
-        return "{}"
-    elseif is_list(v) then
-        for _, item in ipairs(v) do
-            table.insert(parts, inner .. pretty(item, inner))
-        end
-        return "[\n" .. table.concat(parts, ",\n") .. "\n" .. indent .. "]"
-    end
-    local keys = {}
-    for k in pairs(v) do table.insert(keys, k) end
-    table.sort(keys, function(a, b) return tostring(a) < tostring(b) end)
-    for _, k in ipairs(keys) do
-        table.insert(parts, inner .. vim.json.encode(tostring(k)) .. ": " .. pretty(v[k], inner))
-    end
-    return "{\n" .. table.concat(parts, ",\n") .. "\n" .. indent .. "}"
-end
-
---- Format a value as pretty-printed JSON.
---- Returns nil if the input cannot be encoded (callers fall back to "{}").
----@param obj any
----@return string?
-function M.format_json(obj)
-    local ok, j = pcall(pretty, obj, "")
-    if not ok then return nil end
-    return j .. "\n"
 end
 
 ---Load all projects from disk (with mtime caching)
@@ -131,7 +90,7 @@ end
 ---@param data table<string, ZeroProjectConfig>
 ---@return boolean ok
 function M.save(data)
-    local content = M.format_json(data)
+    local content = util.format_json(data)
     if not content then
         log.error("failed to encode projects data")
         return false

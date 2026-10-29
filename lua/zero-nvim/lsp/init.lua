@@ -165,7 +165,7 @@ end
 ---@return string? err "STARTING" when another start is in flight
 local function ensure_lsp_client(user, host, port, root_dir, server_name, cmd_args, settings, opts)
     -- 项目 root "/" 归一化后是 ""：LSP 的 rootUri 需要真实路径
-    root_dir = client_select.norm_root(root_dir)
+    root_dir = uri.norm_root(root_dir)
     if root_dir == "" then root_dir = "/" end
     local lsp_name = client_name(server_name)
     local tkey = uri.target_key(user, host, port)

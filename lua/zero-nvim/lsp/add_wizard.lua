@@ -15,7 +15,6 @@ local float         = require("zero-nvim.ui.float")
 local util          = require("zero-nvim.util")
 local log           = require("zero-nvim.log")
 local manager       = require("zero-nvim.project.manager")
-local store         = require("zero-nvim.project.store")
 local presets       = require("zero-nvim.lsp.presets")
 local lsp           = require("zero-nvim.lsp")
 
@@ -40,7 +39,7 @@ end
 
 local function step3_preview(ctx, server_name, server_cfg)
     local payload = { [server_name] = server_cfg }
-    local lines = vim.split(store.format_json(payload) or "{}", "\n")
+    local lines = vim.split(util.format_json(payload) or "{}", "\n")
 
     local height = math.min(math.max(#lines + 2, 8), 25)
     local buf, _, close = float.menu({
@@ -117,8 +116,6 @@ end
 -- ---------------------------------------------------------------------------
 -- Step 1: server picker
 -- ---------------------------------------------------------------------------
-
-local SENTINEL_MANUAL = "__manual__"
 
 local function step1_pick(ctx)
     local function build_rows()

@@ -43,17 +43,6 @@ local function normalize_argv(argv)
     error("argv must be string or string[]")
 end
 
---- 确保主机已连接后发一条 `method(...)` RPC。target = {user, host, port?}
----@return boolean ok
----@return any result_or_error
-local function request(target, method, ...)
-    local chan, err = remote.ensure_connection(target.user, target.host, target.port or 22)
-    if not chan then return false, err or "no daemon channel" end
-    local ok, res = pcall(vim.fn.rpcrequest, chan, method, ...)
-    if not ok then return false, tostring(res) end
-    return true, res
-end
-
 --- 同步命令。第二参数可以是 argv（string|string[]），也可以是完整 spec。
 ---@param target table { user, host, port? }
 ---@param argv   string|string[]|table  argv 或 { argv, env?, cwd?, stdin?, timeout_ms?, pty? }
@@ -64,7 +53,7 @@ function M.sync(target, argv, opts)
     local spec = (type(argv) == "table" and argv.argv) and vim.deepcopy(argv) or { argv = argv }
     spec = vim.tbl_extend("force", spec, opts or {})
     spec.argv = normalize_argv(spec.argv)
-    local ok, res = request(target, "cmd_sync", target.user, target.host, target.port or 22, spec)
+    local ok, res = remote.request(target.user, target.host, target.port or 22, "cmd_sync", spec)
     if not ok then return nil, res end
     return res
 end
@@ -85,19 +74,28 @@ function M.stream(target, spec, handlers)
         owner_buf = spec.owner_buf,
         owner_win = spec.owner_win,
     })
-    -- 不把 parser/owner_* 等 Lua-only 字段塞给 daemon
-    local ok, err = request(target, "cmd_stream", sid, target.user, target.host, target.port or 22, {
-        argv = argv,
-        env = spec.env,
-        cwd = spec.cwd,
-        stdin = spec.stdin,
-        pty = spec.pty,
-        timeout_ms = spec.timeout_ms,
-    })
+    -- 不走 remote.request：cmd_stream 的参数是 [sid, user, host, port, spec]
+    -- （sid 打头，与 cancel / stdin 通知一致），且 daemon 同步只做注册、总是
+    -- 返回 true——连接错误经 on_exit 异步上报，NOT_CONNECTED 重试无从触发。
+    -- 这里只需确保已连接（复用认证 / 负缓存）。
+    local port = target.port or 22
+    local chan, err = remote.ensure_connection(target.user, target.host, port)
+    local ok = chan ~= nil
+    if ok then
+        -- 不把 parser/owner_* 等 Lua-only 字段塞给 daemon
+        ok, err = pcall(vim.fn.rpcrequest, chan, "cmd_stream", sid, target.user, target.host, port, {
+            argv = argv,
+            env = spec.env,
+            cwd = spec.cwd,
+            stdin = spec.stdin,
+            pty = spec.pty,
+            timeout_ms = spec.timeout_ms,
+        })
+    end
     if not ok then
         -- 连接 / 启动失败：清掉刚注册的 session
         exec.unregister(sid)
-        return nil, err
+        return nil, tostring(err or "no daemon channel")
     end
     return sid
 end

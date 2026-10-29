@@ -1,98 +1,39 @@
 -- =============================================================================
 -- zero-nvim/neogit/watcher.lua — neogit fork 的远端 .git/ 监听适配
 -- =============================================================================
--- 本地 neogit 用 vim.uv.new_fs_event() 监听 .git/，远端没法直接监听文件系统。
--- 这里用两层补偿（思路完全等同 zero-nvim/gitsigns/refresh.lua）：
---   (1) 事件触发（默认开）：BufWritePost / FocusGained / BufEnter 命中 zero://
---       buffer 时，debounce 200ms 后触发 on_event。覆盖了"自己改完保存 / 切回
---       nvim 窗口 / 切回某 zero buffer"几条最常见的"HEAD 可能变了"路径。
---   (2) 可选轮询：poll_ms > 0 时启动一个 uv timer，按节奏跑——但仅当存在
---       注册中的 watch session 时才发。focus 不在 nvim 上时 vim 自己不调度。
+-- 本地 neogit 用 vim.uv.new_fs_event() 监听 .git/；远端靠 zero-nvim/refresher.lua
+-- 的事件 + 可选轮询代偿。
 --
--- 单一 watcher 模块支撑多个 watch session（多个远端 repo 同时打开 :Neogit）：
--- start() 注册 session，autocmd / poll 触发时 fan-out 到所有 session 的 on_event
--- （不区分 git_dir：远端无法知道哪个仓库变了，neogit 自己的 refresh 很便宜）。
+-- 单一 watcher 支撑多个 watch session（多个远端 repo 同时打开 :Neogit）：
+-- start() 注册 session，触发时 fan-out 到所有 session 的 on_event（不区分
+-- git_dir：远端无法知道哪个仓库变了，neogit 自己的 refresh 很便宜）。
+-- 没有 session 时事件 / 轮询都不触发。
 
-local util = require("zero-nvim.util")
+local refresher = require("zero-nvim.refresher")
 local log = require("zero-nvim.log")
 
 local M = {}
 
-local uv = vim.uv or vim.loop
-
-local debounce_ms = 200
-local poll_ms = 0
-
-local debounce_timer
-local poll_timer
-local in_flight = false
-
--- 注册中的 watch session：sessions[session_id] = { ctx, git_dir, on_event }
+-- 注册中的 watch session：sessions[session_id] = { id, ctx, git_dir, on_event }
 local sessions = {}
 local sid_counter = 0
 
-local function gen_sid()
-    sid_counter = sid_counter + 1
-    return "watch-" .. sid_counter
-end
-
---- 真正分发；in-flight gate 确保上一次未结束时新触发被丢弃，防止 thrash。
-local function dispatch_all()
-    if in_flight then return end
-    in_flight = true
-    -- on_event 内部会让 neogit watcher 调 dispatch_refresh，那是 async 的，
-    -- 我们只能用启发式：等够 1 个 debounce 周期再放开 in-flight。
-    for _, s in pairs(sessions) do
-        local ok, err = pcall(s.on_event, nil)
-        if not ok then
-            -- session 自身挂了不该影响别的 session
-            log.warn(("neogit watcher: session %s on_event err: %s"):format(s.id, tostring(err)))
+local r = refresher.new({
+    group = "ZeroNvimNeogitWatcher",
+    debounce_ms = 200,
+    enabled = function() return next(sessions) ~= nil end,
+    run = function()
+        for _, s in pairs(sessions) do
+            local ok, err = pcall(s.on_event, nil)
+            if not ok then
+                -- session 自身挂了不该影响别的 session
+                log.warn(("neogit watcher: session %s on_event err: %s"):format(s.id, tostring(err)))
+            end
         end
-    end
-    vim.defer_fn(function() in_flight = false end, debounce_ms)
-end
+    end,
+})
 
---- 入口：autocmd / timer 都走这里。debounce 把同时段多次触发合成一次。
-local function schedule()
-    if not next(sessions) then return end
-    if not debounce_timer then debounce_timer = uv.new_timer() end
-    debounce_timer:stop()
-    debounce_timer:start(debounce_ms, 0, vim.schedule_wrap(dispatch_all))
-end
-
-local function configure_poll()
-    util.close_timer(poll_timer)
-    poll_timer = nil
-    if poll_ms <= 0 then return end
-    poll_timer = uv.new_timer()
-    poll_timer:start(poll_ms, poll_ms, vim.schedule_wrap(function()
-        if next(sessions) and util.any_zero_window_visible() then
-            dispatch_all()
-        end
-    end))
-end
-
-local autocmd_group_installed = false
-local function ensure_autocmds()
-    if autocmd_group_installed then return end
-    autocmd_group_installed = true
-    local group = vim.api.nvim_create_augroup("ZeroNvimNeogitWatcher", { clear = true })
-
-    -- BufEnter / BufWritePost：切到一个 zero:// buffer / 自己写完
-    vim.api.nvim_create_autocmd({ "BufEnter", "BufWritePost" }, {
-        group = group,
-        pattern = "zero://*",
-        callback = schedule,
-    })
-
-    -- FocusGained：整个 nvim 窗口失焦后回来——期间用户可能在终端跑了 git
-    -- pull 等改 HEAD 的命令。仅在有 session 时才生效（schedule 自带空 sessions
-    -- 的 early return），避免本地 buffer 也吃刷新。
-    vim.api.nvim_create_autocmd("FocusGained", {
-        group = group,
-        callback = schedule,
-    })
-end
+local autocmds_installed = false
 
 --- 公开入口：注册一个 watch session。返回 unwatch 函数。
 --- 由 zero-nvim/neogit/backend.lua 的 M.watch 调用，间接由 fork neogit 的
@@ -102,21 +43,18 @@ end
 ---@param on_event  fun(filename: string?)
 ---@return function unwatch
 function M.start(ctx, git_dir, on_event)
-    ensure_autocmds()
+    if not autocmds_installed then
+        autocmds_installed = true
+        r.install_autocmds()
+    end
 
-    local sid = gen_sid()
-    sessions[sid] = {
-        id = sid,
-        ctx = ctx,
-        git_dir = git_dir,
-        on_event = on_event,
-    }
+    sid_counter = sid_counter + 1
+    local sid = "watch-" .. sid_counter
+    sessions[sid] = { id = sid, ctx = ctx, git_dir = git_dir, on_event = on_event }
 
     -- 注册时立即触发一次：让 :Neogit 打开后第一次 status 数据是新鲜的
     vim.defer_fn(function()
-        if sessions[sid] then
-            pcall(on_event, nil)
-        end
+        if sessions[sid] then pcall(on_event, nil) end
     end, 50)
 
     return function()
@@ -125,12 +63,9 @@ function M.start(ctx, git_dir, on_event)
 end
 
 --- 公开入口：模块级配置（debounce / poll）。可选；不调也走默认值。
----@param opts table?  { debounce_ms?, poll_ms? }
+---@param opts? { debounce_ms?: integer, poll_ms?: integer }
 function M.setup(opts)
-    opts = opts or {}
-    debounce_ms = opts.debounce_ms or 200
-    poll_ms = opts.poll_ms or 0
-    configure_poll()
+    r.configure(opts)
 end
 
 --- 调试辅助：当前活跃 session 数

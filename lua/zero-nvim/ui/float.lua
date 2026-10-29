@@ -135,7 +135,7 @@ end
 ---@param tbl table
 ---@param on_save fun(new_tbl: table)
 function M.edit_json(name, tbl, on_save)
-    local formatted_json = require("zero-nvim.project.store").format_json(tbl) or "{}"
+    local formatted_json = util.format_json(tbl) or "{}"
     local content = vim.split(formatted_json, "\n")
 
     local buf, win = M.create({ title = "Edit Config: " .. name, width = 80, height = 20 })

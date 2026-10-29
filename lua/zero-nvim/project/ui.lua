@@ -30,7 +30,7 @@ function M.add_current_project(bufnr, on_complete)
     local root = is_dir and uri.as_dir(path) or uri.parent_dir(path)
 
     -- Default project name is the folder name（根目录 "/" 时为 "/"）
-    local default_name = vim.fs.basename(manager.norm_root(root))
+    local default_name = vim.fs.basename(uri.norm_root(root))
     if default_name == "" then default_name = "/" end
 
     float.prompt({ title = "Project Name", default = default_name }, function(name)

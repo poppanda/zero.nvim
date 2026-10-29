@@ -40,8 +40,8 @@ eq(manager.remove("legacy"), false, "remove reports failed save")
 eq(projects.legacy ~= nil, true, "failed remove leaves cache untouched")
 store.save = orig_save
 
--- store.format_json: pure Lua, valid JSON, backslashes preserved
-local json = store.format_json({ b = { "x\\y", 1 }, a = { cmd = { "a\"b" } }, e = {} })
+-- util.format_json: pure Lua, valid JSON, backslashes preserved
+local json = require("zero-nvim.util").format_json({ b = { "x\\y", 1 }, a = { cmd = { "a\"b" } }, e = {} })
 local decoded = vim.json.decode(json)
 if decoded.b[1] ~= "x\\y" or decoded.a.cmd[1] ~= "a\"b" or decoded.b[2] ~= 1 then
     error("format_json roundtrip mismatch: " .. json)

@@ -52,8 +52,9 @@ Core:
 - **init.lua** — `setup(opts)` (idempotent: augroup recreated, global patches installed once), `:Zero*` user commands, LSP autocmds (FileType autostart, BufWinEnter attach, VimResume/FocusGained revive). `plugin/zero-nvim.lua` calls `setup()` only if the user hasn't.
 - **config.lua** — Defaults + merged options; modules read `config.get()`.
 - **log.lua** — Single notify path (prefix + level filter from `config.log`).
-- **util.lua** — Small helpers (timers, `set_lines`, editor size).
-- **uri.lua** — All `zero://` parse / format / normalize / join helpers. Always go through it.
+- **util.lua** — Small helpers (timers, `set_lines`, editor size, `any_zero_window_visible`, `format_json` pretty printer).
+- **refresher.lua** — Shared "remote HEAD may have changed" trigger for gitsigns / neogit: BufEnter / BufWritePost on `zero://*` + FocusGained, debounce, heuristic in-flight gate, optional polling while a `zero://` window is visible.
+- **uri.lua** — All `zero://` parse / format / normalize / join helpers, plus `norm_root` (trailing-slash strip for root comparisons). Always go through it.
 - **daemon.lua** — Binary lookup, `jobstart` with `rpc = true`, stderr → WARN notifications, exit listeners (aborts in-flight streams, clears per-connection state).
 - **remote.lua** — `request` / `request_interactive` for `method(user, host, port, ...)` RPCs: starts the daemon, connects (password prompt only when interactive), 10s negative connect cache, reconnect + retry on NOT_CONNECTED; `host_cache`, `remote_home`, `list_dir` (fires a background `scan_project` notification).
 - **buffer_io.lua** — Remote bytes ↔ buffer lines with Vim read/write semantics ('fileformat', 'eol'/'fixeol', BOM, binary/NUL); load-failed marking.
@@ -64,11 +65,11 @@ Core:
 Features:
 - **lsp/** — `init.lua`: start / autostart / prewarm / attach / stop of `zero-<key>` clients through the daemon proxy (preflight via `lsp_probe`; key/agent auth required; pythonPath injection for pyright-family). `restart.lua`: auto-restart, backoff, dormant clients, `:ZeroLspRestart`. `client_select.lua`: pure client naming / reuse / attach selection (longest covering root; same-host fallback for dependency files). `locations.lua`: definition-jump preload (below). `presets.lua` + `add_wizard.lua`: `:ZeroLspAdd`.
 - **project/** — `store.lua` (JSON at `stdpath("data")/zero-nvim/projects.json`, mtime cache), `manager.lua` (CRUD, `upsert_lsp`, longest-prefix `match_project`), `ui.lua` (`:ZeroProject` picker, JSON editor, health check).
-- **cmd/** — Lua remote-command API: `init.lua` (`sync`, `stream`, `cancel`, `write_stdin`, `close_stdin`, `with_remote_path`), `exec.lua` (stream session registry, `_dispatch` notification entry, auto-cancel when owner buf/win closes, `abort_all`), `parsers/` (parser protocol + `rg.lua` for `rg --json`).
+- **cmd/** — Lua remote-command API: `init.lua` (`sync` via `remote.request`; `stream` calls `cmd_stream` directly since it takes `session_id` first and never answers NOT_CONNECTED; `cancel`, `write_stdin`, `close_stdin`, `with_remote_path`), `exec.lua` (stream session registry, `_dispatch` notification entry, auto-cancel when owner buf/win closes, `abort_all`), `parsers/` (parser protocol + `rg.lua` for `rg --json`).
 - **search/** — `:ZeroSearch`: `init.lua` controller (remote rg via `cmd.stream`, local rg via `jobstart`), `view.lua` (path / query / results tree / preview floats), `type_picker.lua` (`<C-t>` file-type filter).
 - **search_mini/** — `:ZeroSearchMini` literal in-buffer find / replace (`init.lua` state, `view.lua` floats).
-- **gitsigns/** — Backend for a gitsigns fork exposing `gitsigns.backends`; `refresh.lua` triggers `:Gitsigns refresh` on events / optional polling. Silently skipped with upstream gitsigns.
-- **neogit/** — Backend for a neogit fork exposing `neogit.backends` (paths / spawn / watch); `watcher.lua` replaces `.git/` fs watching with events + optional polling.
+- **gitsigns/** — Backend for a gitsigns fork exposing `gitsigns.backends`; `refresh.lua` runs `:Gitsigns refresh` via `refresher.lua` (option `gitsigns.refresh`). Silently skipped with upstream gitsigns.
+- **neogit/** — Backend for a neogit fork exposing `neogit.backends` (paths / spawn / watch); `watcher.lua` replaces `.git/` fs watching: watch sessions fanned out via `refresher.lua` (option `neogit.watcher`).
 - **ui/** — `float.lua` (shared float / input / JSON editor), `host_picker.lua`, `browser.lua`, `icons.lua`.
 
 ### Oil.nvim Adapter (`lua/oil/adapters/zero.lua`)
@@ -127,6 +128,6 @@ Daemon → Lua: stream events are `nvim_exec_lua` notifications calling `require
 
 ## Debug
 
-- `ZERO_NVIM_DEBUG=1 nvim ...` — the daemon (inherits the env) prints routine `debug_log!` messages to stderr, and `daemon.lua` tees daemon stderr to `/tmp/zero-daemon.log`. The daemon treats empty / `0` as off; the Lua tee turns on for any set value.
+- `ZERO_NVIM_DEBUG=1 nvim ...` — the daemon (inherits the env) prints routine `debug_log!` messages to stderr, and `daemon.lua` tees daemon stderr to `/tmp/zero-daemon.log`. Both treat empty / `0` as off.
 - Daemon stderr always appears as Neovim WARN notifications (`Daemon: ...`); remote LSP ssh stderr is prefixed `[SSH-ERR]`.
 - Plugin messages honour `log.level` (set `vim.log.levels.DEBUG` to see `log.debug` output).

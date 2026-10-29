@@ -1,4 +1,4 @@
---- 零散的通用小工具（不依赖插件其他状态）。
+--- 零散的通用小工具（不依赖插件其他状态）：timer、buffer 行、编辑器尺寸、JSON 美化。
 local uri = require("zero-nvim.uri")
 
 local M = {}
@@ -44,6 +44,48 @@ function M.any_zero_window_visible()
         end
     end
     return false
+end
+
+local is_list = vim.islist or vim.tbl_islist
+
+--- Pure-Lua JSON pretty printer (2-space indent, sorted object keys).
+--- Scalars / string escaping go through vim.json.encode, so the output is
+--- always valid JSON — no shell round-trip (the old `echo | jq` pipeline could
+--- mangle backslashes and needed external tools).
+---@param v any
+---@param indent string
+---@return string
+local function pretty(v, indent)
+    if type(v) ~= "table" or v == vim.NIL then
+        return vim.json.encode(v)
+    end
+    local inner = indent .. "  "
+    local parts = {}
+    if next(v) == nil then
+        return "{}"
+    elseif is_list(v) then
+        for _, item in ipairs(v) do
+            table.insert(parts, inner .. pretty(item, inner))
+        end
+        return "[\n" .. table.concat(parts, ",\n") .. "\n" .. indent .. "]"
+    end
+    local keys = {}
+    for k in pairs(v) do table.insert(keys, k) end
+    table.sort(keys, function(a, b) return tostring(a) < tostring(b) end)
+    for _, k in ipairs(keys) do
+        table.insert(parts, inner .. vim.json.encode(tostring(k)) .. ": " .. pretty(v[k], inner))
+    end
+    return "{\n" .. table.concat(parts, ",\n") .. "\n" .. indent .. "}"
+end
+
+--- Format a value as pretty-printed JSON.
+--- Returns nil if the input cannot be encoded (callers fall back to "{}").
+---@param obj any
+---@return string?
+function M.format_json(obj)
+    local ok, j = pcall(pretty, obj, "")
+    if not ok then return nil end
+    return j .. "\n"
 end
 
 return M

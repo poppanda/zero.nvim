@@ -1,6 +1,7 @@
 local M = {}
 local store = require("zero-nvim.project.store")
 local log = require("zero-nvim.log")
+local uri = require("zero-nvim.uri")
 
 ---@class ZeroProject
 ---@field name string
@@ -79,13 +80,6 @@ function M.upsert_lsp(project_name, server_name, server_cfg)
     end)
 end
 
---- 去掉末尾的 "/"（"/" 本身 -> ""），用于 root 比较。
----@param path? string
----@return string
-function M.norm_root(path)
-    return ((path or ""):gsub("/+$", ""))
-end
-
 ---Does a stored project config target the given connection?
 ---Missing user/port in the stored config act as wildcards (configs written
 ---before user/port were recorded keep matching).
@@ -125,14 +119,14 @@ function M.match_project(host, path, user, port)
     local best_match_len = -1
     local best_score = -1
 
-    local clean_path = M.norm_root(path)
+    local clean_path = uri.norm_root(path)
 
     for name, config in pairs(projects) do
         -- 坏配置（root 缺失 / 类型不对）直接跳过，避免 gsub 崩溃
         if type(config) == "table" and type(config.root) == "string" then
             local ok, score = target_matches(config, host, user, port)
             if ok then
-                local clean_root = M.norm_root(config.root)
+                local clean_root = uri.norm_root(config.root)
                 local covers = clean_root == ""                      -- root "/" covers everything
                     or clean_path == clean_root
                     or clean_path:find(clean_root .. "/", 1, true) == 1

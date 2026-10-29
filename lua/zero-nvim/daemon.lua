@@ -57,7 +57,9 @@ end
 local function on_stderr(_, data)
     -- 调试模式：daemon stderr 同时 tee 到文件，方便 panic / SIGPIPE 死亡时
     -- 事后回看（vim.notify 历史可能被 :messages 截掉）。开关通过环境变量。
-    local debug_log = os.getenv("ZERO_NVIM_DEBUG") and "/tmp/zero-daemon.log" or nil
+    -- 与 daemon 一致：空串 / "0" 视为关闭
+    local flag = os.getenv("ZERO_NVIM_DEBUG")
+    local debug_log = (flag and flag ~= "" and flag ~= "0") and "/tmp/zero-daemon.log" or nil
     local f = debug_log and io.open(debug_log, "a") or nil
     for _, line in ipairs(data) do
         if line ~= "" then
