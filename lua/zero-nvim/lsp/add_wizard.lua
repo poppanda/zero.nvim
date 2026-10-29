@@ -43,19 +43,13 @@ local function step3_preview(ctx, server_name, server_cfg)
     local lines = vim.split(store.format_json(payload) or "{}", "\n")
 
     local height = math.min(math.max(#lines + 2, 8), 25)
-    local buf, win = float.create({
+    local buf, _, close = float.menu({
         title = "Preview LSP entry: " .. ctx.project_name,
         footer = "<CR>:Save | <C-e>:Edit | <Esc>:Cancel",
         width = 80,
         height = height,
-    })
-
-    vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
-    vim.api.nvim_set_option_value("filetype", "json", { buf = buf })
-    vim.api.nvim_set_option_value("modifiable", false, { buf = buf })
-    vim.api.nvim_set_option_value("buftype", "nofile", { buf = buf })
-
-    local function close() float.close(win, buf) end
+    }, lines)
+    vim.bo[buf].filetype = "json"
 
     vim.keymap.set("n", "<CR>", function()
         close()
@@ -74,9 +68,6 @@ local function step3_preview(ctx, server_name, server_cfg)
             save_and_prewarm(ctx, server_name, new_cfg)
         end)
     end, { buffer = buf, silent = true })
-
-    vim.keymap.set("n", "<Esc>", close, { buffer = buf, silent = true })
-    vim.keymap.set("n", "q", close, { buffer = buf, silent = true })
 end
 
 -- ---------------------------------------------------------------------------
@@ -153,17 +144,12 @@ local function step1_pick(ctx)
     local lines = vim.tbl_map(function(r) return r.label end, rows)
 
     local height = math.min(math.max(#lines, 8), 20)
-    local buf, win = float.create({
+    local buf, win, close = float.menu({
         title = "Add LSP to " .. ctx.project_name,
         footer = "<CR>:Select | r:Refresh bins | <Esc>:Cancel",
         width = 60,
         height = height,
-    })
-    vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
-    vim.api.nvim_set_option_value("modifiable", false, { buf = buf })
-    vim.api.nvim_set_option_value("buftype", "nofile", { buf = buf })
-
-    local function close() float.close(win, buf) end
+    }, lines)
 
     local function selected_row()
         local idx = vim.api.nvim_win_get_cursor(win)[1]
@@ -194,9 +180,6 @@ local function step1_pick(ctx)
             log.warn("no mason bins found, manual entry only")
         end
     end, { buffer = buf, silent = true })
-
-    vim.keymap.set("n", "<Esc>", close, { buffer = buf, silent = true })
-    vim.keymap.set("n", "q", close, { buffer = buf, silent = true })
 
     -- Position cursor at first non-empty row if possible.
     if rows[1] and rows[1].kind ~= "empty" then

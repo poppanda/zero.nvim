@@ -68,23 +68,15 @@ function M.show_project_picker()
     -- 高度 10..20 行
     local win_height = math.min(math.max(#names, 10), 20)
 
-    local buf, win = float.create({
+    local buf, win, close = float.menu({
         title = "Zero Projects",
         footer = "<CR>:Open | <C-a>:Add | <C-e>:Edit | <C-d>:Del | <C-l>:Add LSP | <C-h>:Check",
         width = final_width,
         height = win_height,
-    })
-
-    vim.api.nvim_buf_set_lines(buf, 0, -1, false, display_lines)
-    vim.api.nvim_set_option_value("modifiable", false, { buf = buf })
-    vim.api.nvim_set_option_value("buftype", "nofile", { buf = buf })
+    }, display_lines)
 
     local function get_selected_name()
         return names[vim.api.nvim_win_get_cursor(win)[1]]
-    end
-
-    local function close()
-        float.close(win, buf)
     end
 
     local function refresh()
@@ -160,38 +152,26 @@ function M.show_project_picker()
             M.check_health(name)
         end
     end, { buffer = buf, silent = true })
-
-    vim.keymap.set("n", "q", close, { buffer = buf, silent = true })
-    vim.keymap.set("n", "<Esc>", close, { buffer = buf, silent = true })
 end
 
 --- Open a health check window with initial lines
 ---@param name string Project name
 ---@param lines string[] Initial lines
----@return integer buf, integer win, function update_line
+---@return fun(idx: integer, text: string) update_line
 local function open_health_window(name, lines)
-    local buf, win = float.create({
+    local buf = float.menu({
         title = "Health Check: " .. name,
         width = 60,
         height = math.max(#lines + 2, 5),
-    })
-    vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
-    vim.api.nvim_set_option_value("modifiable", false, { buf = buf })
-    vim.api.nvim_set_option_value("buftype", "nofile", { buf = buf })
+    }, lines)
 
-    local close = function() float.close(win, buf) end
-    vim.keymap.set("n", "q", close, { buffer = buf })
-    vim.keymap.set("n", "<Esc>", close, { buffer = buf })
-
-    --- Update a specific line (1-based index)
-    local function update_line(idx, text)
+    --- Update a specific line (1-based index); 多行错误信息压成一行
+    return function(idx, text)
         if not vim.api.nvim_buf_is_valid(buf) then return end
         vim.bo[buf].modifiable = true
-        vim.api.nvim_buf_set_lines(buf, idx - 1, idx, false, { text })
+        vim.api.nvim_buf_set_lines(buf, idx - 1, idx, false, { (text:gsub("%s*\n%s*", " ")) })
         vim.bo[buf].modifiable = false
     end
-
-    return buf, win, update_line
 end
 
 --- Run health check for a project
@@ -231,7 +211,7 @@ function M.check_health(project_name_or_args)
     end
 
     -- Open window immediately
-    local _, _, update_line = open_health_window(name, lines)
+    local update_line = open_health_window(name, lines)
 
     -- Run checks asynchronously
     vim.schedule(function()

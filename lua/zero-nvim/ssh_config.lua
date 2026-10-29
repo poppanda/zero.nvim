@@ -7,9 +7,10 @@ local M = {}
 
 local DEFAULT_PATH = vim.fn.expand("~") .. "/.ssh/config"
 
---- Daemon RPC（按需启动 daemon）；失败返回 nil。
+--- Daemon RPC（按需启动 daemon）；失败返回 nil。daemon 二进制缺失时静默
+--- 走本地解析（:ZeroLink 每次 Tab 补全都会调到这里，不能每次报错）。
 local function rpc(method, ...)
-    local chan = daemon.ensure()
+    local chan = daemon.ensure({ quiet = true })
     if not chan then return nil end
     local ok, res = pcall(vim.fn.rpcrequest, chan, method, ...)
     if ok and type(res) == "table" then return res end

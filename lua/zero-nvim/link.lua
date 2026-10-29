@@ -57,7 +57,7 @@ function M.run(args)
 
     if not target or target == "" then
         require("zero-nvim.ui.host_picker").pick_host(ssh_config.parse(), function(entry)
-            browse(entry.user or ssh_config.default_user(), entry.hostname or entry.host, entry.port or 22, entry.host)
+            browse(entry.user or ssh_config.default_user(), entry.hostname or entry.host, entry.port or uri.DEFAULT_PORT, entry.host)
         end)
         return
     end

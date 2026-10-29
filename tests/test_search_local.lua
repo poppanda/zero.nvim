@@ -22,35 +22,63 @@ search.last.query = ""
 search.open_ui({ is_local = true, initial_path = dir })
 local s = search.current_session
 
-local function run(query)
-    -- 改 query 走 on_lines 防抖（350ms）触发搜索，再等 rg 结束 + 预览防抖
-    vim.api.nvim_buf_set_lines(s.input_buf, 0, -1, false, { query })
-    vim.wait(450, function() return false end)
-    vim.wait(3000, function() return s.job_id == nil end, 10)
-    vim.wait(200, function() return false end)
+--- 等本轮搜索完全落定：代号已换（防抖已触发）、rg 已结束、无待执行的增量渲染。
+--- 不用固定 sleep：防抖 / 节流 timer 在负载下会晚到。
+local function wait_settled(gen)
+    local ok = vim.wait(5000, function()
+        return s.id ~= gen and s.job_id == nil and not s.render_scheduled
+    end, 10)
+    check(ok, "search did not settle")
 end
 
--- 1. 结果树：2 个文件 + spacer，匹配行带行号
-run("needle")
-check(#s.files == 2 and s.match_count == 3, "expected 2 files / 3 matches, got " .. #s.files .. "/" .. s.match_count)
-local lines = vim.api.nvim_buf_get_lines(s.results_buf, 0, -1, false)
-check(#lines == #s.nodes, "one node per rendered line")
-check(lines[2]:match("^%s+1 │ local needle"), "match row: " .. tostring(lines[2]))
-check(s.selected_index == 1 and s.nodes[1].type == "file", "first row selected")
+local function run(query)
+    -- 改 query 走 on_lines 防抖（350ms）触发搜索
+    local gen = s.id
+    vim.api.nvim_buf_set_lines(s.input_buf, 0, -1, false, { query })
+    wait_settled(gen)
+end
 
--- 2. 预览：选中 match 行后预览窗口显示文件内容
 local function press(buf, lhs)
     for _, m in ipairs(vim.api.nvim_buf_get_keymap(buf, "n")) do
         if m.lhs == lhs then return m.callback() end
     end
     error("no mapping " .. lhs)
 end
+
+--- 等选中节点的预览渲染完（预览有 100ms 防抖）
+local function wait_preview()
+    local node = s.nodes[s.selected_index]
+    local key = node.file .. "\n" .. tostring(node.lnum) .. ":" .. tostring(node.col)
+    check(vim.wait(2000, function() return s.preview_key == key end, 10), "preview not rendered")
+end
+
+-- 1. 结果树：2 个文件 + spacer，匹配行带行号（rg 多线程，文件顺序不固定）
+run("needle")
+check(#s.files == 2 and s.match_count == 3, "expected 2 files / 3 matches, got " .. #s.files .. "/" .. s.match_count)
+local lines = vim.api.nvim_buf_get_lines(s.results_buf, 0, -1, false)
+check(#lines == #s.nodes, "one node per rendered line")
+local a_row
+for i, n in ipairs(s.nodes) do
+    if n.type == "file" and n.file:match("/a%.lua$") then a_row = i end
+end
+check(a_row and lines[a_row + 1]:match("^%s+1 │ local needle"), "match row: " .. tostring(a_row and lines[a_row + 1]))
+check(s.selected_index == 1 and s.nodes[1].type == "file", "first row selected")
+
+-- 2. 预览：选中 match 行后预览窗口显示文件内容
 press(s.results_buf, "j")
-vim.wait(300, function() return false end)
 local node = s.nodes[s.selected_index]
-check(node.type == "match", "j moves onto a match row")
+check(s.selected_index == 2 and node.type == "match", "j moves onto a match row")
+wait_preview()
 local pv = vim.api.nvim_buf_get_lines(s.preview_buf, 0, -1, false)
-check(#pv == 2 and pv[1]:match("needle"), "preview shows file content: " .. vim.inspect(pv))
+local expect = vim.fn.readfile(node.file)
+check(vim.deep_equal(pv, expect), "preview shows file content: " .. vim.inspect(pv))
+
+-- 2b. 带上次 query 重开：恢复上次选中位置
+search.close_ui()
+search.open_ui({ is_local = true, initial_path = dir })
+s = search.current_session
+wait_settled(-1)
+check(s.selected_index == 2, "selection restored on reopen, got " .. s.selected_index)
 
 -- 3. 清空 query：结果清空，旧代号被换掉
 local gen = s.id

@@ -16,8 +16,8 @@
 ## 2. 涉及的文件 (Files Involved)
 
 *   **`daemon/src/lsp.rs`**: TCP-to-SSH 代理的 Rust 核心实现。它负责衍生 `ssh` 子进程、管理双向传输线程，以及执行 `pump_and_translate` 函数，该函数解析类似 HTTP 的请求头并重写 JSON 载荷。
-*   **`lua/zero-nvim/lsp.lua`**: 评估 Neovim 缓冲区的 URI（`remote://` 或 `oil-zero://`），触发对守护进程的 `lsp_start` RPC 调用，并使用 `vim.lsp.start_client` 附加 Neovim 的 LSP 客户端。
-*   **`lua/zero-nvim/init.lua`**: 注册 `:ZeroLspStart` 命令。它还处理连接状态 (`ensure_connection`)、异步扫描远程 `~/.local/share/nvim/mason/bin` 目录，并缓存这些二进制文件，以便为 `:ZeroLspStart` 命令提供丰富的自动补全功能。
+*   **`lua/zero-nvim/lsp.lua`**（现为 `lua/zero-nvim/lsp/init.lua`）: 评估 Neovim 缓冲区的 URI（`remote://` 或 `oil-zero://`），触发对守护进程的 `lsp_start` RPC 调用，并使用 `vim.lsp.start_client` 附加 Neovim 的 LSP 客户端。
+*   **`lua/zero-nvim/init.lua`**: 注册 `:ZeroLspStart` 命令（连接管理现在在 `remote.lua`，mason bins 扫描在 `lsp/init.lua`）。它还处理连接状态 (`ensure_connection`)、异步扫描远程 `~/.local/share/nvim/mason/bin` 目录，并缓存这些二进制文件，以便为 `:ZeroLspStart` 命令提供丰富的自动补全功能。
 
 ## 3. 已解决的问题 (Recently Resolved Issues)
 
@@ -53,7 +53,7 @@
 
 ### 实施的变更 (Implemented Changes)
 
-1.  **`lua/zero-nvim/lsp.lua`**:
+1.  **`lua/zero-nvim/lsp.lua`**（现为 `lua/zero-nvim/lsp/init.lua`）:
     -   `start_lsp` 函数现在接受 `settings` 参数，允许传递服务器特定的配置（如 `pythonPath`）。
     -   添加了 `before_init` 钩子，强制设置 `params.processId = vim.NIL`。
     -   增强了 `capabilities` 处理，禁用了 `workspace.didChangeWatchedFiles.dynamicRegistration`，防止服务器发送不必要的 `client/registerCapability` 请求（虽然 Neovim 能处理，但远程文件监控通常不支持或开销大）。

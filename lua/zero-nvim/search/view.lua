@@ -8,7 +8,6 @@ local type_picker = require("zero-nvim.search.type_picker")
 
 local M = {}
 
-local ui_seq = 0
 local DEBOUNCE_MS = 350
 local ns = vim.api.nvim_create_namespace("ZeroSearchUI")
 local cursor_ns = vim.api.nvim_create_namespace("zero_search_cursor")
@@ -207,19 +206,9 @@ function M.open(session, opts, cb)
         end
     end
 
-    -- 任一浮窗被关闭（:q / <C-w>o / :only 等非 q/<Esc> 路径）→ 整个 UI 一起关。
-    -- 每个 UI 实例一个 augroup，teardown 时由 search.close_ui 删除。
-    ui_seq = ui_seq + 1
-    session.augroup = vim.api.nvim_create_augroup("ZeroSearchUI_" .. ui_seq, { clear = true })
-    for _, win in ipairs({ session.path_win, session.input_win, session.results_win, session.preview_win }) do
-        vim.api.nvim_create_autocmd("WinClosed", {
-            group = session.augroup,
-            pattern = tostring(win),
-            once = true,
-            -- WinClosed 期间不能关别的窗口，延到下一 tick
-            callback = function() vim.schedule(cb.on_close) end,
-        })
-    end
+    -- 任一浮窗被关闭（非 q/<Esc> 路径）→ 整个 UI 一起关；augroup 由 search.close_ui 删除
+    session.augroup = float.on_any_closed(
+        { session.path_win, session.input_win, session.results_win, session.preview_win }, cb.on_close)
 
     M.focus(session, "query")
     vim.cmd("startinsert!")

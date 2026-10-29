@@ -10,7 +10,7 @@ We have provided a self-contained Lua test script that mocks the system SSH call
 Execute the following command from the project root:
 
 ```bash
-nvim -l tests/test_zero_milestone1.lua
+nvim -l tests/test_zero_milestone1.lua   # removed; current suite: make test-lua
 ```
 
 ### What it Tests

@@ -32,15 +32,12 @@ function M.browse_path(user, hostname, port, on_confirm, opts)
     local raw_entries = {} -- daemon 返回的完整列表
     local shown = {}       -- 过滤 + 排序后实际显示的条目（第 1 行是 ".."）
 
-    local buf, win = float.create({
+    local buf, win, close = float.menu({
         title = display_name .. ":" .. current_path,
         footer = "CR:Enter | -:Parent | C-s:Open | .:Hidden | q:Cancel",
         width = WIDTH,
         height = 10, -- initial; resized in render()
-    })
-    vim.bo[buf].buftype = "nofile"
-    vim.bo[buf].modifiable = false
-    local function close() float.close(win, buf) end
+    }, {})
 
     local function render()
         shown = {}
@@ -119,8 +116,6 @@ function M.browse_path(user, hostname, port, on_confirm, opts)
         show_hidden = not show_hidden
         render() -- 同一份 raw_entries，不重新拉取
     end, map_opts)
-    vim.keymap.set("n", "q", close, map_opts)
-    vim.keymap.set("n", "<Esc>", close, map_opts)
 
     load_dir(current_path)
 end

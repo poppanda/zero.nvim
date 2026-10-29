@@ -9,7 +9,7 @@ manual procedures for verifying each one.
 |---------|---------------|--------|
 | Workspace root injection | `lsp.lua` `before_init` patch | ✅ |
 | Diagnostics URI mapping | `lsp.rs` `pump_and_translate` (SSH→TCP) | ✅ |
-| Cross-file jump (Go-to-Definition) | `init.lua` `locations_to_items` patch | ✅ |
+| Cross-file jump (Go-to-Definition) | `locations_to_items` patch (now `lsp/locations.lua`) | ✅ |
 | Find References cross-file | same `locations_to_items` patch | ✅ |
 | LSP lifecycle stop command | `:ZeroLspStop` | ✅ |
 
@@ -61,7 +61,7 @@ internal workspace folder URIs.
 
 4. Capture the raw `initialize` request by checking the debug log:
    ```bash
-   cat /tmp/daemon_ssh*
+   cat /tmp/daemon_ssh*   # removed: the daemon no longer writes raw LSP logs; use :LspLog with vim.lsp.set_log_level('debug')
    ```
    Look for a JSON block with `"method":"initialize"`. Verify:
    - `"rootUri"` is `"file:///home/user/my_project"` (not `zero://...`)
@@ -126,7 +126,7 @@ because the simple string replacement covers all URI occurrences in the body.
 
 4. Check the raw LSP traffic log to confirm translation:
    ```bash
-   grep '"method":"textDocument/publishDiagnostics"' /tmp/debug_ssh_raw.log
+   grep '"method":"textDocument/publishDiagnostics"' /tmp/debug_ssh_raw.log   # removed log (see the note on /tmp/daemon_ssh* above)
    ```
    The log should show `file:///home/user/...` (remote side) while Neovim sees
    `zero://user@host:22/...`.
@@ -143,7 +143,9 @@ the correct `zero://` buffer.
 
 ### What was implemented
 
-`init.lua` patches `vim.lsp.util.locations_to_items` at setup time. Before
+`init.lua` patches `vim.lsp.util.locations_to_items` at setup time (the patch now lives in
+`lua/zero-nvim/lsp/locations.lua`; `handle_fetch` no longer exists — missing files are
+batch-fetched with `fetch_paths` and loaded via `bufload`). Before
 handing locations back to Neovim's jump machinery, the patch:
 
 1. Calls `vim.fn.bufadd(uri)` for any `zero://` URI not yet in a buffer
@@ -258,6 +260,6 @@ This is an additional workspace-level feature enabled by M6's URI translation.
 |---------|-------------|-----|
 | `rootUri` is `zero://...` in initialize log | `before_init` not running (old Neovim?) | Ensure Neovim ≥ 0.10; check `vim.lsp.start_client` supports `before_init` |
 | Diagnostics show on wrong line | LSP using 0-indexed lines | Set `offset_encoding` in `start_lsp` |
-| `gd` opens `file:///path` instead of `zero://...` | `pump_and_translate` not translating | Confirm daemon was rebuilt (`make build`); check `/tmp/daemon_ssh*` logs |
-| Jump lands on empty buffer | `handle_fetch` failed silently | Check daemon connection: `:ZeroLspStop` + reconnect, look at WARN notifications |
+| `gd` opens `file:///path` instead of `zero://...` | `pump_and_translate` not translating | Confirm daemon was rebuilt (`make build`); run with `ZERO_NVIM_DEBUG=1` and check daemon WARN notifications / `/tmp/zero-daemon.log` |
+| Jump lands on empty buffer | `fetch_paths` preload failed (`lsp/locations.lua`) | Check daemon connection: `:ZeroLspStop` + reconnect, look at WARN notifications |
 | `:ZeroLspStop` says "no matching client" | LSP name mismatch | Try exact name from `:LspInfo` (prefix `zero-` is stripped automatically) |

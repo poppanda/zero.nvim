@@ -8,6 +8,7 @@ local M = {}
 local state = {
     channel_id = nil,
     leaving = false, -- VimLeavePre 之后 daemon 退出属于正常流程，不再报错
+    missing_logged = false, -- "binary not found" 每个会话只提示一次
     exit_listeners = {},
 }
 
@@ -74,13 +75,19 @@ function M.channel()
 end
 
 --- Daemon channel, starting the daemon on demand. Returns nil when the
---- binary cannot be found / started (an error has been logged).
+--- binary cannot be found / started. A missing binary is logged at most once
+--- per session, and never with opts.quiet (callers that have a local fallback,
+--- e.g. ssh_config during command-line completion).
+---@param opts? { quiet?: boolean }
 ---@return integer?
-function M.ensure()
+function M.ensure(opts)
     if state.channel_id then return state.channel_id end
     local bin_path = find_bin()
     if not bin_path then
-        log.error("Daemon binary not found. Build it with `make build` (or set daemon.path).")
+        if not (opts and opts.quiet) and not state.missing_logged then
+            state.missing_logged = true
+            log.error("Daemon binary not found. Build it with `make build` (or set daemon.path).")
+        end
         return nil
     end
     local job

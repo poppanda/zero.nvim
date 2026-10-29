@@ -9,7 +9,7 @@ Our search requires offloading `rg` (ripgrep) workload to the remote daemon to a
 *   `daemon/src/main.rs`
     *   **Focus**: Look at the RPC method registration block for `global_search`.
     *   **Key Changes**: Notice how we extract the new boolean flags `case_sensitive` and `whole_word`, unpacking them from the MsgPack parameters before passing them to the handler.
-*   `daemon/src/search.rs`
+*   `daemon/src/search.rs` (removed; remote search now runs through `daemon/src/cmd/` `cmd_stream`)
     *   **Focus**: `handle_global_search` and `run_search` functions.
     *   **Key Changes**: Pay attention to how the `run_search` function dynamically constructs the raw shell command for `rg`. See how it appends `--case-sensitive`, `--ignore-case`, and `--word-regexp` based on the UI toggles. The results are chunked and streamed back via Msgpack-RPC.
 
@@ -17,7 +17,7 @@ Our search requires offloading `rg` (ripgrep) workload to the remote daemon to a
 
 The Search subsystem operates through complex floating window manipulations. 
 
-*   `lua/zero-nvim/ui.lua`
+*   `lua/zero-nvim/ui.lua` (now `lua/zero-nvim/search/view.lua`)
     *   **Focus**: The massive `M.open_search_ui` function.
     *   **Key Changes**: 
         *   **Footer generation**: Notice how the `update_input_footer` function is bound to the flag state map (`toggle_state.case_sensitive` / `whole_word`) to draw checkbox-like indicators `[x]Aa`.
@@ -28,7 +28,7 @@ The Search subsystem operates through complex floating window manipulations.
 
 This file ties the remote RPC streaming, the local job fallback, and the complex Tree-View UI logic together.
 
-*   `lua/zero-nvim/search.lua`
+*   `lua/zero-nvim/search.lua` (now `lua/zero-nvim/search/init.lua`)
     *   **Focus 1: Execution & Fallback Core** (`M.live_grep`, `M.execute_search`, `M.open_ui`)
         *   Check `M.live_grep` first: See how it parses `vim.api.nvim_buf_get_name(0)` to figure out if we are acting on a local path or an `oil-zero://` / `remote://` network path.
         *   Follow into `M.execute_search`: Observe how we selectively call `vim.fn.jobstart({"rg", ...})` for local paths, and `zero.global_search()` for remote paths via RPC, unifying their output consumption paths.

@@ -1,5 +1,6 @@
 --- 通用浮窗组件：居中浮窗、单行输入框、JSON 编辑窗、开关 footer 文案。
 local util = require("zero-nvim.util")
+local log = require("zero-nvim.log")
 
 local M = {}
 
@@ -34,6 +35,44 @@ function M.create(opts)
     vim.api.nvim_set_option_value("cursorline", true, { win = win })
 
     return buf, win
+end
+
+--- Centered read-only list float: `lines` filled in, buffer non-modifiable,
+--- q / <Esc> close it. (nvim_create_buf(false, true) is already buftype=nofile.)
+---@param opts { title?: string, footer?: string, width?: number, height?: number }
+---@param lines string[]
+---@return integer buf, integer win, fun() close
+function M.menu(opts, lines)
+    local buf, win = M.create(opts)
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+    vim.bo[buf].modifiable = false
+    local function close() M.close(win, buf) end
+    for _, lhs in ipairs({ "q", "<Esc>" }) do
+        vim.keymap.set("n", lhs, close, { buffer = buf, silent = true, nowait = true })
+    end
+    return buf, win, close
+end
+
+local group_seq = 0
+
+--- 多窗口 UI：其中任一窗口被外部关闭（:q / <C-w>o / :only）时调 on_close
+--- （schedule 到下一 tick：WinClosed 期间不能关别的窗口）。返回 augroup，
+--- teardown 时先删掉它，主动关窗才不会再回调。
+---@param wins integer[]
+---@param on_close fun()
+---@return integer augroup
+function M.on_any_closed(wins, on_close)
+    group_seq = group_seq + 1
+    local group = vim.api.nvim_create_augroup("ZeroNvimFloatGroup_" .. group_seq, { clear = true })
+    for _, win in ipairs(wins) do
+        vim.api.nvim_create_autocmd("WinClosed", {
+            group = group,
+            pattern = tostring(win),
+            once = true,
+            callback = function() vim.schedule(on_close) end,
+        })
+    end
+    return group
 end
 
 --- Close a floating window safely
@@ -112,7 +151,7 @@ function M.edit_json(name, tbl, on_save)
     vim.api.nvim_set_option_value("filetype", "json", { buf = buf })
     vim.api.nvim_set_option_value("modifiable", true, { buf = buf })
 
-    vim.notify("Edit config and write (:w) to save. Close window to cancel.", vim.log.levels.INFO)
+    log.info("Edit config and write (:w) to save. Close window to cancel.")
 
     -- Auto-save on write
     vim.api.nvim_create_autocmd("BufWriteCmd", {
@@ -121,7 +160,7 @@ function M.edit_json(name, tbl, on_save)
             local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
             local ok, decoded = pcall(vim.json.decode, table.concat(lines, "\n"))
             if not ok then
-                vim.notify("Invalid JSON: " .. tostring(decoded), vim.log.levels.ERROR)
+                log.error("Invalid JSON: " .. tostring(decoded))
                 return
             end
 

@@ -164,7 +164,9 @@ end
 ---@return integer? client_id
 ---@return string? err "STARTING" when another start is in flight
 local function ensure_lsp_client(user, host, port, root_dir, server_name, cmd_args, settings, opts)
+    -- 项目 root "/" 归一化后是 ""：LSP 的 rootUri 需要真实路径
     root_dir = client_select.norm_root(root_dir)
+    if root_dir == "" then root_dir = "/" end
     local lsp_name = client_name(server_name)
     local tkey = uri.target_key(user, host, port)
     local lock_key = client_select.client_key(server_name, user, host, port, root_dir)
@@ -300,11 +302,10 @@ function M.start_lsp(bufnr, cmd_args, settings, opts)
     local root_dir = opts.root_dir
     if not root_dir then
         if project_config and type(project_config.root) == "string" then
-            root_dir = client_select.norm_root(project_config.root)
+            root_dir = project_config.root
         else
-            root_dir = client_select.norm_root(path:sub(-1) == "/" and path or vim.fs.dirname(path))
+            root_dir = path:sub(-1) == "/" and path or vim.fs.dirname(path)
         end
-        if root_dir == "" then root_dir = "/" end
     end
 
     local p_conf = project_config and project_config.lsp and project_config.lsp[server_name]
@@ -353,14 +354,12 @@ end
 function M.prewarm_lsps(user, host, port, project_config)
     if not project_config or type(project_config.lsp) ~= "table" then return end
     if type(project_config.root) ~= "string" then return end
-    local root_dir = client_select.norm_root(project_config.root)
-
     for server_name, server_cfg in pairs(project_config.lsp) do
         local cmd_args = M.server_cmd(server_name, server_cfg)
         -- Schedule each server independently. Daemon RPC is single-threaded so
         -- they end up serialized anyway, but this keeps the trigger non-blocking.
         vim.schedule(function()
-            ensure_lsp_client(user, host, port, root_dir, server_name, cmd_args, server_cfg.settings)
+            ensure_lsp_client(user, host, port, project_config.root, server_name, cmd_args, server_cfg.settings)
         end)
     end
 end
@@ -388,7 +387,7 @@ function M.autostart(buf, ft)
                 if vim.api.nvim_buf_is_valid(buf) then
                     M.start_lsp(buf, M.server_cmd(server_name, server_cfg), nil, {
                         project_config = project_config,
-                        root_dir = client_select.norm_root(project_config.root),
+                        root_dir = project_config.root,
                         server_key = server_name,
                     })
                 end

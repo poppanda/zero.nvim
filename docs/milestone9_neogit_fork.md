@@ -222,7 +222,7 @@ gitsigns 没用到这个能力——它只 `opts.stdin` 一次性传 patch。
 实现要点：
 - `CmdHandle` 增加 `stdin_tx: Mutex<Option<mpsc::Sender<StdinMsg>>>`，
   worker 启动时填上 sender，rx 进 `run_inner`。
-- `exec_stream.rs` 主 poll 循环每次 iteration 排空 stdin queue，把
+- `exec_stream.rs`（现为 `daemon/src/cmd/stream.rs`）主 poll 循环每次 iteration 排空 stdin queue，把
   pending 字节按 chunk 写到 channel（non-blocking write，
   EAGAIN 不阻塞 stdout 读取）；写完队列且收到 close 标志后才 send_eof。
 - spec.stdin 仍然作为快路径保留：caller 一次性传完会立刻
@@ -556,7 +556,7 @@ require("zero-nvim.neogit.backend").setup()
 - **Phase 3C**：`editor_session_open / reply` RPC（§4.5）
 
 ### Phase 3A 已落地的 daemon 改动（不在原计划但必须做）
-- `cmd/dispatch.rs` 的 `handle_cmd_sync` 和 `cmd_stream` sink 把
+- `cmd/dispatch.rs`（现为 `daemon/src/rpc.rs` 分发 + `daemon/src/cmd/mod.rs`）的 `handle_cmd_sync` 和 `cmd_stream` sink 把
   stdout/stderr 由 `Value::Binary` 改成 `Value::String(from_utf8_lossy)`：
   详情见 §6.5 第 1 条。
 - `connect.rs` + `state.rs` 加 per-target exec session 复用 + 后台预热

@@ -4,7 +4,7 @@ This document outlines the testing procedures for Milestone 4. It verifies the n
 
 ## 1. Prerequisites
 
-Ensure the daemon is built with the latest changes (`main.rs` threads & `search.rs` live grep support).
+Ensure the daemon is built with the latest changes (`main.rs` threads & `search.rs` live grep support; `search.rs` has since been replaced by `daemon/src/cmd/`).
 
 ### Build the Daemon
 From the project root:

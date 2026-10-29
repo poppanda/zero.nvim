@@ -1,5 +1,7 @@
 # zero.nvim 通用远程命令基座 — 实施方案
 
+> 注（现状）：最终实现的文件布局与本方案不同——daemon 侧为 `daemon/src/cmd/{mod,spec,stream,batcher}.rs`，分发表在 `daemon/src/rpc.rs`，会话池在 `daemon/src/session.rs`（没有 `exec_sync.rs` / `exec_stream.rs` / `cancel.rs` / `registry.rs` / `dispatch.rs`）；`search.rs` 已删除；Lua 侧搜索在 `lua/zero-nvim/search/{init,view,type_picker}.lua`（无 `ui/search.lua` / `widgets/`）。下文保留原方案。
+
 ## Context
 
 **为什么做**：当前 zero.nvim 的远程命令执行是"面向搜索专化"的——`exec_remote` 只抓 stdout、search 自己写流式逻辑、libssh2 Session 在搜索期间被 Mutex 全程占用、UI 关闭不能取消远端进程。要继续给 git（hunk-level diff、status、stage）和 docker 做远程化，再这样堆下去会彻底变形。

@@ -128,15 +128,15 @@ local function set_selection(session, idx)
     schedule_preview(session)
 end
 
---- 重绘结果树并维持选中项。上次关闭 UI 时的选中位置（M.last.selected_index）
---- 等结果足够多时恢复；final（搜索结束）时结果不够也恢复（夹到最后一项）。
+--- 重绘结果树并维持选中项。session.restore_index（重开 UI 时恢复上次的选中
+--- 位置）等结果足够多时恢复；final（搜索结束）时结果不够也恢复（夹到最后一项）。
 local function render(session, final)
     session.nodes = view.render_results(session, session.truncated and MAX_RESULTS or nil)
-    local restore = M.last.selected_index
-    if restore == 0 then
+    local restore = session.restore_index
+    if not restore then
         set_selection(session, math.max(1, session.selected_index))
     elseif #session.nodes > 0 and (final or #session.nodes >= restore) then
-        M.last.selected_index = 0
+        session.restore_index = nil
         set_selection(session, restore)
     end
 end
@@ -175,8 +175,8 @@ local function cancel_inflight(session)
     session.local_parser = nil
 end
 
---- 新一轮搜索前清空 session 的结果状态和两个 buffer
-local function reset(session, query)
+--- 清空 session 的结果状态（open_ui 初始化 / 每轮搜索前）
+local function reset_results(session, query)
     session.query = query
     session.files = {}
     session.file_map = {}
@@ -187,7 +187,6 @@ local function reset(session, query)
     session.stderr = ""
     session.parse_errors = 0
     session.preview_key = nil
-    view.clear(session)
 end
 
 --- rg 结束（或被 daemon 中断）时汇报错误
@@ -325,7 +324,8 @@ local function run_search(session)
     -- 不能再回填列表
     session.id = next_gen()
     local gen = session.id
-    reset(session, query)
+    reset_results(session, query)
+    view.clear(session)
     if query == "" or path == "" then return end
 
     local function is_live()
@@ -417,12 +417,7 @@ function M.open_ui(opts)
         user = opts.user,
         host = opts.host,
         port = opts.port,
-        files = {},
-        file_map = {},
         file_cache = {},
-        nodes = {},
-        query = "",
-        selected_index = 0,
         id = next_gen(),
         toggle_state = {
             case_sensitive = M.last.case_sensitive,
@@ -430,6 +425,12 @@ function M.open_ui(opts)
             file_types = vim.deepcopy(M.last.file_types),
         },
     }
+    reset_results(session, "")
+    -- 带着上次 query 重开时才恢复上次的选中位置；用户一动（j/k、改 query /
+    -- 开关）就作废，免得流式结果晚到时把选择拽回旧位置
+    if M.last.query ~= "" and M.last.selected_index > 0 then
+        session.restore_index = M.last.selected_index
+    end
     M.current_session = session
 
     -- 回调全部绑定到这个 session：防抖 timer / WinClosed 的 vim.schedule
@@ -439,19 +440,26 @@ function M.open_ui(opts)
             if is_open(session) then return fn(session) end
         end
     end
+    -- 用户主动操作：作废待恢复的选中位置
+    local function user(fn)
+        return live(function()
+            session.restore_index = nil
+            return fn(session)
+        end)
+    end
 
     view.open(session, {
         title = title,
         path = opts.initial_path or M.last.path or "/",
         query = M.last.query,
     }, {
-        on_change = live(run_search),
+        on_change = user(run_search),
         on_close = function() M.close_ui(session) end,
-        on_enter = live(open_selected),
-        on_toggle_fold = live(toggle_fold),
-        on_select_next = live(function() set_selection(session, session.selected_index + 1) end),
+        on_enter = user(open_selected),
+        on_toggle_fold = user(toggle_fold),
+        on_select_next = user(function() set_selection(session, session.selected_index + 1) end),
         -- 返回 true = 已在第一项，交给 view 把焦点移回 query
-        on_select_prev = live(function()
+        on_select_prev = user(function()
             if session.selected_index <= 1 then return true end
             set_selection(session, session.selected_index - 1)
             return false

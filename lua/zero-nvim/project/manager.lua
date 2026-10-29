@@ -6,29 +6,45 @@ local log = require("zero-nvim.log")
 ---@field name string
 ---@field config ZeroProjectConfig
 
+--- Apply `fn` to a private copy of the stored projects and save it. store.load
+--- returns its cache table, so mutating it directly would leave the cache dirty
+--- when the save fails.
+---@param fn fun(projects: table<string, ZeroProjectConfig>): boolean? return false to skip saving
+---@return boolean saved
+local function update(fn)
+    local projects = vim.deepcopy(store.load())
+    if fn(projects) == false then return false end
+    return store.save(projects)
+end
+
 ---Add or update a project
 ---@param name string
 ---@param config ZeroProjectConfig
+---@return boolean ok
 function M.add(name, config)
-    local projects = store.load()
-    projects[name] = config
-    -- Update timestamp
-    projects[name].created_at = os.time()
-    store.save(projects)
-    log.info(string.format("project '%s' saved", name))
+    local ok = update(function(projects)
+        projects[name] = vim.tbl_extend("force", config, { created_at = os.time() })
+    end)
+    if ok then log.info(string.format("project '%s' saved", name)) end
+    return ok
 end
 
 ---Remove a project by name
 ---@param name string
+---@return boolean ok
 function M.remove(name)
-    local projects = store.load()
-    if projects[name] then
+    local found = false
+    local ok = update(function(projects)
+        found = projects[name] ~= nil
+        if not found then return false end
         projects[name] = nil
-        store.save(projects)
+    end)
+    if ok then
         log.info(string.format("project '%s' removed", name))
-    else
+    elseif not found then
         log.warn(string.format("project '%s' not found", name))
     end
+    return ok
 end
 
 ---List all projects
@@ -52,16 +68,15 @@ end
 ---@param server_cfg table
 ---@return boolean ok
 function M.upsert_lsp(project_name, server_name, server_cfg)
-    local projects = store.load()
-    local proj = projects[project_name]
-    if not proj then
-        log.error(string.format("project '%s' not found", project_name))
-        return false
-    end
-    proj.lsp = proj.lsp or {}
-    proj.lsp[server_name] = vim.tbl_deep_extend("force", proj.lsp[server_name] or {}, server_cfg)
-    store.save(projects)
-    return true
+    return update(function(projects)
+        local proj = projects[project_name]
+        if not proj then
+            log.error(string.format("project '%s' not found", project_name))
+            return false
+        end
+        proj.lsp = proj.lsp or {}
+        proj.lsp[server_name] = vim.tbl_deep_extend("force", proj.lsp[server_name] or {}, server_cfg)
+    end)
 end
 
 --- 去掉末尾的 "/"（"/" 本身 -> ""），用于 root 比较。

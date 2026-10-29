@@ -27,6 +27,19 @@ eq(manager.match_project("prod", "/srv/x", "alice", 22), "other", "other host")
 eq(manager.match_project("dev", "/srv/app/x.py"), "alice", "no user/port given: longest root, then explicit (alice) wins tie")
 eq(manager.match_project(nil, "/x"), nil, "nil host")
 
+-- failed save must not dirty the (cached) table store.load returned
+local orig_save = store.save
+store.save = function() return false end
+local cfg = { host = "dev", root = "/tmp/new" }
+eq(manager.add("new", cfg), false, "add reports failed save")
+eq(projects.new, nil, "failed add leaves cache untouched")
+eq(cfg.created_at, nil, "add does not mutate the caller's config")
+eq(manager.upsert_lsp("alice", "pyright", { cmd = { "pyright" } }), false, "upsert reports failed save")
+eq(projects.alice.lsp, nil, "failed upsert leaves cache untouched")
+eq(manager.remove("legacy"), false, "remove reports failed save")
+eq(projects.legacy ~= nil, true, "failed remove leaves cache untouched")
+store.save = orig_save
+
 -- store.format_json: pure Lua, valid JSON, backslashes preserved
 local json = store.format_json({ b = { "x\\y", 1 }, a = { cmd = { "a\"b" } }, e = {} })
 local decoded = vim.json.decode(json)

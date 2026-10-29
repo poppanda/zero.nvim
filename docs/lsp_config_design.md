@@ -53,11 +53,11 @@ require("zero-nvim").setup({
 *   **Defaults**: `defaults` 表中新增了 `lsp = { servers = {} }` 字段。
 *   **Command**: `:ZeroLspStart` 命令被更新。当用户执行 `:ZeroLspStart <server_name> [args...]` 时：
     1.  提取第一个参数 `<server_name>`（例如 `basedpyright-langserver`）。
-    2.  在 `options.lsp.servers` 中查找该名称对应的配置。
+    2.  在 `options.lsp.servers`（已移除：LSP 配置现在只在项目 JSON 的 `lsp.<name>` 中）中查找该名称对应的配置。
     3.  如果找到配置且包含 `settings` 字段，提取该 `settings` 表。
     4.  调用 `require("zero-nvim.lsp").start_lsp(0, args, settings)`，将设置传递给核心 LSP 启动函数。
 
-### 2. `lua/zero-nvim/lsp.lua`
+### 2. `lua/zero-nvim/lsp.lua`（现为 `lua/zero-nvim/lsp/init.lua`）
 
 *   **`start_lsp` Function**: 签名更新为 `start_lsp(bufnr, cmd_args, settings)`。
 *   **`vim.lsp.start_client`**: 接收传入的 `settings` 参数。这确保了 LSP 服务器在初始化 (`initialize` 请求) 或初始化后 (`workspace/configuration` 请求) 能够接收到正确的配置。

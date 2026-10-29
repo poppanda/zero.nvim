@@ -4,7 +4,6 @@ local util = require("zero-nvim.util")
 
 local M = {}
 
-local ui_seq = 0
 local WIDTH = 50
 
 --- 结果行前缀：普通模式一行一个匹配；替换模式每个匹配两行（🟥 原文 / 🟩 替换后）
@@ -211,16 +210,7 @@ function M.create_ui(state)
     })
 
     -- 任一浮窗被关（:q / <C-w>o 等）→ 两个一起关并清理 timer / 高亮
-    ui_seq = ui_seq + 1
-    state.augroup = vim.api.nvim_create_augroup("ZeroSearchMiniUI_" .. ui_seq, { clear = true })
-    for _, win in ipairs({ state.input_win, state.results_win }) do
-        vim.api.nvim_create_autocmd("WinClosed", {
-            group = state.augroup,
-            pattern = tostring(win),
-            once = true,
-            callback = function() vim.schedule(function() M.close_ui(state) end) end,
-        })
-    end
+    state.augroup = float.on_any_closed({ state.input_win, state.results_win }, function() M.close_ui(state) end)
 
     vim.wo[state.input_win].winhl = "NormalFloat:TelescopePromptNormal,FloatBorder:TelescopePromptBorder"
     vim.wo[state.input_win].wrap = false

@@ -4,7 +4,7 @@ build:
 	cd daemon && cargo build
 
 clean:
-	rm -f /tmp/daemon_ssh* /tmp/debug_ssh_raw.log
+	rm -f /tmp/zero-daemon.log
 
 test: test-rust test-lua
 

@@ -31,7 +31,7 @@
     将涉及多个文件的 RPC 请求合并为单个 `fetch_paths` 批量接口；并从前端剥离阻塞逻辑，对非强一致性要求的文件预览采用异步加载机制（Coroutine / Callback）。
 *   **代码改动方向**：
     *   **Rust (Daemon)**：新增 `handle_fetch_paths(paths: Vec<String>)`。遍历传入的路径并启动多线程并发执行读取（或在单线程异步中并发调度），将结果聚合成 `HashMap<String, FileData>` 形式返回。
-    *   **Lua (Neovim)**：在 `init.lua` 修改 `locations_to_items` 的钩子逻辑。在收到 LSP 结果的多个 URI 后，收集所有未加载的内容，一次性发送给 Daemon，而非在 for 循环中分别 `handle_fetch`。
+    *   **Lua (Neovim)**：在 `init.lua`（现为 `lua/zero-nvim/lsp/locations.lua`）修改 `locations_to_items` 的钩子逻辑。在收到 LSP 结果的多个 URI 后，收集所有未加载的内容，一次性发送给 Daemon，而非在 for 循环中分别 `handle_fetch`。
 
 ### 2. 驻留持久化 Shell 通道 (Persistent PTY Shell)
 **解决的问题：** `exec` 开启子 Channel 时的隐性握手延迟。
@@ -60,7 +60,7 @@
     当我们在全局搜索文件内容或文件名并获得命中的文件列表后，利用搜索返回等待用户操作的空闲时间，静默触发后端异步拉取前 10~20 个热门结果文件的内容进入内存。
 *   **代码改动方向**：
     *   **Rust (Daemon)**：增加 `prewarm_cache` 接口，接收一批文件路径，并开启后台非阻塞线程去缓存这些文件到 `DaemonState.caches`。
-    *   **Lua (Neovim)**：在 `search.lua` 中修改 `Telescope` 或自定义 Picker 的数据回调钩子。在列表呈现出来的第一帧，向守护进程发送 `rpcnotify`（异步非阻塞），让守护进程悄悄干活。
+    *   **Lua (Neovim)**：在 `search.lua`（现为 `lua/zero-nvim/search/init.lua`）中修改 `Telescope` 或自定义 Picker 的数据回调钩子。在列表呈现出来的第一帧，向守护进程发送 `rpcnotify`（异步非阻塞），让守护进程悄悄干活。
 
 ---
 
