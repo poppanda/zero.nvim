@@ -25,7 +25,7 @@ use crate::session::{get_conn, shell_quote};
 use crate::state::{LockExt, SharedState, Target};
 use anyhow::Context;
 use rmpv::Value;
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -263,7 +263,6 @@ fn run_lsp_proxy(
 
     // 持续消费 ssh stderr（防止管道写满阻塞子进程），转发到 daemon stderr 让 Neovim 看到
     thread::spawn(move || {
-        use std::io::{BufRead, BufReader};
         for l in BufReader::new(child_stderr).lines().map_while(Result::ok) {
             eprintln!("[SSH-ERR] {}", l);
         }
@@ -283,7 +282,7 @@ fn run_lsp_proxy(
     let from = client_prefix.to_string();
     let child_a = child.clone();
     thread::spawn(move || {
-        let (mut r, mut w) = (tcp_stream, child_stdin);
+        let (mut r, mut w) = (BufReader::new(tcp_stream), child_stdin);
         let _ = pump_and_translate(&mut r, &mut w, &from, FILE_PREFIX, "TCP->SSH");
         // Neovim 断开：关 ssh stdin（远端 LSP 读到 EOF），关 TCP，宽限后杀 ssh
         drop(w);
@@ -292,7 +291,7 @@ fn run_lsp_proxy(
     });
 
     // 当前线程：ssh stdout → TCP (Neovim)：file:/// → zero://user@host:port/
-    let (mut r, mut w) = (child_stdout, tcp_writer);
+    let (mut r, mut w) = (BufReader::new(child_stdout), tcp_writer);
     let _ = pump_and_translate(&mut r, &mut w, FILE_PREFIX, client_prefix, "SSH->TCP");
     // 远端 LSP / ssh 退出：shutdown 让 Neovim 立刻看到 EOF，并让 Thread 1 的 read 返回
     let _ = tcp_ctl_b.shutdown(Shutdown::Both);
@@ -389,7 +388,7 @@ fn pump_and_translate<R: Read, W: Write>(
         let mut headers = String::new();
         let mut content_length: Option<usize> = None;
 
-        // 1. Read headers byte by byte until \r\n\r\n
+        // 1. Read headers byte by byte until \r\n\r\n（reader 已带缓冲，不是逐字节 syscall）
         loop {
             let mut byte = [0u8; 1];
             let n = reader.read(&mut byte)?;
@@ -462,11 +461,7 @@ fn pump_and_translate<R: Read, W: Write>(
 ///
 /// from / to 均不带结尾 `/`（如 "zero://u@h:22"、"file://"）。
 fn rewrite_uri_prefix(body: &str, from: &str, to: &str) -> String {
-    let pat = format!("\"{}/", from);
-    if !body.contains(&pat) {
-        return body.to_string();
-    }
-    body.replace(&pat, &format!("\"{}/", to))
+    body.replace(&format!("\"{}/", from), &format!("\"{}/", to))
 }
 
 #[cfg(test)]

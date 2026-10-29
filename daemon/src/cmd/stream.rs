@@ -7,7 +7,8 @@
 //   * 每条流式命令从 exec 池**取走**一个 Session 独占（见 session.rs），结束后归还。
 //   * 单个 worker 线程内部：blocking exec → 切到 non-blocking 后 poll。libssh2 不是
 //     线程安全的，所以 stdout / stderr / stdin 都在同一线程里交错读写。
-//   * stderr 头一行解析 "ZERO_PID:<n>"（由 spec.rs 的 PID 包装打出），cancel 升级时用。
+//   * stderr（pty 模式下是 stdout）头一行解析 "ZERO_PID:<n>"（由 spec.rs 的 PID
+//     包装打出），cancel 升级时用。
 //   * cancel 三档升级：close channel（远端 SIGPIPE）→ 3s grace → kill -TERM → 2s →
 //     kill -KILL。TERM/KILL 打整个进程组，在后台线程经共享会话发出，不延迟 Aborted 事件。
 //
@@ -24,15 +25,15 @@ use super::spec::RemoteCommand;
 use crate::connect::open_dedicated_session;
 use crate::rpc::Outbox;
 use crate::session::{
-    exec_pool_clear, exec_pool_put, exec_pool_take, exec_shared, is_session_dead,
-    DEFAULT_TIMEOUT_MS,
+    exec_pool_clear, exec_pool_put, exec_pool_take, exec_shared, is_session_dead, is_would_block,
+    DEFAULT_TIMEOUT_MS, EAGAIN,
 };
 use crate::state::{LockExt, SharedState, Target};
 use anyhow::Context;
 use rmpv::Value;
 use ssh2::{Channel, Session};
 use std::collections::VecDeque;
-use std::io::{ErrorKind, Read, Write};
+use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread;
@@ -42,8 +43,6 @@ use std::time::{Duration, Instant};
 const CANCEL_GRACE: Duration = Duration::from_secs(3);
 /// TERM 之后到 KILL 的间隔
 const TERM_TO_KILL: Duration = Duration::from_secs(2);
-/// libssh2 的 EAGAIN
-const EAGAIN: ssh2::ErrorCode = ssh2::ErrorCode::Session(-37);
 
 /// 命令产生的事件
 #[derive(Debug)]
@@ -340,7 +339,9 @@ impl Worker {
                 Ok(0) => {}
                 Ok(n) => {
                     idle = false;
-                    batcher.feed_stdout(&buf_out[..n]);
+                    // pty 把 stderr 并进 stdout：PID 行会出现在 stdout 开头
+                    let data = &buf_out[..n];
+                    batcher.feed_stdout(if self.cmd.pty { pid.feed(data) } else { data });
                 }
                 Err(e) if is_would_block(&e) => {}
                 Err(_) if cancelling => {
@@ -515,16 +516,6 @@ fn close_channel(session: &Session, channel: &mut Channel) {
     session.set_timeout(0);
 }
 
-/// 不同 ssh2 版本里 EAGAIN 既可能是 io::ErrorKind::WouldBlock，也可能透传为带
-/// Session(-37) 的 io::Error::Other。
-fn is_would_block(e: &std::io::Error) -> bool {
-    if e.kind() == ErrorKind::WouldBlock {
-        return true;
-    }
-    let msg = e.to_string();
-    msg.contains("EAGAIN") || msg.contains("Session(-37)") || msg.contains("would block")
-}
-
 /// 构造 kill 命令：先杀整个进程组（sshd 为每个 exec channel setsid，组内即该命令
 /// 的进程树，如 git → pager / hooks），再兜底杀 PID 本身。
 /// 若 PGID 与执行 kill 的 shell 自己的组相同（理论上不会）则跳过组杀，避免误伤。
@@ -560,6 +551,8 @@ mod tests {
         assert!(parse_pid_line(b"some other stderr").is_none());
         assert!(parse_pid_line(b"ZERO_PID:notanumber\n").is_none());
         assert!(parse_pid_line(b"ZERO_PID:42").is_none()); // no newline yet
+                                                           // pty 模式下行尾是 \r\n
+        assert_eq!(parse_pid_line(b"ZERO_PID:9\r\nx"), Some((9, 12)));
     }
 
     #[test]

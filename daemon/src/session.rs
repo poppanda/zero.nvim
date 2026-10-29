@@ -11,10 +11,10 @@
 use crate::connect;
 use crate::state::{LockExt, SharedState, Target};
 use anyhow::Context;
-use ssh2::{Session, Sftp};
+use ssh2::{Channel, Session, Sftp};
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// libssh2 blocking 调用的默认超时
 pub const DEFAULT_TIMEOUT_MS: u32 = 10_000;
@@ -201,29 +201,122 @@ pub struct ExecOutput {
     pub code: i32,
 }
 
-/// 在会话上开一个 channel 执行 shell 命令并收集全部输出（blocking）。
+/// 在会话上开一个 channel 执行 shell 命令并收集全部输出。
 ///
-/// 先读完 stdout 再读 stderr，只适合 stderr 很少的短命令；长命令 / 大量交错
-/// 输出走 cmd::stream 的 non-blocking poll。
+/// channel 建立后临时切到 non-blocking，在同一循环里交错写 stdin、读 stdout /
+/// stderr：顺序 read_to_end(stdout) 再读 stderr 时，大量 stderr（或远端在读完
+/// stdin 前就大量输出）会把通道窗口 / 内存撑爆甚至互等。
+///
+/// 超时语义沿用会话 timeout：连续这么久没有任何进展（无读写）即报错；0 = 不限。
+/// 结束（含出错）后恢复会话原来的 blocking + timeout。
 pub fn exec(session: &Session, cmd: &str, stdin: Option<&[u8]>) -> anyhow::Result<ExecOutput> {
     let mut ch = session.channel_session().context("无法开启 SSH 通道")?;
     ch.exec(cmd).context("远程执行失败")?;
-    if let Some(data) = stdin {
-        ch.write_all(data).context("写入 stdin 失败")?;
-        ch.send_eof().context("send_eof 失败")?;
-    }
-    let mut stdout = Vec::new();
-    ch.read_to_end(&mut stdout).context("读取 stdout 失败")?;
-    let mut stderr = Vec::new();
-    ch.stderr()
-        .read_to_end(&mut stderr)
-        .context("读取 stderr 失败")?;
+
+    let prev_timeout = session.timeout();
+    session.set_blocking(false);
+    session.set_timeout(0);
+    let r = drain_channel(&mut ch, stdin, Duration::from_millis(prev_timeout.into()));
+    session.set_blocking(true);
+    session.set_timeout(prev_timeout);
+
+    let (stdout, stderr) = r?;
     ch.wait_close().ok();
     Ok(ExecOutput {
         stdout,
         stderr,
         code: ch.exit_status().unwrap_or(-1),
     })
+}
+
+/// non-blocking 泵：写完 stdin（若有，写完 send_eof），同时收集 stdout / stderr 直到 EOF
+fn drain_channel(
+    ch: &mut Channel,
+    stdin: Option<&[u8]>,
+    idle_timeout: Duration,
+) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
+    let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+    let mut buf = [0u8; 32 * 1024];
+    let mut stdin_off = 0;
+    let mut eof_sent = stdin.is_none();
+    let mut last_progress = Instant::now();
+    let mut backoff = Duration::from_micros(100);
+
+    loop {
+        let mut progressed = false;
+        if let (Some(data), false) = (stdin, eof_sent) {
+            if stdin_off < data.len() {
+                match ch.write(&data[stdin_off..]) {
+                    Ok(n) => {
+                        stdin_off += n;
+                        progressed |= n > 0;
+                    }
+                    Err(e) if is_would_block(&e) => {}
+                    Err(e) => return Err(anyhow::Error::new(e).context("写入 stdin 失败")),
+                }
+            }
+            if stdin_off >= data.len() {
+                match ch.send_eof() {
+                    Ok(()) => {
+                        eof_sent = true;
+                        progressed = true;
+                    }
+                    Err(e) if e.code() == EAGAIN => {}
+                    Err(e) => return Err(anyhow::Error::new(e).context("send_eof 失败")),
+                }
+            }
+        }
+        progressed |= read_available(ch, &mut stdout, &mut buf).context("读取 stdout 失败")?;
+        progressed |=
+            read_available(&mut ch.stderr(), &mut stderr, &mut buf).context("读取 stderr 失败")?;
+
+        // libssh2 的 eof() 在还有未读数据包时返回 false，所以这里两路都已读空
+        if ch.eof() {
+            return Ok((stdout, stderr));
+        }
+        if progressed {
+            last_progress = Instant::now();
+            backoff = Duration::from_micros(100);
+        } else {
+            if !idle_timeout.is_zero() && last_progress.elapsed() >= idle_timeout {
+                return Err(anyhow::anyhow!(
+                    "远程命令超时（{}ms 无输出）",
+                    idle_timeout.as_millis()
+                ));
+            }
+            std::thread::sleep(backoff);
+            backoff = (backoff * 2).min(Duration::from_millis(5));
+        }
+    }
+}
+
+/// 把当前可读的数据全部读进 out（non-blocking）；返回是否读到了东西
+fn read_available(r: &mut impl Read, out: &mut Vec<u8>, buf: &mut [u8]) -> std::io::Result<bool> {
+    let mut got = false;
+    loop {
+        match r.read(buf) {
+            Ok(0) => return Ok(got),
+            Ok(n) => {
+                out.extend_from_slice(&buf[..n]);
+                got = true;
+            }
+            Err(e) if is_would_block(&e) => return Ok(got),
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// libssh2 的 EAGAIN
+pub const EAGAIN: ssh2::ErrorCode = ssh2::ErrorCode::Session(-37);
+
+/// 不同 ssh2 版本里 EAGAIN 既可能是 io::ErrorKind::WouldBlock，也可能透传为带
+/// Session(-37) 的 io::Error::Other。
+pub fn is_would_block(e: &std::io::Error) -> bool {
+    if e.kind() == std::io::ErrorKind::WouldBlock {
+        return true;
+    }
+    let msg = e.to_string();
+    msg.contains("EAGAIN") || msg.contains("Session(-37)") || msg.contains("would block")
 }
 
 /// 在共享会话上执行一条短命令（经 with_conn，断连时自动重连重试）。
@@ -238,7 +331,8 @@ pub fn exec_shared(
     with_conn(state, t, |conn| {
         let prev_timeout = conn.session.timeout();
         if let Some(d) = timeout {
-            conn.session.set_timeout(d.as_millis() as u32);
+            conn.session
+                .set_timeout(u32::try_from(d.as_millis()).unwrap_or(u32::MAX));
         }
         let r = exec(&conn.session, cmd, stdin);
         conn.session.set_timeout(prev_timeout);

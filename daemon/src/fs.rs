@@ -9,7 +9,6 @@ use crate::session::{self, exec_shared, shell_quote, with_conn, ConnSession};
 use crate::state::{DirCache, DirEntry, LockExt, SharedState, Target};
 use rmpv::Value;
 use ssh2::{FileStat, OpenFlags, OpenType, RenameFlags, Sftp};
-use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
@@ -223,6 +222,12 @@ pub fn fetch_file(t: &Target, path: &str, state: &SharedState) -> anyhow::Result
         let mut file = sftp
             .open(Path::new(path))
             .map_err(|e| anyhow::anyhow!("无法打开远程文件 {}: {}", path, e))?;
+        // 与 fetch_path 同一上限：超大文件会长时间占住连接锁并卡死 UI
+        if let Some(size) = file.stat().ok().and_then(|st| st.size) {
+            if size > MAX_FETCH_SIZE {
+                return Err(too_big(size, path));
+            }
+        }
         let mut content = Vec::new();
         file.read_to_end(&mut content)
             .map_err(|e| anyhow::anyhow!("读取失败 {}: {}", path, e))?;
@@ -437,37 +442,37 @@ pub fn stat(t: &Target, path: &str, state: &SharedState) -> anyhow::Result<Value
     })
 }
 
-/// 预扫描目录树（最多 3 层，跳过隐藏目录）并填充缓存
+/// 预扫描目录树（最多 3 层，跳过隐藏目录）并填充缓存。
+///
+/// 每个目录单独走一次 with_sftp：大项目要扫上百个目录，整段持有连接锁会让
+/// 同连接上的 read_dir / fetch / write 排队到扫描结束。
 pub fn scan_project(t: &Target, root: &str, state: &SharedState) -> anyhow::Result<Value> {
     const MAX_DEPTH: usize = 3;
-    let scanned = with_sftp(state, t, |sftp| {
-        let mut scanned: HashMap<PathBuf, Vec<DirEntry>> = HashMap::new();
-        let mut stack = vec![(PathBuf::from(root), 0)];
-        while let Some((dir, depth)) = stack.pop() {
-            if depth > MAX_DEPTH || scanned.contains_key(&dir) {
-                continue;
-            }
-            // 权限不足等错误跳过；连接断开会在下次操作时由 with_conn 捕获
-            let Ok(entries) = list_dir(sftp, &dir) else {
-                continue;
-            };
-            for e in entries
-                .iter()
-                .filter(|e| e.is_dir && !e.name.starts_with('.'))
-            {
-                stack.push((dir.join(&e.name), depth + 1));
-            }
-            scanned.insert(dir, entries);
+    let mut seen = std::collections::HashSet::new();
+    let mut stack = vec![(PathBuf::from(root), 0)];
+    while let Some((dir, depth)) = stack.pop() {
+        if depth > MAX_DEPTH || !seen.insert(dir.clone()) {
+            continue;
         }
-        Ok(scanned)
-    })?;
-
-    debug_log!("Daemon: scan_project 完成，缓存了 {} 个目录", scanned.len());
-    with_cache(state, t, |cache| {
-        for (path, entries) in scanned {
-            cache.insert(path, entries);
+        let listed = with_sftp(state, t, |sftp| {
+            list_dir(sftp, &dir).map_err(|e| anyhow::anyhow!("读目录失败 {}: {}", dir.display(), e))
+        });
+        let entries = match listed {
+            Ok(entries) => entries,
+            // 连接已死（with_conn 已重连重试过）：放弃本次扫描
+            Err(e) if session::is_session_dead(&e) => return Err(e),
+            // 权限不足等单目录错误：跳过
+            Err(_) => continue,
+        };
+        for e in entries
+            .iter()
+            .filter(|e| e.is_dir && !e.name.starts_with('.'))
+        {
+            stack.push((dir.join(&e.name), depth + 1));
         }
-    });
+        with_cache(state, t, |c| c.insert(dir, entries));
+    }
+    debug_log!("Daemon: scan_project 完成，扫描了 {} 个目录", seen.len());
     Ok(Value::Boolean(true))
 }
 
